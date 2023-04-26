@@ -58,6 +58,7 @@ The following is an incomplete research proposal. It is not finished being desig
 - Guiding Principle: Assuming a system can self-improve, increasing the diversity of computational bases on which the system can rely is likely to increase the probability that the system will be able to reach a better value for itself along a given dimension (efficiency, accuracy, etc.) by increasing the variety of options in the search space, which allows more possible combinations of tradeoffs at the cost of a likely increase in time spent searching (which will be mitigated later).
 
 ## Proposed Solution Preview
+- [Full Details](#mvp)
 - Use an evolutionary algorithm to find a new learning algorithm / model architecture combination starting from initial population of existing algorithms / architectures
 - Include flexible firing policy that can emulate multiple spiking mechanisms for activation sparsity and dynamic tradeoffs between spatial and temporal processing
 - Allowing each node in the network to modify any aspects of any subgraphs in the network when it fires (including itself) also allows the model to dynamically change its own learning strategies
