@@ -1,4 +1,6 @@
 # Learning to Learn: Evolving Generalized Self-Organizing Cyclic Spiking Computation Graphs
+("Recurrent" sometimes has the connotation of only including self-referential edges, which is wholly insufficient for the feedback loops I'm picturing)
+
 ## Contents
 - [Disclaimer](#disclaimer)
 - [Main Goals](#main-goals)
@@ -15,6 +17,7 @@
   - [Spiking Graph Neural Networks](#spiking-graph-neural-networks)
   - [Universal Approximation](#universal-approximation)
   - [Compression as a Goal](#compression-as-a-goal)
+  - [Continual Learning](#continual-learning)
 - [Proposed Solution](#proposed-solution)
   - [MVP](#mvp)
   - [Final State](#final-state)
@@ -28,7 +31,7 @@
 - [References](#references)
 
 ## Disclaimer
-The following is an incomplete research proposal. It is not finished being designed and not all the mentioned papers have been finished yet (some haven’t even been started). My process is usually a continuous cycle of "build it up" and "tear it down" where I come up with ideas for a while and then criticize them for a while and eventually I see what survives for a while. Because of this, it is likely to change due to issues, contradictions, etc before implementation.
+The following is an incomplete research proposal. It is not finished being designed and not all the mentioned papers have been finished yet (some haven’t even been started). My process is usually a continuous cycle of "build it up" and "tear it down" where I come up with ideas for a while and then criticize them for a while and eventually I see what survives. Because of this, it is likely to change due to issues, contradictions, etc before implementation.
 
 ## Main Goals
 - Improve model inference-time efficiency (less compute resources required along an arbitrary metric)
@@ -45,7 +48,7 @@ The following is an incomplete research proposal. It is not finished being desig
 ## Why multiple learning paradigms?
 [How learning unfolds in the brain: toward an optimization view](https://www.sciencedirect.com/science/article/pii/S0896627321006772)
 
-> “At the macroscopic level, studies have revealed that behavioral changes during learning are guided by different types of feedback such as supervision (Brainard and Doupe, 2002), reward (Schultz et al., 1997), and sensory prediction errors (Shadmehr and Holcomb, 1997), and develop on different timescales (Newell and Rosenbloom, 1981; Boyden et al., 2004; Smith et al., 2006; Yang and Lisberger, 2010).
+> “At the macroscopic level, studies have revealed that behavioral changes during learning are guided by different types of feedback such as supervision (Brainard and Doupe, 2002), reward (Schultz et al., 1997), and sensory prediction errors (Shadmehr and Holcomb, 1997), and develop on different timescales (Newell and Rosenbloom, 1981; Boyden et al., 2004; Smith et al., 2006; Yang and Lisberger, 2010).
 > …
 > More generally, it has been proposed that the brain learns new motor skills via supervised learning, unsupervised learning, and reinforcement—perhaps even simultaneously (Doya, 2000; Izawa and Shadmehr, 2011).”
 
@@ -76,7 +79,6 @@ The following is an incomplete research proposal. It is not finished being desig
 
 ### Spiking Neural Networks
 - There are important advantages to being able to utilize the temporal dimension for encoding information
-  - An increase in representational capacity for the same number of nodes and edges
   - Allows easy local update rules for training such as Spike-timing-dependent plasticity (STDP), which “is the primary candidate mechanism for the storage of information in autoassociative networks” [12] in the brain
   - When used in conjunction with neuromorphic hardware, they can provide a large reduction to energy consumption by switching to an event-driven model of computation
 - “Spiking Neural Networks have revealed themselves as one of the most successful approaches to model the behavior and learning potential of the brain, and exploit them to undertake practical online learning tasks” [6]
@@ -124,11 +126,14 @@ In [14] they "consider a dynamic network to be a network where nodes and edges a
 - Perceptual quality can be defined as “the extent to which [an output sample] is perceived as a valid (natural) sample”. In [35], they adopt a mathematical definition of this that was proposed by others and show that “there is a triple tradeoff between rate, distortion and perception.” “Rate” here means bits per sample and “distortion” means the distributional shifts in the data. Their "key observation is that the rate-distortion function elevates as the perceptual quality is enforced to be higher (see Fig. 1). In other words, to obtain good perceptual quality, it is necessary to make a sacrifice in either the distortion or the rate of the algorithm. … But our theory shows that every distortion measure (excluding pathological cases) must have a tradeoff with perceptual quality.” They also note that even though the divergence function that best relates to human perception is the subject of ongoing research, their results “hold for (nearly) any divergence.” This effect is particularly pronounced at low bit rates.
 - Compression being the main goal of the paradigm presented in [36] for encouraging generalization fits very well with my approach as a major goal of my approach is to encode the desired behavior in a highly dynamical system, allowing for higher representational density (a.k.a. compressing the function)
 
+### Continual Learning
+According to [43], blurred boundary continual learning is when the "task boundaries are blurred, characterized by distinct but overlapping data label spaces". This is the most relevant continual learning setting I have found but most continual learning settings apply here given the breadth of the main goals. There are two main metrics for memory stability, forgetting measure (FM) [44] and backward transfer (BWT) [45]. FM "is calculated by the difference between its maximum performance obtained in the past and its current performance" [43]. "BWT evaluates the average influence of learning the k-th task on all old tasks" [43]. In direct contrast, plasticity can be measured using intransience (IM) [44] and forward transfer (FWT) [45]. "IM is defined as the inability of a model to learn new tasks, which is calculated by the difference of a task between its joint training performance and continual learning performance" [43]. Memory stability and plasticity have an intrinsic tradeoff. One way to deal with this is by including the training of a generative model to use for replay-based methods at the cost of additional overhead but generative models are also plagued by the catastrophic forgetting problem. Alternatively, a Bayesian framework can be used but the posterior probability has to be estimated due to intractability. "The constraint on continual learning for either replay or regularization is ultimately reflected in gradient directions" [43]. 
+
 ## Proposed Solution
 ### MVP
 - Discrete time
 - Borrowing from spiking neural networks, we include a firing policy for every node that determines whether or not it should fire given it’s activation value and any internal state the policy maintains
-  - Firing policy flexibility (always fire, threshold, decay, random, etc) allows a dimension for tradeoff between spatial and temporal processing
+  - Firing policy flexibility (always fire, threshold, decay, random, etc) allows a dimension for tradeoff between spatial (memory-based) and temporal processing
     - See section “1. Neural variability shapes learning, but is often inflexible” in [37] for justification of including random firing policy. In short, it is because behavioral variability during learning is a key part of exploring the reward space.
 - Model can determine how each input & output will be encoded w/ choice of rate coding, temporal coding, phase coding, and burst coding (Neural Coding in Spiking Neural Networks: A Comparative Study for Robust Neuromorphic Systems)
   - Different bits of information in the network will have different transmission requirements (required noise tolerance, relative transmission speed, etc)
@@ -321,3 +326,6 @@ Haven't really started these ones at all but they sound useful
 40. [A bio-inspired bistable recurrent cell allows for long-lasting memory](https://arxiv.org/abs/2006.05252)
 41. [Scale-Invariant Memory Representations Emerge from Moiré Interference between Grid Fields That Produce Theta Oscillations: A Computational Model](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6672484/)
 42. [Scale-Invariance and Self-Similar 'Wavelet' Transforms: an Analysis of Natural Scenes and Mammalian Visual Systems](redwood.psych.cornell.edu/papers/field-1993.pdf)
+43. [A Comprehensive Survey of Continual Learning: Theory, Method and Application](https://arxiv.org/pdf/2302.00487.pdf)
+44. [Riemannian walk for incremental learning: Understanding forgetting and intransigence](https://arxiv.org/abs/1801.10112)
+45. [Gradient Episodic Memory for Continual Learning](https://arxiv.org/abs/1706.08840)
