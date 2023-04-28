@@ -56,7 +56,7 @@ The following is an incomplete research proposal. It is not finished being desig
 - Mitigating human influence in the learning paradigm and model architecture enough to support the other goals likely requires the use of an evolutionary approach
   - Unfortunately, whether the approach works for our purposes is also highly dependent on how it is implemented and what degrees of freedom it allows.
 - Key fact: Biological neurons are able to modify their genetic expression based on environmental cues like when a specific neurotransmitter binds to a receptor in the cell wall (this can happen every time cells involved in a synapse communicate)
-  - See Signaling Mechanisms Linking Neuronal Activity to Gene Expression and Plasticity of the Nervous System & Neuronal Activity–Regulated Gene Transcription in Synapse Development and Cognitive Function
+  - See [46] and [47]
   - In other words, they have many more degrees of freedom and a larger variety of types of DoF that they can utilize for learning than what we currently simulate
 - Guiding Principle: Assuming a system can self-improve, increasing the diversity of computational bases on which the system can rely is likely to increase the probability that the system will be able to reach a better value for itself along a given dimension (efficiency, accuracy, etc.) by increasing the variety of options in the search space, which allows more possible combinations of tradeoffs at the cost of a likely increase in time spent searching (which will be mitigated later).
 
@@ -329,3 +329,5 @@ Haven't really started these ones at all but they sound useful
 43. [A Comprehensive Survey of Continual Learning: Theory, Method and Application](https://arxiv.org/pdf/2302.00487.pdf)
 44. [Riemannian walk for incremental learning: Understanding forgetting and intransigence](https://arxiv.org/abs/1801.10112)
 45. [Gradient Episodic Memory for Continual Learning](https://arxiv.org/abs/1706.08840)
+46. [Signaling Mechanisms Linking Neuronal Activity to Gene Expression](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC2728073/)
+47. [Plasticity of the Nervous System & Neuronal Activity–Regulated Gene Transcription in Synapse Development and Cognitive Function](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3098681/)
