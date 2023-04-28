@@ -167,6 +167,7 @@ According to [43](#references), blurred boundary continual learning is when the 
       - We won’t know when adding another piece of the initial population to a species would be beneficial.
 - To allow for reinforcement, supervised and unsupervised learning in the same network, there will be at least five special input nodes (likely more). One will represent reward for reinforcement learning. For each output node, include an extra input node for that node’s loss (minimum of one node). The remaining three in the minimum set are to signify which of these learning types should be used.
 - Set aside a held out data set (equal distribution across every task) to ensure generalization of final learner
+- To avoid obscure failure modes caused by data quality issues or poisoning attacks, use smaller hand-crafted datasets that are designed to teach specific lessons and, when possible, use data generators that are designed to teach specific lessons instead. -> still vulnerable to reward hacking w/ data generators?
 - Basic reinforcement learning tasks necessary for a cognitive map of task space [38](#references)
   - Data can easily be generated on the spot for most of these because they are modality independent
   - Probabilistic and non-probabilistic reversal learning
@@ -235,7 +236,7 @@ According to [43](#references), blurred boundary continual learning is when the 
 #### Non-learning algorithms (not part of population but can be referenced by genes)
 
 ### Known Unsolved Problems
-- Ensuring alignment is maintained in production without reverting to the original network in between tasks so that online learning can take place. RLHF might not be a scalable enough solution.
+- Ensuring alignment is maintained in production without reverting to the original network in between tasks so that online learning can take place. RLHF might not be a scalable enough solution and RLAIF could be too dangerous.
 - How to efficiently parallelize both the evolutionary algorithm using federated learning and the final result
 - How to incorporate continuous time with the modulatory effects
 - How to encourage the use of unsupervised tasks for learning
