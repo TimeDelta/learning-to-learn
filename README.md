@@ -272,6 +272,7 @@ Haven't really started these ones at all but they sound useful
 - [Neurons detect cognitive boundaries to structure episodic memories in humans](https://authors.library.caltech.edu/107546/4/41593_2022_1020_MOESM1_ESM.pdf)
 - [Why think step-by-step? Reasoning emerges from the locality of experience](https://arxiv.org/pdf/2304.03843.pdf)
 - [Accurate online training of dynamical spiking neural networks through Forward Propagation Through Time](https://arxiv.org/abs/2112.11231#:~:text=Here%2C%20we%20show%20how%20a,regularized%20risk%20on%20the%20loss.)
+- [Dynamics-Aware Unsupervised Discovery of Skills](https://arxiv.org/abs/1907.01657)
 
 ## Future Ideas
 - Using federated learning across a variety of different hardware implementations might be usable to improve generalization across different types of hardware
