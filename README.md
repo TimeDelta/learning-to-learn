@@ -136,7 +136,7 @@ According to [43](#references), blurred boundary continual learning is when the 
 - Borrowing from spiking neural networks, we include a firing policy for every node that determines whether or not it should fire given it’s activation value and any internal state the policy maintains
   - Firing policy flexibility (always fire, threshold, decay, random, etc) allows a dimension for tradeoff between spatial (memory-based) and temporal processing
     - See section “1. Neural variability shapes learning, but is often inflexible” in [37](#references) for justification of including random firing policy. In short, it is because behavioral variability during learning is a key part of exploring the reward space.
-- Model can determine how each input & output will be encoded w/ choice of rate coding, temporal coding, phase coding, and burst coding (Neural Coding in Spiking Neural Networks: A Comparative Study for Robust Neuromorphic Systems)
+- Model can determine how each input & output will be encoded w/ choice of rate coding, temporal coding, phase coding, and burst coding [48](#references)
   - Different bits of information in the network will have different transmission requirements (required noise tolerance, relative transmission speed, etc)
   - “Although the exact mechanisms of biological coding schemes in the brain are not well understood, the biological evidence shows that multiple spikes coding schemes have a pivotal role in the brain.” [8](#references)
 - When switching tasks, feed in the new task embedding so the model can reconfigure the IO mapping and the number of IO nodes, internal context, etc.
@@ -335,3 +335,4 @@ Haven't really started these ones at all but they sound useful
 45. [Gradient Episodic Memory for Continual Learning](https://arxiv.org/abs/1706.08840)
 46. [Signaling Mechanisms Linking Neuronal Activity to Gene Expression](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC2728073/)
 47. [Plasticity of the Nervous System & Neuronal Activity–Regulated Gene Transcription in Synapse Development and Cognitive Function](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3098681/)
+48. [Neural Coding in Spiking Neural Networks: A Comparative Study for Robust Neuromorphic Systems](https://www.frontiersin.org/articles/10.3389/fnins.2021.638474/full)
