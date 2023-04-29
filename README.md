@@ -59,7 +59,7 @@ The following is an incomplete research proposal. It is not finished being desig
   - See [46](#references) and [47](#references)
   - In other words, they have many more degrees of freedom and a larger variety of types of DoF that they can utilize for learning than what we currently simulate
 - Guiding Principle: Assuming a system can self-improve, increasing the diversity of computational bases on which the system can rely is likely to increase the probability that the system will be able to reach a better value for itself along a given dimension (efficiency, accuracy, etc.) by increasing the variety of options in the search space, which allows more possible combinations of tradeoffs at the cost of a likely increase in time spent searching (which will be mitigated later).
-- The underlying computational mediums of the human brain and modern computers are different enough that we know there will be differences in the software that is optimal along some dimensions but we aren't sure exactly what or where those differences and dimensions will be plus predicting them is made even more difficult by the fact that we don't fully understand the brain and by the fact that modern digital computer hardware architecture is still changing and for certain uses, might even be supplanted by the use of quantum computing, which requires an entirely new programming paradigm.
+- The underlying computational mediums of the human brain and modern computers are different enough that we know there will be differences in the software that is optimal along some dimensions but we aren't sure exactly what or where those differences and dimensions will be plus predicting them is made even more difficult by the fact that we don't fully understand the brain and by the fact that modern digital computer hardware architecture is still changing and for certain uses, might even be supplanted by the use of quantum computing, which requires an *entirely new* programming paradigm. 
 
 ## Proposed Solution Preview
 - [Full Details](#mvp)
@@ -248,6 +248,7 @@ According to [43](#references), blurred boundary continual learning is when the 
 Whether I will need to incorporate compression into the main goal or if the time and memory complexity is a good enough proxy
 - How to best allow the mixing of model architectures and optimization methods
   - Maybe try to just equally disperse the optimization methods used by each initial agent within a species. In addition, could force each piece (model architecture, optimization algorithm, loss/reward function, etc.) to compete ONLY with other options of the same type and score them all separately.
+  - Also could record the performance of each model along each dimension of the fitness function and then choose mating partners based on complementary performance metrics but this still leaves it wondering how to optimally mix the parents.
 
 ### Mechanisms that Might Evolve
 - Stabilization of the system away from an infinite positive feedback loop between two nodes or two populations
