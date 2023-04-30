@@ -177,6 +177,7 @@ According to [43](#references), blurred boundary continual learning is when the 
     - In order to encourage desired behavior, must include same task in test set but with different outcome metrics (spontaneous recovery, reinstatement, rapid reacquisition or renewal)
   - Devaluation should encourage “a capacity to ‘simulate’ the consequences of actions within a cognitive model of the task” based on results comparing their sham-lesioned model to their OFC-lesioned model
     - The authors also claim that a similar line of reasoning can be used to explain the role of OFC in model-based RL such as sensory preconditioning, identity unblocking and pavlovian overexpectation.
+  - "Recent results implicate medial OFC in encoding economic value and lateral OFC in more complex functions, such as credit assignment and model-based RL (Noonan et al., 2010, Rudebeck and Murray, 2011a, Rudebeck and Murray, 2011b, Noonan et al., 2012)." [38](#references)
 - Task Selection
   - Use a skill-tree based approach where harder tasks cannot be unlocked until all pre-reqs have been completed w/ ≥ X score by at least N models.
   - In every generation, the models will use freshly chosen training and testing datasets that will be randomly sampled ordered subsets of examples from the available tasks. Training for each model of that generation occurs for the same random number (between hyperparameters A and B) of iterations over the subset before being tested.
