@@ -153,7 +153,6 @@ According to [43](#references), blurred boundary continual learning is when the 
     - See section “1. Neural variability shapes learning, but is often inflexible” in [37](#references) for justification of including random firing policy. In short, it is because behavioral variability during learning is a key part of exploring the reward space.
 - Model can determine how each input & output will be encoded w/ choice of rate coding, temporal coding, phase coding, and burst coding [48](#references)
   - Different bits of information in the network will have different transmission requirements (required noise tolerance, relative transmission speed, etc)
-  - “Although the exact mechanisms of biological coding schemes in the brain are not well understood, the biological evidence shows that multiple spikes coding schemes have a pivotal role in the brain.” [8](#references)
 - When switching tasks, feed in the new task embedding so the model can reconfigure the IO mapping and the number of IO nodes, internal context, etc.
 - Allow nodes in the network, upon firing, to each apply some unique ordered list of effects to a subset of their outgoing connections
   - Each node also has a set of policies for choosing which of its outgoing edges to use when applying its effects (many-to-many mapping)
