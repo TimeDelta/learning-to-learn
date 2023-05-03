@@ -45,7 +45,7 @@ Due to limitations on my spare time, this is a public project that is open to fe
 - Discussions space is open to anybody and should be used for debating content modifications in order to ensure adherence to the main tenets of the project (public learning as credentials and material for future students).
 - Any content curator can call a vote to merge content at any time.
   - Voting closes a week after it is called or once success criteria is met
-    - Success criteria: either at least 50% of content curators so far or 50% of final votes in favor.
+    - Success criteria: either at least 50% of all content curators or 50% of final votes after poll close are in favor.
   - Original author of content suggested in the discussions tab has first right to requesting the content be approved via pull request.
 
 ## Main Goals
