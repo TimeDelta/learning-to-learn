@@ -267,7 +267,7 @@ Whether I will need to incorporate compression into the main goal or if the time
 
 ### Mechanisms that Might Evolve
 - Stabilization of the system away from an infinite positive feedback loop between two nodes or two populations
-  - Removal of nodes / edges in the case of prolonged overstimulation
+  - Removal of nodes / edges in the case of prolonged overstimulation (maybe using a critical-point-based phase transition like in percolation for detection)
 - Reordering mechanism that increases representational capacity of self-organizing effects
   - Modularizing the effects into groups that are interspersed with reordering effects
   - Similar to the splicing mechanisms that evolved in DNA that allow for multiple proteins to be encoded by the same stretch of DNA
