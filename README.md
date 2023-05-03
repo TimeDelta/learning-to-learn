@@ -276,7 +276,8 @@ Haven't really started these ones at all but they sound useful
 - [Dynamics-Aware Unsupervised Discovery of Skills](https://arxiv.org/abs/1907.01657)
 - [Frahmentation Instability in Aggregating Systems](https://www.sciencedirect.com/science/article/abs/pii/S0378437122000930)
 - [Rethinking the performance comparison between SNNs and ANNs](https://www.sciencedirect.com/science/article/abs/pii/S0893608019302667)
-- [A survey on computationally efficient neural architecture search](https://www.sciencedirect.com/science/article/pii/S2949855422000028?dgcid=raven_sd_recommender_email)
+- [A survey on computationally efficient neural architecture search](https://www.sciencedirect.com/science/article/pii/S2949855422000028)
+- [Scaling Laws for Reward Model Overoptimization](https://arxiv.org/abs/2210.10760)
 
 ## Future Ideas
 - Using federated learning across a variety of different hardware implementations might be usable to improve generalization across different types of hardware
