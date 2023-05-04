@@ -317,7 +317,7 @@ According to [43](#references), blurred boundary continual learning is when the 
 - Try to use roughly equal distribution over task context (supervised, reinforcement, etc) to avoid giving an intrinsic advantage to some members of the initial population
 
 ## Maybe Ideas
-- Tasks should be paired with each task (not example) requiring a generalization of others so that the generalized task can be selected for the eval set in a way that encourages generalization (i.e. a task that requires visual and audio would be a generalization of tasks that include audio and of tasks that include visual if and only if)
+- Tasks should be paired with each task (not example) requiring a generalization of others so that the generalized task can be selected for the eval set in a way that encourages generalization (i.e. a task that requires visual and audio would be a generalization of tasks that include audio and of tasks that include visual)
 - Each time a task is selected for the training set, include a generalized task in the eval set
 - Meta optimize this algorithm using itself like NVIDIA did with its simulator?
 - Effect diffusion (static or dynamic)
