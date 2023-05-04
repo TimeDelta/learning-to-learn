@@ -260,7 +260,7 @@ According to [43](#references), blurred boundary continual learning is when the 
 - Is there a way to include unsupervised tasks in the eval set, especially in an unbiased way (clustering method metrics like silhouette or penalizing intravariance introduce intrinsic bias in the signal)? Closest proxy I can think of is self-supervised like an LM or autoencoder but even those have bias in the loss function itself and the whole point of including unsupervised tasks is to allow it to learn in an unbiased manner
   - Could we induce the networks to incorporate unsupervised learning after a number of generations by including unsupervised learning for each modality before the training for that generation?
   - Without this, might not be worth having unsupervised learning
-Whether I will need to incorporate compression into the main goal or if the time and memory complexity is a good enough proxy
+- Whether I will need to incorporate compression into the main goal or if the time and memory complexity is a good enough proxy
 - How to best allow the mixing of model architectures and optimization methods
   - Maybe try to just equally disperse the optimization methods used by each initial agent within a species. In addition, could force each piece (model architecture, optimization algorithm, loss/reward function, etc.) to compete ONLY with other options of the same type and score them all separately.
   - Also could record the performance of each model along each dimension of the fitness function and then choose mating partners based on complementary performance metrics but this still leaves it wondering how to optimally mix the parents.
