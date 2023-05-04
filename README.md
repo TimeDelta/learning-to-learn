@@ -311,8 +311,8 @@ According to [43](#references), blurred boundary continual learning is when the 
 - Using federated learning across a variety of different hardware implementations might be usable to improve generalization across different types of hardware
 - Interpolation or mating between each agent before and after its training to allow some computation reuse without letting too much leakage of a previously trained-on example being included in a future generation’s test set
   - possibly using something like [Git Re-Basin](https://arxiv.org/abs/2209.04836) but use the before model instead of a differently initialized one plus put more weight on before than after training
-    - Also would have to figure out how to deal with node, edge and effect creation / deletion and use
-    - Would have to use some modification of the activation matching algorithm in order to deal with spikng (not sure how to incorporate with the straight-through estimator)
+    - Also would have to figure out how to deal with node, edge and effect creation / deletion
+    - Would have to use some modification of the activation matching algorithm in order to deal with spiking (not sure how to incorporate with the straight-through estimator)
 - Determine “success rate” of cross-species and of cross-time mating strategies and put more likelihood on using more successful strategies
 - Try to use roughly equal distribution over task context (supervised, reinforcement, etc) to avoid giving an intrinsic advantage to some members of the initial population
 
