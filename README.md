@@ -278,6 +278,8 @@ According to [43](#references), blurred boundary continual learning is when the 
 
 ## Other Papers that Might be Useful
 - [On the Relationship Between Variational Inference and Auto-Associative Memory](https://arxiv.org/pdf/2210.08013.pdf)
+  - "In order to improve the memory capacity, modern Hopfield networks [22, 21, 8] propose several variants of the energy function using polynomial or exponential interactions. Extending these models to the continuous case, [30] proposed the Modern Continuous Hopfield Network (MCHN) with update rules implementing self attention, that they relate to the transformer model [36]. In [26], the authors introduce a general Hopfield network framework where the update rules are built using three components: a similarity function, a separation function, and a projection function."
+  - "It has been shown that overparameterized auto-encoders also implement AM [28, 33]. These methods embed the stored patterns as attractors through training, and retrieval is performed by iterating over the auto-encoding loop."
 - [Multifactorial Evolutionary Algorithm with Online Transfer Parameter Estimation: MFEA-II](https://www.researchgate.net/profile/Abhishek-Gupta-17/publication/331729696_Multifactorial_Evolutionary_Algorithm_With_Online_Transfer_Parameter_Estimation_MFEA-II/links/5c98495892851cf0ae95ec75/Multifactorial-Evolutionary-Algorithm-With-Online-Transfer-Parameter-Estimation-MFEA-II.pdf)
 - [STCA: Spatio-Temporal Credit Assignment with Delayed Feedback in Deep Spiking Neural Networks](https://www.ijcai.org/proceedings/2019/0189.pdf)
 - [Sparse Distributed Memory using N-of-M Codes](apt.cs.manchester.ac.uk/ftp/pub/apt/papers/NofMnnV3.pdf)
