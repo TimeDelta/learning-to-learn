@@ -185,7 +185,7 @@ According to [43](#references), blurred boundary continual learning is when the 
 - Set aside a held out data set (equal distribution across every task) to ensure generalization of final learner
 - To avoid obscure failure modes caused by data quality issues or poisoning attacks, use smaller hand-crafted datasets that are designed to teach specific lessons and, when possible, use data generators that are designed to teach specific lessons instead. -> still vulnerable to reward hacking w/ data generators?
 - Basic reinforcement learning tasks necessary for a cognitive map of task space [38](#references)
-  - Data can easily be generated on the spot for most of these because they are modality independent
+  - Data can easily be generated on the spot for most of these because the modality and dimensions don't particularly matter since we can define the task to just choose a random modality, input dimensions (above a different min per task), target action embeddings, target stimulus (might want to add Gausian noise), etc.
   - Probabilistic and non-probabilistic reversal learning
   - Delayed alternation
   - Extinction training should help lead to creation “of a new competing association” for cases in which a preferred outcome is no longer available
