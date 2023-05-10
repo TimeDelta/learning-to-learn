@@ -107,7 +107,7 @@ In [14](#references) they "consider a dynamic network to be a network where node
 
 ### Meta-learning / Multi-modality
 - In the meta-learning paradigm, multiple tasks are frequently used in conjunction in order to find a good starting point for a given architecture across multiple different tasks, which are later fine tuned for specific tasks.
-- [16](#references) presents an approach that finds a good common network initialization for learning based on interpolation of losses from multiple tasks. Doing so usually leads to an improvement in generalization. This approach will use that as a subset of its search space, including initial model architecture, loss function, optimization algorithm, etc.
+- [18](#references) presents an approach that finds a good common network initialization for learning based on interpolation of losses from multiple tasks. Doing so usually leads to an improvement in generalization. This approach will use that as a subset of its search space, including initial model architecture, loss function, optimization algorithm, etc.
 - Including multiple modalities in the learned tasks improves the robustness and generalizability of the learned representations
 - In [19](#references) they mainly focus on tokenization scheme and scaling the transformer architecture to log linear performance over increasing input & output sizes.
 - In [20](#references) they develop a similar tokenization scheme for each modality used that is fed to a transformer model in order to allow for generalization across modalities for static input nodes but their task list is not well curated for positive transfer and likely still separates the tasks to a degree, which is supported by appendix J showing some amount of negative transfer.
