@@ -103,7 +103,18 @@ Due to limitations on my spare time, this is a public project that is open to fe
   - The biggest drawback of most of these is a decrease in training efficiency in some way or (in the case of converting non-spiking to spiking) an increase in inference time but the accuracy has been shown to be comparable to the similarly trained non-spiking version of the network
 
 ### Self-modification / Self-organization
-In [14](#references) they "consider a dynamic network to be a network where nodes and edges appear and/or disappear over time”. This is merely a less powerful subset of what I am proposing. They also state that self-modification allows the model to “radically influence network properties which enables a more powerful representation of network data which in turn increases predictive capabilities of methods using such data.”
+- In [14](#references) they "consider a dynamic network to be a network where nodes and edges appear and/or disappear over time”. This is merely a less powerful subset of what I am proposing. They also state that self-modification allows the model to “radically influence network properties which enables a more powerful representation of network data which in turn increases predictive capabilities of methods using such data.”
+- In [49](#references) they attempt to overcome the shortcomings of a previous experiment that used a hand-crafted data set, which is "against the idea of ... learn[ing] significant features by iteratively tuning internal representations" and the increased "dimensionality of neural weights along the hierarchy" caused by preprocessing.
+  - "The most well-established model is the self-organizing feature map (SOM, Kohonen, 1990) algorithm that nonlinearly projects a high-dimensional input space onto a low-dimensional (typically two-dimensional) discretized representation. It consists of a layer with competitive neurons connected to adjacent neurons by a neighborhood relation."
+    - Fixed topology
+    - fixed number of neurons
+  - "The ability of a network to create new neurons (and remove unused ones) for adapting to novel incoming signals is crucial for better dealing with non-stationary input distributions."
+  - "A well-known model is the growing neural gas (GNG,  Fritzke, 1995), in which neurons are added at fixed intervals to minimize local errors. In contrast to the GNG, the growing when required (GWR) network proposed by Marsland et al. (2002) creates new neurons whenever the activity of trained neurons is smaller than a given threshold. ... Additionally, the algorithm considers the number of times that neurons have fired so that recently created neurons are properly trained before creating new ones."
+  - "The use of an activation threshold and firing counters to modulate the growth of the network leads to the creation of a larger number of neurons at early stages of the training and then tune the weights of existing neurons through subsequent training epochs. This behavior is particularly convenient for incremental learning scenarios since neurons will be created to promptly distribute their receptive fields in the input space, thereby yielding fast convergence through iterative fine-tuning of the topological map. It has been shown that GWR-based learning is particularly suitable for novelty detection and cumulative learning in robot scenarios Marsland et al. (2005), Marsland et al. (2002)."
+    - In GNG, number of neurons grow linearly over time
+    - In GWR, number of neurons grows quickly in beginning but has a horizontal asymptote as training progresses
+    - GWR tends to have quicker convergence with respect to "quantization error (average discrepancy between the input and representative neurons in the network)"
+    - "The standard GNG and GWR learning algorithms do not account for temporal sequence processing. Consequently, these models were extended with recurrent connectivity"
 
 ### Meta-learning / Multi-modality
 - In the meta-learning paradigm, multiple tasks are frequently used in conjunction in order to find a good starting point for a given architecture across multiple different tasks, which are later fine tuned for specific tasks.
@@ -378,3 +389,4 @@ According to [43](#references), blurred boundary continual learning is when the 
 46. [Signaling Mechanisms Linking Neuronal Activity to Gene Expression](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC2728073/)
 47. [Plasticity of the Nervous System & Neuronal Activity–Regulated Gene Transcription in Synapse Development and Cognitive Function](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3098681/)
 48. [Neural Coding in Spiking Neural Networks: A Comparative Study for Robust Neuromorphic Systems](https://www.frontiersin.org/articles/10.3389/fnins.2021.638474/full)
+49. [Lifelong learning of human actions with deep neural network self-organization](https://www.sciencedirect.com/science/article/pii/S0893608017302034)
