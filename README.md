@@ -115,6 +115,9 @@ Due to limitations on my spare time, this is a public project that is open to fe
     - In GWR, number of neurons grows quickly in beginning but has a horizontal asymptote as training progresses
     - GWR tends to have quicker convergence with respect to "quantization error (average discrepancy between the input and representative neurons in the network)"
     - "The standard GNG and GWR learning algorithms do not account for temporal sequence processing. Consequently, these models were extended with recurrent connectivity"
+  - Recurrent self-organization
+    - "in the [temporal kohonen map], there is no explicit back-reference to previous map activity because the context is only implicitly represented by the weights."
+    - "In Parisi, Magg, and Wermter (2016), we presented a GWR network equipped with recurrent neurons with one context descriptor, yielding a decreased temporal quantization error for a time-series prediction task with respect to recurrent models of the SOM and the GNG."
 
 ### Meta-learning / Multi-modality
 - In the meta-learning paradigm, multiple tasks are frequently used in conjunction in order to find a good starting point for a given architecture across multiple different tasks, which are later fine tuned for specific tasks.
