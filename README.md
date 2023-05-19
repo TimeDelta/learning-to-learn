@@ -118,6 +118,15 @@ Due to limitations on my spare time, this is a public project that is open to fe
   - Recurrent self-organization
     - "in the [temporal kohonen map], there is no explicit back-reference to previous map activity because the context is only implicitly represented by the weights."
     - "In Parisi, Magg, and Wermter (2016), we presented a GWR network equipped with recurrent neurons with one context descriptor, yielding a decreased temporal quantization error for a time-series prediction task with respect to recurrent models of the SOM and the GNG."
+  - Lifelong learning
+    - "The functional plasticity of the map can be modulated through critical periods, i.e., a particularly sensitive period in which the map is more responsive to the effects of experience."
+    - " In the SOM (Kohonen, 1990), two training phases are used to achieve a topographic organization resembling the two phases of a critical period: the organization phase in which the network is trained with a high learning rate and large neighborhood size, and the tuning phase in which these parameters are reduced to fine-tune the map and learn more detailed distinctions of the input."
+      - Fixed number of neurons forces critical periods to play a "crucial role in the formation of maps with good topological organization"
+      - When not fixed, new resources can be created based on input distribution
+        - Hyperparameters kept fixed and uses competitive Hebbian learning so no critical periods
+        - Tracking the number of iterations since connection use can allow control of information durability by deleting connections that haven't been used and nodes without connections on each iteration
+    - Predictive coding can be used for lifelong learning
+  - Proposed method: hierarchical self-organization
 
 ### Meta-learning / Multi-modality
 - In the meta-learning paradigm, multiple tasks are frequently used in conjunction in order to find a good starting point for a given architecture across multiple different tasks, which are later fine tuned for specific tasks.
