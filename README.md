@@ -289,6 +289,7 @@ According to [43](#references), blurred boundary continual learning is when the 
 - How to best allow the mixing of model architectures and optimization methods
   - Maybe try to just equally disperse the optimization methods used by each initial agent within a species. In addition, could force each piece (model architecture, optimization algorithm, loss/reward function, etc.) to compete ONLY with other options of the same type and score them all separately.
   - Also could record the performance of each model along each dimension of the fitness function and then choose mating partners based on complementary performance metrics but this still leaves it wondering how to optimally mix the parents.
+- Translation between genes and network
 
 ### Mechanisms that Might Evolve
 - Stabilization of the system away from an infinite positive feedback loop between two nodes or two populations
@@ -334,6 +335,16 @@ According to [43](#references), blurred boundary continual learning is when the 
   - "The utility of linear decodability however, becomes less clear for intermediate stages of information processing in higher brain areas that carry information about latent variables that support flexible mental computations. While an experimenter may apply linear decoders to find information about a hypothesized latent variable in a certain brain area, there is no a priori reason to assume that the brain relies on such decoders."
   - "For instance, ring-like manifolds, on which activity is represented by a single angular latent variable, can emerge from only weak structure in the connectivity"
 - [Model-agnostic Measure of Generalization Difficulty](https://arxiv.org/abs/2305.01034)
+- [Adaptive Inference through Early-Exit Networks: Design, Challenges and Directions](https://arxiv.org/abs/2106.05022)
+  - very interesting paper about progressive inference using an exit policy based on context
+  - probably use the "vanilla backbone networks, enhanced with early exits along their depth" approach because modularity would be useful for the gene representations
+    - "when disentangling the backbone network’s design from the early exits, one can have the flexibility of lazily selecting the architecture of the latter ones"
+  - "existence of residual connections spanning across early exits can help generalisability of the network"
+  - "maintaining multiple feature size representations, can prove detrimental in terms of model footprint"
+  - even though using a non-uniform architecture for the early exits increases the search space, it also allows for tradeoffs between "The number (and type) of exit-specific layers accuracy vs. their overhead"
+  - "too many early classifiers can negatively impact convergence when training end-to-end"
+  - equidistant vs variable distance "decision depends on the use-case, the exit rate and the accuracy of each early exit"
+  - "inter-exit distance is not actual “depth”, but can be quantified by means of FLOPs or parameters in the network"
 
 ## Future Ideas
 - Using federated learning across a variety of different hardware implementations might be usable to improve generalization across different types of hardware
