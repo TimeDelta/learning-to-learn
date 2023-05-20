@@ -33,7 +33,7 @@
 - [References](#references)
 
 ## Disclaimer
-The following is an incomplete research proposal. It is not finished being designed and not all the mentioned papers have been finished yet (some haven’t even been started). My process is usually a continuous cycle of "build it up" and "tear it down" where I come up with ideas for a while and then criticize them for a while and eventually I see what survives. Because of this, it is likely to change due to issues, contradictions, etc before implementation.
+The following is an incomplete research proposal. It is not finished being designed and not all the mentioned papers have been finished yet (some haven’t even been started). My process is usually a continuous and highly chaotic cycle of "build it up" and "tear it down" where I come up with ideas for a bit and then criticize them for a bit and eventually I see what survives. Because of this, it is likely to change due to issues, contradictions, etc before implementation.
 
 ## Contributing
 Due to limitations on my spare time, this is a public project that is open to feedback from anybody at any time. The idea is to provide a free non-degree credential for anybody looking to collaborate on and learn about an interesting research idea in neural architecture search by doing all learning in public view to simultaneously attack the stigma of making a mistake while also creating free online material from which future students can learn.
