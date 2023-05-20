@@ -344,7 +344,22 @@ According to [43](#references), blurred boundary continual learning is when the 
   - even though using a non-uniform architecture for the early exits increases the search space, it also allows for tradeoffs between "The number (and type) of exit-specific layers accuracy vs. their overhead"
   - "too many early classifiers can negatively impact convergence when training end-to-end"
   - equidistant vs variable distance "decision depends on the use-case, the exit rate and the accuracy of each early exit"
-  - "inter-exit distance is not actual “depth”, but can be quantified by means of FLOPs or parameters in the network"
+  - "inter-exit distance is not actual 'depth', but can be quantified by means of FLOPs or parameters in the network"
+  - train network and early exits together
+    - "joint loss function is shaped which sums intermediate and the last output losses (𝐿(𝑖)) in a 𝑡𝑎𝑠𝑘 weighted manner (Eq. 1) and then backpropagates the signals to the respective parts of the network"
+    - "accuracy of this approach can be higher both for the intermediate (𝑦𝑖<𝑁) and the last exit (𝑦𝑁)" but "not guaranteed due to cross-talk between exits"
+    - "interplay of multiple backpropagation signals and the relative weighting (𝑤𝑖) of the loss components" finnicky w.r.t. "enabl[ing] the extraction of reusable features across exits"
+  - train separately
+    - first train backbone then freeze it, place and train the exit policies
+    - "means that each exit is only fine-tuning its own layers and does not affect the convergence of the rest of the network"
+    - no "cross talk between classifiers nor need to hand-tune the loss function", which allows "more exit variants [to] be placed at arbitrary positions in the network and be trained in parallel, offering scalability in training while leaving the selection of exit heads for deployment time"
+    - "more restrictive in terms of degrees of freedom on the overall model changes, and thus can yield lower accuracy than an optimised jointly trained variant."
+  - can use knowledge distillation setup where "the student 𝑖 is typically an early exit and the teacher 𝑗 can be a subsequent or the last exit"
+    - hyperparameters:
+      - distillation temperature (𝑇) "controls how 'peaky' the teacher softmax (soft labels) should be"
+      - alpha (𝛼) "balances the learning objective between ground truth (𝑦) and soft labels (𝑦𝑗)"
+  - to deal with non-IID and inference-context-specific variation, can customize early exits "while retaining the performance of the last exit in the source global domain"
+    - can still be used in conjunction with knowledge distillation 
 
 ## Future Ideas
 - Using federated learning across a variety of different hardware implementations might be usable to improve generalization across different types of hardware
