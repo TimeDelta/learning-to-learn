@@ -433,3 +433,4 @@ According to [43](#references), blurred boundary continual learning is when the 
 47. [Plasticity of the Nervous System & Neuronal Activity–Regulated Gene Transcription in Synapse Development and Cognitive Function](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3098681/)
 48. [Neural Coding in Spiking Neural Networks: A Comparative Study for Robust Neuromorphic Systems](https://www.frontiersin.org/articles/10.3389/fnins.2021.638474/full)
 49. [Lifelong learning of human actions with deep neural network self-organization](https://www.sciencedirect.com/science/article/pii/S0893608017302034)
+50. [Brain-inspired learning in artificial neural networks: a review](https://arxiv.org/pdf/2305.11252.pdf)
