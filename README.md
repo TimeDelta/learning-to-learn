@@ -98,6 +98,8 @@ Due to limitations on my spare time, this is a public project that is open to fe
   - Allows easy local update rules for training such as Spike-timing-dependent plasticity (STDP), which “is the primary candidate mechanism for the storage of information in autoassociative networks” [12](#references) in the brain
   - When used in conjunction with neuromorphic hardware, they can provide a large reduction to energy consumption by switching to an event-driven model of computation
   - Including time as an explicit degree of freedom in the model allows it to more closely approximate the actual dynamics of the world.
+  - "the ability to process noisy and dynamic data" [50](#references)
+  - "more robust and fault-tolerant computing" [50](#references)
 - “Spiking Neural Networks have revealed themselves as one of the most successful approaches to model the behavior and learning potential of the brain, and exploit them to undertake practical online learning tasks” [6](#references)
 - Main existing training methods: surrogate gradients, spike-op gradient descent, realtime recurrent learning, forward gradient propagation, event-based backpropagation
   - The biggest drawback of most of these is a decrease in training efficiency in some way or (in the case of converting non-spiking to spiking) an increase in inference time but the accuracy has been shown to be comparable to the similarly trained non-spiking version of the network. This further means that the network could dynamically switch between these two modes to change time & energy tradeoffs insitu based on task necessity if the proper conditions are met for the evolution of such a mechanism.
