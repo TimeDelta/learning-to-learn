@@ -365,6 +365,11 @@ According to [43](#references), blurred boundary continual learning is when the 
   - 3 main deployment methods: up to specific exit, full adaptive inference (each sample exits early depending on difficulty), budgeted adaptive inference ("maximise the throughput of correct predictions" given i.e. a total latency budget)
   - rule-based exiting "need[s] to manually define an arbitrary threshold"
   - learned early exiting can be modeled with or without independence from previous states of exit decisions
+- [Network of Evolvable Neural Units: Evolving to Learn at a Synaptic Level](https://arxiv.org/abs/1912.07589)
+  - uses 4-gate recurrent nodes (reset, update, cell, output)
+  - each node uses same shared gate parameters
+  - each gate is a single layer feedforward network with nonlinear activation that has the same number of outputs as there are memory states
+  - this reduces the required chromosomes to two
 
 ## Future Ideas
 - Using federated learning across a variety of different hardware implementations might be usable to improve generalization across different types of hardware
