@@ -183,6 +183,7 @@ According to [43](#references), blurred boundary continual learning is when the 
 - When switching tasks, feed in the new task embedding so the model can reconfigure the IO mapping and the number of IO nodes, internal context, etc.
 - Allow nodes in the network, upon firing, to each apply some unique ordered list of effects to a subset of their outgoing connections
   - Each node also has a set of policies for choosing which of its outgoing edges to use when applying its effects (many-to-many mapping)
+    - Examples policies: newest; oldest; most or least used; most or least recently chosen in general or by x effect. Will be wasteful to track all of the necessary variables here for every node so consider each node having a mutable set that determines which pointers to track.
   - A node can have effects that require different numbers of connections
   - Each node will also have something similar to a refractory period represented as a number of touches before being able to forward its activation value to outgoing connections
   - Effects also have a connection hop policy to determine how far the effect should apply, mimicking locality of neuromodulator effects in the brain
