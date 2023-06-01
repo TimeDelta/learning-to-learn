@@ -82,7 +82,7 @@ Due to limitations on my spare time, this is a public project that is open to fe
 - Include flexible firing policy that can emulate multiple spiking mechanisms for activation sparsity and dynamic tradeoffs between spatial and temporal processing
 - Allowing each node in the network to modify any aspects of any subgraphs in the network when it fires (including itself) also allows the model to dynamically change its own learning strategies
 - Dynamic IO mapping & dynamic IO encoding
-- Use constraints on task selection for each generation’s train / test datasets to encourage generalization by encouraging things like the use of multiple learning rates, which can be used to balance memorization & generalization since learning rate can be used as a regularizing force
+- Use constraints on task selection for each generation’s train / test datasets to encourage generalization by encouraging things like the use of multiple learning rates in a single network, which can be used to balance memorization & generalization since learning rate can be used as a regularizing force
 
 ## Existing Literature
 ### Neural Architecture Search
