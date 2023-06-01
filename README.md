@@ -286,7 +286,7 @@ According to [43](#references), blurred boundary continual learning is when the 
 - How to incorporate continuous time with the modulatory effects
 - How to encourage the use of unsupervised tasks for learning
 - How to curate the available tasks in a way that will encourage generalization to new tasks and modalities
-- Is there a way to include unsupervised tasks in the eval set, especially in an unbiased way (clustering method metrics like silhouette or penalizing intravariance introduce intrinsic bias in the signal)? Closest proxy I can think of is self-supervised like an LM or autoencoder but even those have bias in the loss function itself and the whole point of including unsupervised tasks is to allow it to learn in an unbiased manner
+- Is there a way to include unsupervised tasks in the eval set, especially in an unbiased way (clustering method metrics like silhouette or penalizing intravariance introduce intrinsic bias in the signal)? Closest proxy I can think of is self-supervised like an LM or autoencoder but even those have bias in the loss function itself and the whole point of including unsupervised tasks is to allow it to learn in an unbiased manner from ambient stimuli.
   - Could we induce the networks to incorporate unsupervised learning after a number of generations by including unsupervised learning for each modality before the training for that generation?
   - Without this, might not be worth having unsupervised learning
 - Whether I will need to incorporate compression into the main goal or if the time and memory complexity is a good enough proxy
