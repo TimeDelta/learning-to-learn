@@ -376,6 +376,7 @@ According to [43](#references), blurred boundary continual learning is when the 
   - this reduces the required chromosomes to two
 - [Leveraging dendritic properties to advance machine learning and neuro-inspired computing](https://arxiv.org/abs/2306.08007)
 - [Dendrites and Efficiency: Optimizing Performance and Resource Utilization](https://arxiv.org/abs/2306.07101)
+- [Faith and Fate: Limits of Transformers on Compositionality](https://arxiv.org/pdf/2305.18654.pdf)
 
 ## Future Ideas
 - Using federated learning across a variety of different hardware implementations might be usable to improve generalization across different types of hardware
