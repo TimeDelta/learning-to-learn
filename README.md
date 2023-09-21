@@ -201,8 +201,7 @@ According to [43](#references), blurred boundary continual learning is when the 
 - Use an evolutionary algorithm to find the final starting point for the learning algorithm / model combination
   - Incorporate time cost and memory cost into the fitness function
     - e.g. for each task, a\*score + b/normalized_mem_cost + c/normalized_time_cost, where a+b+c=1 w/ d weight on area under this curve when plotted over each training iteration and e weight given to the value over the test set, where d+e=1 and take the "macro" mean (equal weight to every task).
-      - Score would be something like F1 or MCC divided by (false_positives+1) for supervised classification tasks (or things like BLEU for translation) and the normalized total reward for reinforcement context. Basically each task has to define its own metric.
-        - Dividing the combined score by the number of false positives in the supervised classification context should heavily bias the evolved learner toward deduction without forcing it to only use deduction. My intuition says false positives are generally more costly than false negatives so start with that and then compare to dividing by false negatives.
+      - Scoring metric is defined separately for each task.
       - This adds competing evolutionary pressures. One to generalize to unseen data (test set fitness) and another to quickly learn or memorize (area under training curve) with the ability to change each factor’s relative importance
     - This also adds pressure to compress the behavioral dynamics across time and memory
   - Start with an initial population that is implementations of existing algorithms in this framework ([details](#initial-population))
