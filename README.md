@@ -210,7 +210,6 @@ According to [43](#references), blurred boundary continual learning is when the 
       - We won’t know when adding another piece of the initial population to a species would be beneficial.
 - To allow for reinforcement, supervised and unsupervised learning in the same network, there will be at least five special input nodes (likely more). One will represent reward for reinforcement learning. For each output node, include an extra input node for that node’s loss (minimum of one node). The remaining three in the minimum set are to signify which of these learning types should be used.
 - Set aside a held out data set (equal distribution across every task) to ensure generalization of final learner
-- To avoid obscure failure modes caused by data quality issues or poisoning attacks, use smaller hand-crafted datasets that are designed to teach specific lessons and, when possible, use data generators that are designed to teach specific lessons instead. -> still vulnerable to reward hacking w/ data generators?
 - Basic reinforcement learning tasks necessary for a cognitive map of task space [38](#references)
   - Data can easily be generated on the spot for most of these because the modality and dimensions don't particularly matter since we can define the task to just choose a random modality, input dimensions (above a different min per task), target action embeddings, target stimulus (might want to add Gausian noise), etc.
   - Probabilistic and non-probabilistic reversal learning
