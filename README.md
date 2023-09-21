@@ -1,5 +1,4 @@
-# Learning to Learn: Evolving Generalized Self-Organizing Cyclic Spiking Computation Graphs
-("Recurrent" sometimes has the connotation of only including edges from a node to itself, which is wholly insufficient for the feedback loops I'm picturing)
+# Learning to Learn: Evolving Generalized Self-Organizing Recurrent Spiking Computation Graphs
 
 ## Contents
 - [Disclaimer](#disclaimer)
