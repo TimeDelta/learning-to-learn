@@ -279,6 +279,7 @@ According to [43](#references), blurred boundary continual learning is when the 
 #### Non-learning algorithms (not part of population but can be referenced by genes)
 
 ### Known Unsolved Problems
+- How to best limit the combinatorial increase in search space
 - Ensuring alignment is maintained in production without reverting to the original network in between tasks so that online learning can take place. RLHF might not be a scalable enough solution and RLAIF could be too dangerous.
 - How to efficiently parallelize both the evolutionary algorithm using federated learning and the final result
 - How to incorporate continuous time with the modulatory effects
