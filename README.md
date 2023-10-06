@@ -89,7 +89,7 @@ Due to limitations on my spare time, this is a public project that is open to fe
   - Limited adaptability: The final solution is static (even ones with continued online learning have a static learning paradigm)
   - Limited degrees of freedom: Most focus on topology and/or weights
      - “Such experimental trials convinced us that to solve the [Neural Architecture Search] dilemma, the connectionist paradigm alone is not adequate.” [1](#references)
-  - "there is evidence that [weight sharing] inhibits the search for optimal architectures (Yu et al., 2020)" [5](#refernces)
+  - Weight sharing speeds up the search but "there is evidence that [weight sharing] inhibits the search for optimal architectures (Yu et al., 2020)" [5](#refernces)
   - Can take a while to find solution
      - [5](#references) addresses this by linearizing the loss function of untrained networks at the data points in each batch and using Kendall’s Tau correlation coefficient, which measures the strength and direction of association that exists between two variables, to determine that an initialized network is not worth training. It is uncertain whether this generalizes to harder tasks. It also remains to be seen whether it can be used for an unsupervised context. It might be adaptable to reinforcement learning but that has not been shown and likely would prove unstable due to the general sparsity of signal in the reinforcement context. It's also unclear if this method can be adapted to spiking neural networks.
 
