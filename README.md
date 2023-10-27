@@ -53,7 +53,7 @@ Due to limitations on my spare time, this is a public project that is open to fe
 - Incorporate multiple, complementary learning paradigms in a single network, i.e.
   - Supervised, unsupervised & reinforcement learning
   - Local and global
-  - Different learning rates throughout the network (like how the hippocampus has to quickly form and hold on to episodic memories but the cortex learns more slowly)
+  - Different learning rates throughout the network (like how the hippocampus has to quickly form and hold on to episodic memories but the neocortex learns more slowly)
   - Different state management methods
 - Increase control of the tradeoff between memory and time complexity of final learner
 - Mitigate the amount of human influence in the design of the model architecture and learning algorithm used in the final solution, instead focusing on easily compared empirical results
