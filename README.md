@@ -14,7 +14,6 @@
   - [Self-Modification / Self-Organization](#self-modification--self-organization)
   - [Meta-Learning / Multi-Modality](#meta-learning--multi-modality)
   - [Transformer Architecture](#transformer-architecture)
-  - [In-Context Learning for Transformer-Based LLMs](#in-context-learning-for-transformer-based-llms)
   - [Spiking Graph Neural Networks](#spiking-graph-neural-networks)
   - [Universal Approximation](#universal-approximation)
   - [Compression as a Goal](#compression-as-a-goal)
@@ -145,13 +144,6 @@ Due to limitations on my spare time, this is a public project that is open to fe
 - “the current hidden representation of a Transformer only accesses the past representations of lower layers, even though higher level representations of the past have already been computed as an autoregressive model.” [26](#references)
 - Supposedly reducible to a combinatorial Hopf Algebra [25](#references)
   - “The representation theory of a Hopf algebra is particularly nice, since the existence of compatible comultiplication, counit, and antipode allows for the construction of tensor products of representations, trivial representations, and dual representations.” - Wikipedia
-
-### In-context Learning for Transformer-based LLMs
-- In-Context Learning does not actually modify the underlying network in any way (no actual learning occurs)
-- ICL in smaller (tractable) attention-only transformer-based LLMs likely relies on skip trigram detectors and induction heads that act as “in-context nearest neighbors” [Chris Olah]
-  - Is also a subset of what I’m proposing
-  - Could be other mechanisms involved when adding the MLP but they would also be evolvable by my method if they provide a benefit
-- Not able to leverage deduction very well
 
 ### Spiking Graph Neural Networks
 - “The striking feature of this plot is its self-similarity - in some ways it looks like a fractal. … figure 5 strongly supports the claim that the degree distribution of a graph received from this numerical experiment follows a power law (similar plot was obtained in a number of simulations).” [30](#references)
