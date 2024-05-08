@@ -288,7 +288,7 @@ According to [43](#references), blurred boundary continual learning is when the 
 
 ### Mechanisms that Might Evolve
 - Stabilization of the system away from an infinite positive feedback loop between two nodes or two populations
-  - Removal of nodes / edges in the case of prolonged overstimulation similar to excitotoxicity (maybe using a critical-point-based phase transition like in percolation for detection)
+  - Removal of nodes / edges in the case of prolonged overstimulation similar to excitotoxicity
     - seems unlikely that the node would be deleted though due to the current relative density of information contained there vs the edges. Perhaps I should allow dynamically adding edge parameters for storage to even out the parameter density?
 - Reordering mechanism that increases representational capacity of self-organizing effects
   - Modularizing the effects into groups that are interspersed with reordering effects
