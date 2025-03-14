@@ -30,22 +30,6 @@
 - [Maybe Ideas](#maybe-ideas)
 - [References](#references)
 
-## Disclaimer
-The following is an incomplete research proposal. It is not finished being designed and not all the mentioned papers have been finished yet (some haven’t even been started). Because of this, it is likely to change due to issues, contradictions, etc before implementation.
-
-## Contributing
-Due to limitations on my spare time, this is a public project that is open to feedback from anybody at any time. The idea is to provide a free non-degree credential for anybody looking to collaborate on and learn about an interesting research idea in neural architecture search by doing all learning in public view to simultaneously attack the stigma of making a mistake while also creating free online material from which future students can learn.
-
-### Guidelines
-- Use pull requests to suggest content modifications
-- Definition of *content curator*: anybody whose content has been added to any branch
-- Content modifications should be backed up by citations unless exempted by at least 75% of content curators
-- Discussions space is open to anybody and should be used for debating content modifications in order to ensure adherence to the main tenets of the project (public learning as credentials and material for future students).
-- Any content curator can call a vote to merge content at any time.
-  - Voting closes a week after it is called or once success criteria is met
-    - Success criteria: either at least 50% of all content curators or 50% of final votes after poll close are in favor.
-  - Original author of content suggested in the discussions tab has first right to requesting the content be approved via pull request.
-
 ## Main Goals
 - Improve model inference-time efficiency (less compute resources required along an arbitrary metric)
 - Increase model representational density
