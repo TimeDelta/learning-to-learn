@@ -68,7 +68,7 @@ Due to limitations on my spare time, this is a public project that is open to fe
 ## Inspiration
 - Mitigating human influence in the learning paradigm and model architecture enough to support the other goals likely requires the use of an evolutionary approach
   - Unfortunately, whether the approach works for our purposes is also highly dependent on how it is implemented and what degrees of freedom it allows.
-- Key fact: Biological neurons are able to modify their genetic expression (methylation and acetylation) based on environmental cues like when a specific neurotransmitter binds to a receptor in the cell wall (this can happen every time cells involved in a synapse communicate)
+- Key fact: Biological neurons are able to modify their genetic expression (methylation and acetylation) based on the accumulation of environmental cues (usually over the course of minutes to hours) like when a specific neurotransmitter binds to a receptor in the cell wall (this can happen every time cells involved in a synapse communicate)
   - See [46](#references) and [47](#references)
   - In other words, they have many more degrees of freedom and a larger variety of types of DoF that they can utilize for learning than what we currently simulate
 - Guiding Principle: Assuming a system can self-improve, increasing the diversity of computational bases on which the system can rely is likely to increase the probability that the system will be able to reach a better value for itself along a given dimension (efficiency, accuracy, etc.) by increasing the variety of options in the search space, which allows more possible combinations of tradeoffs at the cost of a combinatorial increase in search space size (which will be mitigated later).
