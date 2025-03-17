@@ -7,16 +7,7 @@ import torch.nn as nn
 
 from loss import MSELoss
 
-def base_model_loss_function(data, model): # model should be a PyTorch model
-    model.eval()
-    loss = 0.
-    for example in data:
-        with torch.no_grad():
-            actual = model(example[0])
-        loss += (actual - expected) ** 2
-    return loss
-
-def eval_genomes(genomes, config, model, loss_fn, initial_params, steps=10, epsilon=1e-10):
+def eval_genomes(genomes, config, loss_fn, steps=10, epsilon=1e-10):
     """
     Evaluate each genome by using its network as a meta–optimizer.
 
@@ -141,12 +132,8 @@ def override_initial_population(population, config):
     """
     if optimizer == 'adam_backprop':
         script_module = torch.jit.load('computation_graphs/optimizers/adam_backprop.pt')
-    elif optimizer == 'adam_finite_diff':
-        script_module = torch.jit.load('computation_graphs/optimizers/adam_finite_diff.pt')
     elif optimizer == 'gd_backprop':
         script_module = torch.jit.load('computation_graphs/optimizers/gradient_descent_backprop.pt')
-    elif optimizer == 'gd_finite_diff':
-        script_module = torch.jit.load('gradient_descent_finite_diff.pt')
     # below is a torch._C.Graph object. interface is unstable so lock to specific version of PyTorch
     graph = script_module.graph
     for node in graph.nodes():
