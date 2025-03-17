@@ -1,5 +1,9 @@
 import torch
 import torch.nn as nn
+from torch.nn.parameter import Parameter
+import warnings
+
+from typing import Dict, List, Tuple
 
 class BackpropGD(nn.Module):
     def __init__(self, step_size=0.1):
@@ -10,15 +14,16 @@ class BackpropGD(nn.Module):
         super(BackpropGD, self).__init__()
         self.step_size = step_size
 
-    def forward(self, model, loss_fn):
-        """
-        compute new parameters
-        """
+    def forward(self, loss: torch.Tensor, prev_loss: torch.Tensor, named_parameters: List[Tuple[str, Parameter]]) -> Dict[str, torch.Tensor]:
+        param_list = [param for _, param in named_parameters]
         # create_graph=False for efficiency
-        grads = torch.autograd.grad(loss_fn(model), model.parameters(), create_graph=False)
+        grads = torch.autograd.grad([loss], param_list, create_graph=False)
 
         new_params = {}
-        for (name, param), grad in zip(model.named_parameters(), grads):
+        for (name, param), grad in zip(named_parameters, grads):
+            if grad is None:
+                warnings.warn("Gradient is zero for parameter " + name)
+                grad = torch.zeros_like(param)
             new_params[name] = param - self.step_size * grad
 
         return new_params

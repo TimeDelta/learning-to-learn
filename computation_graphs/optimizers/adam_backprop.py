@@ -20,6 +20,7 @@ class AdamBackprop(nn.Module):
 
     def forward(self, loss: torch.Tensor, prev_loss: torch.Tensor, named_parameters: List[Tuple[str, Parameter]]) -> Dict[str, torch.Tensor]:
         param_list = [param for _, param in named_parameters]
+        # create_graph=False for efficiency
         grads = torch.autograd.grad([loss], param_list, create_graph=False)
         self.step += 1
         new_params: Dict[str, torch.Tensor] = {}
