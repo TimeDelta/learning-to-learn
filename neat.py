@@ -49,12 +49,12 @@ def evaluate_optimizer(optimizer, model, loss_fn, steps=10):
     Returns:
       1/∑_steps_(∑_dimensions_(loss))
     """
-    current_param = initial_param
     prev_loss = loss_fn(model)
     area_under_loss = prev_loss
 
     for step in range(steps):
-        model = optimizer(model, loss_fn, prev_loss)
+        new_params = optimizer(loss_fn(model), prev_loss, model.named_parameters())
+        model.load_state_dict(new_params)
         prev_loss = loss_fn(model)
         area_under_loss += prev_loss
 
