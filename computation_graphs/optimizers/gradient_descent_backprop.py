@@ -23,11 +23,8 @@ class BackpropGD(nn.Module):
 
         return new_params
 
-loss_fn_placeholder = lambda model: (sum(param.sum() for param in model.parameters()) - 42)**2
-
 if __name__ == "__main__":
-    optimizer_module = BackpropGD()
     # generate dynamic computation graph:
-    traced_module = torch.jit.script(optimizer_module, (torch.randn(5), loss_fn_placeholder))
-    print(traced_module.graph)
-    torch.jit.save(traced_module, __file__.replace('.py', '.pt'))
+    optimizer = torch.jit.script(BackpropGD())
+    torch.jit.save(optimizer, __file__.replace('.py', '.pt'))
+    print(optimizer.graph)

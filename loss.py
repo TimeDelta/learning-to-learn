@@ -1,13 +1,10 @@
-import numpy as np
 import torch
 import torch.nn as nn
 
-class MSELossFunctionWrapper(nn.Module):
-    def __init__(self, inputs: torch.Tensor, targets: torch.Tensor):
-        super(LossFunctionWrapper, self).__init__()
-        self.inputs = inputs
-        self.targets = targets
-
-    def forward(self, model: nn.Module) -> torch.Tensor:
-        output = model(self.inputs)
-        return nn.functional.mse_loss(output, self.targets)
+class MSELoss:
+    def __init__(self, input: torch.Tensor, target: torch.Tensor):
+        self.input = input
+        self.target = target
+    def __call__(self, model: torch.nn.Module) -> torch.Tensor
+        output = model(self.input)
+        return nn.functional.mse_loss(output, self.target)

@@ -2,6 +2,10 @@ import neat
 import math
 import random
 import copy
+import torch
+import torch.nn as nn
+
+from loss import MSELoss
 
 def base_model_loss_function(data, model): # model should be a PyTorch model
     model.eval()
@@ -12,106 +16,27 @@ def base_model_loss_function(data, model): # model should be a PyTorch model
         loss += (actual - expected) ** 2
     return loss
 
-def update_model_params(model, weights, biases, weight_keys, bias_keys):
+def eval_genomes(genomes, config, model, loss_fn, initial_params, steps=10, epsilon=1e-10):
     """
-    Update the model's parameters using its state dict.
-
-    Parameters:
-      - model: the PyTorch model.
-      - weights: a list of new weight values (as tensors) for the keys in weight_keys.
-      - biases: a list of new bias values (as tensors) for the keys in bias_keys.
-      - weight_keys: list of state_dict keys corresponding to the weight parameters.
-      - bias_keys: list of state_dict keys corresponding to the bias parameters.
-    """
-    state_dict = model.state_dict()
-    for i, key in enumerate(weight_keys):
-        state_dict[key] = weights[i]
-    for i, key in enumerate(bias_keys):
-        state_dict[key] = biases[i]
-    model.load_state_dict(state_dict)
-
-def eval_genomes(genomes, config, model, loss_fn,
-                 initial_weights, initial_biases, weight_keys, bias_keys,
-                 steps=10, epsilon=1e-6):
-    """
-    Evaluate each genome by using its network as a meta–optimizer that updates both
-    the weight and bias parameters of a model via PyTorch's state dict.
+    Evaluate each genome by using its network as a meta–optimizer.
 
     Parameters:
       - genomes: list of (genome_id, genome) tuples
       - config: NEAT configuration
-      - model: the PyTorch model to be optimized
-      - loss_fn: function accepting the model and returning a scalar loss
-      - initial_weights: list of initial weight values (each as a torch.Tensor)
-      - initial_biases: list of initial bias values (each as a torch.Tensor)
-      - weight_keys: list of state_dict keys for the weights
-      - bias_keys: list of state_dict keys for the biases.
-      - steps: number of optimization steps.
-      - epsilon: a small constant to avoid division by zero.
-
-    For each parameter pair, the meta–optimizer (a NEAT-evolved network) receives an input vector:
-        [current_weight, current_bias, global_loss, prev_query_loss]
-    and outputs two numbers: [new_weight, new_bias].
-
-    The global loss is computed by updating the model with the full set of parameters.
-    For each parameter pair, a temporary update is applied to compute a query loss.
 
     The final fitness is defined as:
          1.0 / (final_global_loss + average_query_loss + epsilon)
     """
     for genome_id, genome in genomes:
-        # Create the meta-optimizer network.
-        net = CustomFeedForwardNetwork.create(genome, config)
+        model_copy = copy.deepcopy(model)
+        optimizer = CustomFeedForwardNetwork.create(genome, config)
+        evaluate_optimizer(optimizer, model_copy, loss_fn) # TODO dynamically determine num steps based on generation num
 
-        # Start with copies of the initial parameters.
-        weights = list(initial_weights)
-        biases = list(initial_biases)
-
-        # Update the model with the initial parameters.
-        update_model_params(model, weights, biases, weight_keys, bias_keys)
-        global_loss = loss_fn(model)
-        # Initialize previous query losses for each parameter pair.
-        prev_query_losses = [global_loss for _ in weights]
-
-        for step in range(steps):
-            update_model_params(model, weights, biases, weight_keys, bias_keys)
-            global_loss = loss_fn(model)
-            new_weights = []
-            new_biases = []
-            new_prev_query_losses = []
-
-            # Update each parameter pair independently.
-            for i, (w, b) in enumerate(zip(weights, biases)):
-                # Convert tensor values to Python floats if needed.
-                w_val = w.item() if isinstance(w, torch.Tensor) else w
-                b_val = b.item() if isinstance(b, torch.Tensor) else b
-                input_vector = [w_val, b_val, global_loss, prev_query_losses[i]]
-                outputs = net.activate(input_vector)
-                # Use the outputs as the new weight and bias values.
-                new_w = torch.tensor(outputs[0])
-                new_b = torch.tensor(outputs[1])
-                new_weights.append(new_w)
-                new_biases.append(new_b)
-
-                # Compute the query loss for parameter i by updating just that parameter.
-                temp_weights = weights.copy()
-                temp_biases = biases.copy()
-                temp_weights[i] = new_w
-                temp_biases[i] = new_b
-                update_model_params(model, temp_weights, temp_biases, weight_keys, bias_keys)
-                query_loss = loss_fn(model)
-                new_prev_query_losses.append(query_loss)
-
-            weights = new_weights
-            biases = new_biases
-            prev_query_losses = new_prev_query_losses
-
-        update_model_params(model, weights, biases, weight_keys, bias_keys)
         final_loss = loss_fn(model)
         avg_query_loss = sum(prev_query_losses) / len(prev_query_losses)
         genome.fitness = 1.0 / (final_loss + avg_query_loss + epsilon)
 
-def evaluate_optimizer(optimizer, model, loss_fn, initial_param, steps=10):
+def evaluate_optimizer(optimizer, model, loss_fn, steps=10):
     """
     Runs the optimizer over a number of steps.
 
@@ -119,26 +44,25 @@ def evaluate_optimizer(optimizer, model, loss_fn, initial_param, steps=10):
       optimizer: An instance of SymbolicOptimizer (or subclass) that updates a parameter.
       model: The model whose performance is measured by loss_fn.
       loss_fn: Function that takes the model (or a parameter) and returns a scalar loss.
-      initial_param: The starting parameter value (assumed scalar for simplicity).
       steps: Number of update iterations.
 
     Returns:
-      The final parameter value and final loss.
+      1/∑_steps_(∑_dimensions_(loss))
     """
     current_param = initial_param
     prev_loss = loss_fn(model)
+    area_under_loss = prev_loss
 
     for step in range(steps):
-        inputs = compute_symbolic_inputs(optimizer, model, current_param, prev_loss, loss_fn)
-        new_param = optimizer(inputs, loss_fn, current_param)
-        current_param = new_param.item() if isinstance(new_param, torch.Tensor) else new_param
+        model = optimizer(model, loss_fn, prev_loss)
         prev_loss = loss_fn(model)
+        area_under_loss += prev_loss
 
-    final_loss = loss_fn(model)
-    return current_param, final_loss
+    return 1 / area_under_loss.sum()
 
 def eval_genomes_wrapper(genomes, config):
-    eval_genomes(genomes, config, quadratic_loss, init_param=0.0, steps=10)
+    # TODO: load data
+    eval_genomes(genomes, config, MSELoss(data), steps=10)
 
 # This is a subclass of the neat-python FeedForwardNetwork that we can later extend
 # if we need more control over the network’s behavior.
@@ -211,19 +135,22 @@ def create_initial_genome(config):
     genome.connections = connections
     return genome
 
-def initialize_population(config):
+def override_initial_population(population, config):
     """
     Overrides the initial genomes in the population with copies of the exact initial genome.
     """
-    if optimizer == 'hill':
-        script_module = torch.jit.load('computation_graphs/optimizers/hill_climber.pt')
+    if optimizer == 'adam_backprop':
+        script_module = torch.jit.load('computation_graphs/optimizers/adam_backprop.pt')
+    elif optimizer == 'adam_finite_diff':
+        script_module = torch.jit.load('computation_graphs/optimizers/adam_finite_diff.pt')
     elif optimizer == 'gd_backprop':
         script_module = torch.jit.load('computation_graphs/optimizers/gradient_descent_backprop.pt')
     elif optimizer == 'gd_finite_diff':
         script_module = torch.jit.load('gradient_descent_finite_diff.pt')
-    # below is a torch._C.Graph object interface is unstable so lock to specific version of PyTorch
+    # below is a torch._C.Graph object. interface is unstable so lock to specific version of PyTorch
     graph = script_module.graph
     for node in graph.nodes():
+        # TODO
         print(node)
     base_genome = create_initial_genome(config)
     new_population = {}
@@ -234,22 +161,19 @@ def initialize_population(config):
     population.population = new_population
 
 if __name__ == "__main__":
-    # Assumes the configuration file is named 'config-meta'
     config = neat.Config(neat.DefaultGenome,
                          neat.DefaultReproduction,
                          neat.DefaultSpeciesSet,
                          neat.DefaultStagnation,
-                         config_file)
-    population = neat.Population('neat-config')
+                         'neat-config')
+    population = neat.Population(config)
 
-    # Override the population with our exact initial genome.
-    initialize_population_with_exact_network(population, config)
+    override_initial_population(population, config)
 
-    # Add reporters.
     population.add_reporter(neat.StdOutReporter(True))
     stats = neat.StatisticsReporter()
     population.add_reporter(stats)
 
-    # Run NEAT for up to 100 generations.
-    winner = population.run(eval_genomes_wrapper, 100)
+    num_generations = 1000
+    winner = population.run(eval_genomes_wrapper, num_generations)
     print('\nBest genome:\n{!s}'.format(winner))

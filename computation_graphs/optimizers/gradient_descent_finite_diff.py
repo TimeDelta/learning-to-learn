@@ -27,8 +27,7 @@ class FiniteDifferenceGD(nn.Module):
         return params
 
 if __name__ == "__main__":
-    optimizer_module = FiniteDifferenceGD()
     # generate dynamic computation graph:
-    traced_module = torch.jit.script(optimizer_module, (torch.randn(5), lambda model: 1))
-    print(traced_module.graph)
-    torch.jit.save(traced_module, __file__.replace('.py', '.pt'))
+    optimizer = torch.jit.script(FiniteDifferenceGD())
+    torch.jit.save(optimizer, __file__.replace('.py', '.pt'))
+    print(optimizer.graph)
