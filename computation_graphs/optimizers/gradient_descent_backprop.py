@@ -1,9 +1,8 @@
 import torch
 import torch.nn as nn
 from torch.nn.parameter import Parameter
-import warnings
-
 from typing import Dict, List, Tuple
+import warnings
 
 class BackpropGD(nn.Module):
     def __init__(self, step_size=0.1):
