@@ -174,14 +174,15 @@ According to [43](#references), blurred boundary continual learning is when the 
     - Change input / output node mapping to data / meaning
       - Number of necessary IO nodes is different per task
       - Allows for tradeoff between time and memory costs in scalability of input / output sizes (like a saccade)
-- Use an evolutionary algorithm to find the final starting point for the learning algorithm / model combination
+- Use an evolutionary algorithm (e.g. variant of NEAT) to find the final starting point for the learning algorithm / model combination
   - Incorporate time cost and memory cost into the fitness function
     - e.g. for each task, a\*score + b/normalized_mem_cost + c/normalized_time_cost, where a+b+c=1 w/ d weight on area under this curve when plotted over each training iteration and e weight given to the value over the test set, where d+e=1 and take the "macro" mean (equal weight to every task).
       - Scoring metric is defined separately for each task.
       - This adds competing evolutionary pressures. One to generalize to unseen data (test set fitness) and another to quickly learn or memorize (area under training curve) with the ability to change each factor’s relative importance
     - This also adds pressure to compress the behavioral dynamics across time and memory
   - Start with an initial population that is implementations of existing algorithms in this framework ([details](#initial-population))
-    - Might be able to get a head start on this by generating computation graphs from open source code
+    - Can generate computation graphs from open source code using PyTorch's TorchScript
+    - Look for gene combinations common to high performing individuals in species to find useful things to propagate across species
     - Use a boolean on each origin species that prevents it from full collapse for the first X generations (minimum population of Y) to ensure the final learner has a fair chance of incorporating the important components from the initial population.
       - We won’t know when adding another piece of the initial population to a species would be beneficial.
 - To allow for reinforcement, supervised and unsupervised learning in the same network, there will be at least five special input nodes (likely more). One will represent reward for reinforcement learning. For each output node, include an extra input node for that node’s loss (minimum of one node). The remaining three in the minimum set are to signify which of these learning types should be used.
