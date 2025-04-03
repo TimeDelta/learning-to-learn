@@ -5,10 +5,6 @@ class ActivationFunction:
     def __str__(self) -> str:
         return self.__class__.__name__
 
-class Identity(ActivationFunction):
-    def __call__    (self, x: float) -> float:
-        return x
-
 class Tanh(ActivationFunction):
     def __call__    (self, x: float) -> float:
         return math.tanh(x)

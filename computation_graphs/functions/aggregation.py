@@ -1,3 +1,5 @@
+from typing import List
+
 class AggregationFunction:
     def __call__(self, inputs: List[float]) -> float:
         raise NotImplementedError(f"Must implement __call__ method for {self} aggregation.")

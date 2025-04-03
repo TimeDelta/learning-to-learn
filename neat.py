@@ -5,6 +5,8 @@ import copy
 import torch
 import torch.nn as nn
 
+from computation_graphs.functions.activation import *
+from computation_graphs.functions.aggregation import *
 from loss import MSELoss
 
 def eval_genomes(genomes, config, loss_fn, steps=10, epsilon=1e-10):
@@ -18,14 +20,24 @@ def eval_genomes(genomes, config, loss_fn, steps=10, epsilon=1e-10):
     The final fitness is defined as:
          1.0 / (final_global_loss + average_query_loss + epsilon)
     """
+    losses = {}
     for genome_id, genome in genomes:
         model_copy = copy.deepcopy(model)
         optimizer = CustomFeedForwardNetwork.create(genome, config)
-        evaluate_optimizer(optimizer, model_copy, loss_fn) # TODO dynamically determine num steps based on generation num
+        # TODO dynamically determine num steps based on generation num
+        loss_parts = evaluate_optimizer(optimizer, model_copy, loss_fn)
+        losses[genome_id] = loss_parts
 
-        final_loss = loss_fn(model)
-        avg_query_loss = sum(prev_query_losses) / len(prev_query_losses)
-        genome.fitness = 1.0 / (final_loss + avg_query_loss + epsilon)
+    num_dims = len(next(iter(losses.values())))
+    max_vals = [max(losses[genome_id][i] for genome_id in losses) for i in range(num_dims)]
+
+    normalized_losses = {}
+    for genome_id, genome in genomes:
+        loss_parts = losses[genome_id]
+        # equal weighting to all parts of the loss function for now
+        normalized = sum([loss_parts[i] / max_vals[i] / num_dims for i in range(num_dims)])
+        normalized_losses[genome_id] = normalized
+        genome.fitness = 1.0 / (final_loss + epsilon)
 
 def evaluate_optimizer(optimizer, model, loss_fn, steps=10):
     """
@@ -40,111 +52,91 @@ def evaluate_optimizer(optimizer, model, loss_fn, steps=10):
     Returns:
       1/∑_steps_(∑_dimensions_(loss))
     """
-    prev_loss = loss_fn(model)
-    area_under_loss = prev_loss
+    loss = loss_fn(model)
+    area_under_loss = loss
 
     for step in range(steps):
-        new_params = optimizer(loss_fn(model), prev_loss, model.named_parameters())
+        # TODO measure time_taken
+        new_params = optimizer(loss_fn(model), loss, model.named_parameters())
         model.load_state_dict(new_params)
-        prev_loss = loss_fn(model)
-        area_under_loss += prev_loss
+        loss = loss_fn(model)
+        area_under_loss += loss
+    # TODO add loss over validation data
+    # TODO add loss part for num nodes and edges in optimizer
 
-    return 1 / area_under_loss.sum()
+    return [area_under_loss, validation_loss, optimizer_time, optimizer_size]
 
 def eval_genomes_wrapper(genomes, config):
     # TODO: load data
     eval_genomes(genomes, config, MSELoss(data), steps=10)
 
-# This is a subclass of the neat-python FeedForwardNetwork that we can later extend
-# if we need more control over the network’s behavior.
-class CustomFeedForwardNetwork(neat.nn.FeedForwardNetwork):
-    @classmethod
-    def create(cls, genome, config):
-        # default create won't work: TODO
-        return super(CustomFeedForwardNetwork, cls).create(genome, config)
-
-def create_initial_genome(config):
+def create_initial_genome(config, optimizer):
     """
-    Creates a genome with an exact initial network structure.
-
-    In this example we assume a network with 4 inputs (0-3) and 2 outputs (4-5),
-    plus one hidden node (6). Inputs 0-3 connect to the hidden node, and the hidden node
-    connects to both outputs.
+    Creates an initial genome that mirrors the structure of the provided TorchScript optimizer computation graph.
     """
-    # Create a new genome with key 0 (the key will be re-assigned later for each population member).
     genome = config.genome_type(0)
 
-    # Manually create nodes.
-    # For neat-python, node genes are stored in genome.nodes (a dict mapping node key to node gene).
-    # We create nodes with the necessary parameters. Here we assume the defaults for bias, response, etc.
-    input_keys = [0, 1, 2, 3]
-    output_keys = [4, 5]
-    hidden_keys = [6]
+    graph = optimizer.graph
 
-    for k in input_keys:
-        genome.nodes[k] = config.genome_type.NodeGene(k)
-        genome.nodes[k].bias = 0.0
-        genome.nodes[k].activation = 'tanh'
-        genome.nodes[k].aggregation = 'sum'
+    activation_mapping = {
+        "aten::tanh": Tanh(),
+        "aten::relu": ReLU(),
+        # TODO add more
+    }
+    aggregation_mapping = {
+        "aten::add": Sum(),
+        "aten::mul": Product(),
+        # TODO add more
+    }
 
-    for k in output_keys:
-        genome.nodes[k] = config.genome_type.NodeGene(k)
-        genome.nodes[k].bias = 0.0
-        genome.nodes[k].activation = 'tanh'
-        genome.nodes[k].aggregation = 'sum'
+    node_mapping = {} # from TorchScript nodes to genome node keys
+    next_node_id = 0
+    for node in graph.nodes():
+        op_kind = node.kind()
+        activation = activation_mapping.get(op_kind)
+        aggregation = aggregation_mapping.get(op_kind)
+        if not activation and not aggregation:
+            raise Exception('Unknown function mapping: ' + str(op_kind))
 
-    for k in hidden_keys:
-        genome.nodes[k] = config.genome_type.NodeGene(k)
-        genome.nodes[k].bias = 0.0
-        genome.nodes[k].activation = 'tanh'
-        genome.nodes[k].aggregation = 'sum'
+        new_node = config.genome_type.NodeGene(next_node_id)
+        new_node.activation = activation
+        new_node.aggregation = aggregation
+        genome.nodes[next_node_id] = new_node
 
-    # Manually create connections.
-    # In neat-python, connections are stored in genome.connections, a dict keyed by a tuple (in_node, out_node).
-    # We add connections from each input to the hidden node, then from the hidden node to each output.
+        node_mapping[node] = next_node_id
+        next_node_id += 1
+
     connections = {}
     innovation = 0
-
-    for in_node in input_keys:
-        key = (in_node, 6)
-        conn = config.genome_type.ConnectionGene(key, 0.0)
-        conn.weight = 1.0
-        conn.enabled = True
-        conn.innovation = innovation
-        innovation += 1
-        connections[key] = conn
-
-    for out_node in output_keys:
-        key = (6, out_node)
-        conn = config.genome_type.ConnectionGene(key, 0.0)
-        conn.weight = 1.0
-        conn.enabled = True
-        conn.innovation = innovation
-        innovation += 1
-        connections[key] = conn
+    for node in graph.nodes():
+        current_key = node_mapping[node]
+        for inp in node.inputs():
+            producer = inp.node()
+            # only create a connection if the producer is part of our mapping
+            if producer in node_mapping:
+                in_key = node_mapping[producer]
+                key = (in_key, current_key)
+                conn = config.genome_type.ConnectionGene(key, 0.0)
+                conn.weight = 1.0
+                conn.enabled = True
+                conn.innovation = innovation
+                innovation += 1
+                connections[key] = conn
 
     genome.connections = connections
     return genome
 
-def override_initial_population(population, config):
+def override_initial_population(population, config, optimizers):
     """
     Overrides the initial genomes in the population with copies of the exact initial genome.
     """
-    if optimizer == 'adam_backprop':
-        script_module = torch.jit.load('computation_graphs/optimizers/adam_backprop.pt')
-    elif optimizer == 'gd_backprop':
-        script_module = torch.jit.load('computation_graphs/optimizers/gradient_descent_backprop.pt')
-    # below is a torch._C.Graph object. interface is unstable so lock to specific version of PyTorch
-    graph = script_module.graph
-    for node in graph.nodes():
-        # TODO
-        print(node)
-    base_genome = create_initial_genome(config)
     new_population = {}
+    i = 0
     for key in population.population.keys():
-        new_genome = copy.deepcopy(base_genome)
+        new_genome = create_initial_genome(config, optimizers[i % len(optimizers)])
         new_genome.key = key
         new_population[key] = new_genome
+        i += 1
     population.population = new_population
 
 if __name__ == "__main__":
@@ -155,7 +147,11 @@ if __name__ == "__main__":
                          'neat-config')
     population = neat.Population(config)
 
-    override_initial_population(population, config)
+    optimizers = [
+        torch.jit.load('computation_graphs/optimizers/adam_backprop.pt'),
+        torch.jit.load('computation_graphs/optimizers/gradient_descent_backprop.pt'),
+    ]
+    override_initial_population(population, config, optimizers)
 
     population.add_reporter(neat.StdOutReporter(True))
     stats = neat.StatisticsReporter()

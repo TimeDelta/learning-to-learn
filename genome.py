@@ -1,6 +1,5 @@
 from neat.genome import DefaultGenome
 
-
 class Genome(DefaultGenome):
 
     activation_functions = [Identity(), Tanh(), ReLU()]

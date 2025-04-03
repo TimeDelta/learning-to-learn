@@ -1,0 +1,3 @@
+neat-python
+numpy
+torch

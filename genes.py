@@ -1,11 +1,14 @@
 from neat.genes import BaseGene
 
 class NodeGene(BaseGene):
-    def __init__(self, node_id: int, node_type: str,
-                 activation: ActivationFunction,
-                 aggregation: AggregationFunction):
+    def __init__(self,
+        node_id: int,
+        node_type: str,
+        activation: ActivationFunction,
+        aggregation: AggregationFunction
+    ):
         self.id = node_id
-        self.node_type = node_type  # "input", "hidden", "output"
+        self.node_type = node_type # "input", "hidden", "output"
         self.activation = activation
         self.aggregation = aggregation
 
