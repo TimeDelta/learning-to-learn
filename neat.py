@@ -110,6 +110,8 @@ def create_initial_genome(config, optimizer):
     innovation = 0
     for node in graph.nodes():
         current_key = node_mapping[node]
+        if not genome.nodes[current_key].aggregation and len(node.inputs()) > 1:
+            raise Exception('Must have aggregation for any node with more than 1 input: ', genome.nodes[current_key])
         for inp in node.inputs():
             producer = inp.node()
             # only create a connection if the producer is part of our mapping
