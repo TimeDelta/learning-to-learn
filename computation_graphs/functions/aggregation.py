@@ -10,7 +10,18 @@ import warnings
 @torch.jit.script
 class Product(object):
     def __call__(self, x):
-        return
+        result = 1.0
+        for i in inputs:
+            result *= i
+        return result
+
+@torch.jit.script
+class Subtract(object):
+    def __call__(self, x):
+        total = x[0]
+        for i in range(1, len(x)):
+            total -= x[i]
+        return total
 
 @torch.jit.script
 class Sum(object):
@@ -45,6 +56,7 @@ class AggregationFunctionSet(object):
 
     def __init__(self):
         self.functions = {}
+        self.add('subtract', Subtract())
         self.add('product', Product())
         self.add('sum', Sum())
         self.add('max', Max())

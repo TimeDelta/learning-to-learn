@@ -99,7 +99,7 @@ class OptimizerGenomeConfig(object):
 
 class OptimizerGenome(object):
     """
-    A genome for generalized neural networks.
+    A genome for generalized optimizers.
 
     Terminology
         pin: Point at which the network is conceptually connected to the external world;

@@ -6,6 +6,11 @@ import torch.jit
 # neat-python package passes function references
 
 @torch.jit.script
+class OneMinus(object):
+    def __call__(self, x: float) -> float:
+        return 1.0 - x
+
+@torch.jit.script
 class Tanh(object):
     def __call__(self, x: float) -> float:
         return math.tanh(x)
@@ -75,17 +80,18 @@ class ActivationFunctionSet(object):
 
     def __init__(self):
         self.functions = {}
-        self.add('sigmoid', Sigmoid())
-        self.add('tanh', Tanh())
-        self.add('sin', Sin())
-        self.add('clamped', Clamped())
-        self.add('inv', Inv())
-        self.add('log', Log())
-        self.add('exp', Exp())
-        self.add('abs', Abs())
-        self.add('hat', Hat())
-        self.add('square', Square())
-        self.add('cube', Cube())
+        self.add('one_minus', OneMinus())
+        # self.add('sigmoid', Sigmoid())
+        # self.add('tanh', Tanh())
+        # self.add('sin', Sin())
+        # self.add('clamped', Clamped())
+        # self.add('inv', Inv())
+        # self.add('log', Log())
+        # self.add('exp', Exp())
+        # self.add('abs', Abs())
+        # self.add('hat', Hat())
+        # self.add('square', Square())
+        # self.add('cube', Cube())
 
     def add(self, name, function):
         self.functions[name] = function
