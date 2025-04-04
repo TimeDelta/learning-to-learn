@@ -142,7 +142,8 @@ def override_initial_population(population, config, optimizers):
     population.population = new_population
 
 if __name__ == "__main__":
-    config = neat.Config(neat.DefaultGenome,
+    from genome import OptimizerGenome
+    config = neat.Config(OptimizerGenome,
                          neat.DefaultReproduction,
                          neat.DefaultSpeciesSet,
                          neat.DefaultStagnation,

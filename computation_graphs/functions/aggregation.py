@@ -1,19 +1,71 @@
-from typing import List
+import torch
+import torch.jit
 
-class AggregationFunction:
-    def __call__(self, inputs: List[float]) -> float:
-        raise NotImplementedError(f"Must implement __call__ method for {self} aggregation.")
+import types
+import warnings
 
-    def __str__(self) -> str:
-        return self.__class__.__name__
+# copied from neat-python package to add torchscript compatibility since
+# neat-python package passes function references
 
-class Sum(AggregationFunction):
-    def __call__(self, inputs: List[float]) -> float:
-        return sum(inputs)
+@torch.jit.script
+class Product(object):
+    def __call__(self, x):
+        return
 
-class Product(AggregationFunction):
-    def __call__(self, inputs: List[float]) -> float:
-        result = 1.0
-        for v in inputs:
-            result *= v
-        return result
+@torch.jit.script
+class Sum(object):
+    def __call__(self, x):
+        return sum(x)
+
+@torch.jit.script
+class Max(object):
+    def __call__(self, x):
+        return max(x)
+
+@torch.jit.script
+class Min(object):
+    def __call__(self, x):
+        return min(x)
+
+@torch.jit.script
+class Median(object):
+    def __call__(self, x):
+        return torch.median(x)
+
+@torch.jit.script
+class Mean(object):
+    def __call__(self, x):
+        return torch.mean(x)
+
+class InvalidAggregationFunction(TypeError):
+    pass
+
+class AggregationFunctionSet(object):
+    """Contains aggregation functions and methods to add and retrieve them."""
+
+    def __init__(self):
+        self.functions = {}
+        self.add('product', Product())
+        self.add('sum', Sum())
+        self.add('max', Max())
+        self.add('min', Min())
+        self.add('median', Median())
+        self.add('mean', Mean())
+
+    def add(self, name, function):
+        self.functions[name] = function
+
+    def get(self, name):
+        f = self.functions.get(name)
+        if f is None:
+            raise InvalidAggregationFunction("No such aggregation function: {0!r}".format(name))
+
+        return f
+
+    def __getitem__(self, index):
+        warnings.warn("Use get, not indexing ([{!r}]), for aggregation functions".format(index),
+                      DeprecationWarning)
+        return self.get(index)
+
+    def is_valid(self, name):
+        return name in self.functions
