@@ -68,11 +68,7 @@ class AggregationFunctionSet(object):
         self.functions[name] = function
 
     def get(self, name):
-        f = self.functions.get(name)
-        if f is None:
-            raise InvalidAggregationFunction("No such aggregation function: {0!r}".format(name))
-
-        return f
+        return self.functions.get(name)
 
     def __getitem__(self, index):
         warnings.warn("Use get, not indexing ([{!r}]), for aggregation functions".format(index),

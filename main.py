@@ -78,32 +78,22 @@ def create_initial_genome(config, optimizer):
 
     graph = optimizer.graph
 
-    activation_mapping = {
-        "aten::tanh": Tanh(),
-        # "aten::relu": ReLU(),
-        # TODO add more
-    }
-    aggregation_mapping = {
-        "aten::add": Sum(),
-        "aten::mul": Product(),
-        "aten::sub": Subtract(),
-        "aten::max": Max(),
-        "aten::min": Min(),
-        "aten::median": Median(),
-        "aten::mean": Mean(),
-        # TODO add more
-    }
+    activation_mapping = ActivationFunctionSet()
+    aggregation_mapping = AggregationFunctionSet()
 
     node_mapping = {} # from TorchScript nodes to genome node keys
     next_node_id = 0
     for node in graph.nodes():
         op_kind = node.kind()
-        activation = activation_mapping.get(op_kind)
+        if op_kind == 'prim::Constant':
+            activation = Constant(node.i('value'))
+        else:
+            activation = activation_mapping.get(op_kind)
         aggregation = aggregation_mapping.get(op_kind)
         if not activation and not aggregation:
             raise Exception('Unknown function mapping: ' + str(op_kind))
 
-        new_node = config.genome_type.NodeGene(next_node_id)
+        new_node = config.genome_type.create_node(config, next_node_id)
         new_node.activation = activation
         new_node.aggregation = aggregation
         genome.nodes[next_node_id] = new_node

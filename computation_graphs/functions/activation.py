@@ -6,6 +6,14 @@ import torch.jit
 # neat-python package passes function references
 
 @torch.jit.script
+class Constant(object):
+    def __init__(self, c: float):
+        self.c = c
+
+    def __call__(self, x: float) -> float:
+        return self.c
+
+@torch.jit.script
 class OneMinus(object):
     def __call__(self, x: float) -> float:
         return 1.0 - x
@@ -80,6 +88,7 @@ class ActivationFunctionSet(object):
 
     def __init__(self):
         self.functions = {}
+        self.add('prim::constant', Constant)
         self.add('one_minus', OneMinus())
         # self.add('sigmoid', Sigmoid())
         # self.add('tanh', Tanh())
@@ -97,11 +106,7 @@ class ActivationFunctionSet(object):
         self.functions[name] = function
 
     def get(self, name):
-        f = self.functions.get(name)
-        if f is None:
-            raise InvalidActivationFunction("No such activation function: {0!r}".format(name))
-
-        return f
+        return self.functions.get(name.lower())
 
     def is_valid(self, name):
         return name in self.functions

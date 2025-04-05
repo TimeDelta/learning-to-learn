@@ -375,7 +375,13 @@ class OptimizerGenome(object):
 
     @staticmethod
     def create_node(config, node_id):
-        node = config.node_gene_type(node_id)
+        print(config)
+        import inspect
+        try:
+            node = config.node_gene_type(node_id)
+        except Exception as e:
+            print(inspect.getmembers(config))
+            raise e
         node.init_attributes(config)
         return node
 
