@@ -154,7 +154,8 @@ if __name__ == "__main__":
     population = neat.Population(config)
 
     optimizers = [
-        torch.jit.load('computation_graphs/optimizers/adam_backprop.pt'),
+        # ADAM is already good at dealing with multiple loss minima
+        # torch.jit.load('computation_graphs/optimizers/adam_backprop.pt'),
         torch.jit.load('computation_graphs/optimizers/gradient_descent_backprop.pt'),
     ]
     override_initial_population(population, config, optimizers)
