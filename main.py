@@ -80,12 +80,17 @@ def create_initial_genome(config, optimizer):
 
     activation_mapping = {
         "aten::tanh": Tanh(),
-        "aten::relu": ReLU(),
+        # "aten::relu": ReLU(),
         # TODO add more
     }
     aggregation_mapping = {
         "aten::add": Sum(),
         "aten::mul": Product(),
+        "aten::sub": Subtract(),
+        "aten::max": Max(),
+        "aten::min": Min(),
+        "aten::median": Median(),
+        "aten::mean": Mean(),
         # TODO add more
     }
 

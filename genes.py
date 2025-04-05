@@ -9,18 +9,19 @@ class NodeGene(BaseGene):
         StringAttribute('aggregation', options=''),
     ]
 
-    def __init__(self, node_id: int, node_type: str, activation, aggregation):
+
+    def __init__(self, node_id: int):
         assert isinstance(node_id, int), f"NodeGene id must be an int, not {node_id!r}"
         BaseGene.__init__(self, node_id)
-        self.node_type = node_type # "input", "normal", "output"
-        self.activation = activation
-        self.aggregation = aggregation
+        self.node_type = 'normal' # ['input', 'normal', 'output']
+        self.activation = None
+        self.aggregation = None
 
     def copy(self):
         return NodeGene(self.id, self.node_type, self.activation, self.aggregation)
 
     def distance(self, other, config):
-        d = abs(self.response - other.response)
+        d = 0.0
         if self.activation != other.activation:
             d += 1.0
         if self.aggregation != other.aggregation:
