@@ -11,7 +11,7 @@ import warnings
 class Product(object):
     def __call__(self, x):
         result = 1.0
-        for i in inputs:
+        for i in x:
             result *= i
         return result
 
