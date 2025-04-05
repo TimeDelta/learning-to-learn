@@ -133,8 +133,9 @@ class OptimizerGenome(object):
         self.key = key
 
         # (gene_key, gene) pairs for gene sets
-        self.connections = {}
-        self.nodes = {}
+        self.nodes: Dict[int, NodeGene] = {}
+        self.connections: List[Tuple[int, int]] = [] # [from, to]
+        self.next_node_id = 0
 
         self.fitness = None
 
@@ -392,13 +393,6 @@ class OptimizerGenome(object):
         new_genome.nodes = used_node_genes
         new_genome.connections = used_connection_genes
         return new_genome
-
-    def __init__(self):
-        # Dictionary mapping node id to NodeGene.
-        self.nodes: Dict[int, NodeGene] = {}
-        # List of connections: each connection is a tuple (in_node_id, out_node_id, weight)
-        self.connections: List[Tuple[int, int, float]] = []
-        self.next_node_id = 0
 
     def add_node(self, node_type: str, activation, aggregation) -> NodeGene:
         if activation is None and aggregation is None:
