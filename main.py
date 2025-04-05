@@ -123,11 +123,15 @@ def create_initial_genome(config, optimizer):
     genome.connections = connections
     return genome
 
-def override_initial_population(population, config, optimizers):
+def override_initial_population(population, config):
     """
     Overrides the initial genomes in the population with copies of the exact initial genome.
     """
     new_population = {}
+    optimizers = []
+    print(config)
+    for optimizer in config.optimizers.split(','):
+        optimizers.append(torch.jit.load(f'computation_graphs/optimizers/{optimizer}.pt'))
     i = 0
     for key in population.population.keys():
         new_genome = create_initial_genome(config, optimizers[i % len(optimizers)])
@@ -147,12 +151,7 @@ if __name__ == "__main__":
     )
     population = neat.Population(config)
 
-    optimizers = [
-        # ADAM is already good at dealing with multiple loss minima
-        # torch.jit.load('computation_graphs/optimizers/adam_backprop.pt'),
-        torch.jit.load('computation_graphs/optimizers/gradient_descent_backprop.pt'),
-    ]
-    override_initial_population(population, config, optimizers)
+    override_initial_population(population, config)
 
     population.add_reporter(neat.StdOutReporter(True))
     stats = neat.StatisticsReporter()

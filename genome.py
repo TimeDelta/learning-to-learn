@@ -31,6 +31,7 @@ class OptimizerGenomeConfig(object):
             ConfigParameter('node_delete_prob', float),
             ConfigParameter('single_structural_mutation', bool, 'false'),
             ConfigParameter('structural_mutation_surer', str, 'default'),
+            ConfigParameter('optimizers', str, ['gradient_descent_backprop']),
         ]
 
         self.num_inputs = 3
@@ -42,7 +43,10 @@ class OptimizerGenomeConfig(object):
         self._params += self.connection_gene_type.get_config_params()
 
         for p in self._params:
-            setattr(self, p.name, p.interpret(params))
+            value = p.interpret(params)
+            print(f'setting {p.name} to {value}')
+            setattr(self, p.name, value)
+        print(self.optimizers)
 
         # By convention, input pins have negative keys, and the output
         # pins have keys 0,1,...
@@ -70,7 +74,7 @@ class OptimizerGenomeConfig(object):
         self.aggregation_function_defs.add(name, func)
 
     def save(self, f):
-        write_pretty_params(f, self, [p for p in self._params if 'initial_connection' not in p.name])
+        write_pretty_params(f, self, self._params)
 
     def get_new_node_key(self, node_dict):
         if self.node_indexer is None:
@@ -123,6 +127,7 @@ class OptimizerGenome(object):
     def parse_config(cls, param_dict):
         param_dict['node_gene_type'] = NodeGene
         param_dict['connection_gene_type'] = ConnectionGene
+        print(param_dict)
         return OptimizerGenomeConfig(param_dict)
 
     @classmethod
@@ -375,11 +380,11 @@ class OptimizerGenome(object):
 
     @staticmethod
     def create_node(config, node_id):
-        print(config)
         import inspect
         try:
             node = config.node_gene_type(node_id)
         except Exception as e:
+            print(config)
             print(inspect.getmembers(config))
             raise e
         node.init_attributes(config)
