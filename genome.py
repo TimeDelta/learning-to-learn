@@ -31,7 +31,7 @@ class OptimizerGenomeConfig(object):
             ConfigParameter('node_delete_prob', float),
             ConfigParameter('single_structural_mutation', bool, 'false'),
             ConfigParameter('structural_mutation_surer', str, 'default'),
-            ConfigParameter('optimizers', str, ['gradient_descent_backprop']),
+            ConfigParameter('optimizers', str, 'gradient_descent_backprop'),
         ]
 
         self.num_inputs = 3
@@ -46,7 +46,6 @@ class OptimizerGenomeConfig(object):
             value = p.interpret(params)
             print(f'setting {p.name} to {value}')
             setattr(self, p.name, value)
-        print(self.optimizers)
 
         # By convention, input pins have negative keys, and the output
         # pins have keys 0,1,...
@@ -127,7 +126,6 @@ class OptimizerGenome(object):
     def parse_config(cls, param_dict):
         param_dict['node_gene_type'] = NodeGene
         param_dict['connection_gene_type'] = ConnectionGene
-        print(param_dict)
         return OptimizerGenomeConfig(param_dict)
 
     @classmethod
@@ -380,13 +378,7 @@ class OptimizerGenome(object):
 
     @staticmethod
     def create_node(config, node_id):
-        import inspect
-        try:
-            node = config.node_gene_type(node_id)
-        except Exception as e:
-            print(config)
-            print(inspect.getmembers(config))
-            raise e
+        node = NodeGene(node_id)
         node.init_attributes(config)
         return node
 

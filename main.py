@@ -129,8 +129,7 @@ def override_initial_population(population, config):
     """
     new_population = {}
     optimizers = []
-    print(config)
-    for optimizer in config.optimizers.split(','):
+    for optimizer in config.genome_config.optimizers.split(','):
         optimizers.append(torch.jit.load(f'computation_graphs/optimizers/{optimizer}.pt'))
     i = 0
     for key in population.population.keys():
