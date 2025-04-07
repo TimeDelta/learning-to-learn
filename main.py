@@ -7,6 +7,7 @@ import torch.nn as nn
 
 from computation_graphs.functions.activation import *
 from computation_graphs.functions.aggregation import *
+from genes import *
 from loss import MSELoss
 
 def eval_genomes(genomes, config, loss_fn, steps=10, epsilon=1e-10):
@@ -70,60 +71,6 @@ def eval_genomes_wrapper(genomes, config):
     # TODO: load data
     eval_genomes(genomes, config, MSELoss(data), steps=10)
 
-def convert_node_to_gene(node, next_node_id, activation_mapping, aggregation_mapping):
-    op_kind = node.kind()
-    # %named_parameters.[0-9]+ are inputs to graph
-    if op_kind == 'prim::Constant':
-        if not node.hasAttribute('value'):
-            print(f'WARNING: expected value attribute not present for node [{node}]')
-            return None
-        prim_type = node.kindOf('value')
-        if prim_type == 'i':
-            activation = Constant(node.i('value'))
-        elif prim_type == 'f':
-            activation = Constant(node.f('value'))
-        elif prim_type == 's':
-            activation = Constant(node.s('value'))
-        else:
-            print('WARNING: Unknown primitive type for node:', node)
-    elif op_kind == 'prim::Loop':
-        # For a loop node, extract loop-specific info.
-        blocks = list(node.blocks())
-        # max iteration count may be stored as either attribute or input
-        try:
-            # "max_iter" might not be available
-            max_iterations = node.i("max_iter")
-        except Exception:
-            # try to parse from node's repr if possible
-            m = re.search(r"max_iter=([0-9]+)", str(node))
-            max_iterations = int(m.group(1)) if m else None
-            if max_iterations is None:
-                print(f'WARNING: Unable to parse max iteration count for loop [{node}]')
-                return None
-        if blocks:
-            block_genes = []
-            for block in blocks:
-                block_genes.append([convert_node_to_gene(sub_node) for sub_node in block.nodes()])
-        else:
-            block_genes = []
-
-        activation = LoopActivation(max_iterations, block_genes)
-    else:
-        activation = activation_mapping.get(op_kind)
-    aggregation = aggregation_mapping.get(op_kind)
-    if not activation and not aggregation:
-        print(node.schema())
-        print([i for i in node.inputs()])
-        print([o for o in node.outputs()])
-        for name in node.attributeNames():
-            print(name, node.kindOf(name))
-        raise Exception('Unknown function mapping: ' + str(op_kind))
-
-    new_node_gene = config.genome_type.create_node(config, next_node_id, aggregation, activation)
-    new_node_gene.activation = activation
-    new_node_gene.aggregation = aggregation
-    return new_node_gene
-
 def create_initial_genome(config, optimizer):
     """
     Creates an initial genome that mirrors the structure of the provided TorchScript optimizer computation graph.
@@ -132,13 +79,10 @@ def create_initial_genome(config, optimizer):
 
     graph = optimizer.graph
 
-    activation_mapping = ActivationFunctionSet()
-    aggregation_mapping = AggregationFunctionSet()
-
     node_mapping = {} # from TorchScript nodes to genome node keys
     next_node_id = 0
     for node in graph.nodes():
-        new_node_gene = convert_node_to_gene(node, next_node_id, activation_mapping, aggregation_mapping)
+        new_node_gene = NodeGene(next_node_id, node)
         if new_node_gene:
             genome.nodes[next_node_id] = new_node_gene
             node_mapping[node] = next_node_id
@@ -148,20 +92,19 @@ def create_initial_genome(config, optimizer):
     innovation = 0
     for node in graph.nodes():
         current_key = node_mapping[node]
-        if not genome.nodes[current_key].aggregation and len(node.inputs()) > 1:
-            raise Exception('Must have aggregation for any node with more than 1 input: ', genome.nodes[current_key])
         for inp in node.inputs():
             producer = inp.node()
             # only create a connection if the producer is part of our mapping
             if producer in node_mapping:
                 in_key = node_mapping[producer]
                 key = (in_key, current_key)
-                conn = config.genome_type.ConnectionGene(key, 0.0)
-                conn.weight = 1.0
+                conn = ConnectionGene(key)
                 conn.enabled = True
                 conn.innovation = innovation
                 innovation += 1
                 connections[key] = conn
+            else:
+                print(f'WARNING: missing mapping for input node [{producer}]')
 
     genome.connections = connections
     return genome
