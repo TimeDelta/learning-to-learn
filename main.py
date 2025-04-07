@@ -1,7 +1,6 @@
 import copy
 import math
 import neat
-import re
 import torch
 import torch.nn as nn
 
@@ -74,16 +73,6 @@ def create_initial_genome(config, optimizer):
     """
     Creates an initial genome that mirrors the structure of the provided TorchScript optimizer computation graph.
     """
-
-    def get_constant_type(node):
-        # Get the string representation of the node.
-        node_str = str(node)
-        # Use a regex to extract the type between ':' and '='.
-        m = re.search(r":\s*(\w+)\s*=", node_str)
-        if m:
-            return m.group(1)
-        return None
-
     genome = config.genome_type(0)
 
     graph = optimizer.graph
@@ -96,21 +85,16 @@ def create_initial_genome(config, optimizer):
     for node in graph.nodes():
         op_kind = node.kind()
         if op_kind == 'prim::Constant':
-            prim_type = get_constant_type(node)
-            if not prim_type:
-                print('WARNING: skipping primitive constant due to unparsable value type:', node)
+            if not node.hasAttribute('value'):
+                print('WARNING: primitive constant node has no value attribute:', node)
                 continue
-            prim_type = prim_type.lower()
-            if prim_type == 'int':
+            prim_type = node.kindOf('value')
+            if prim_type == 'i':
                 activation = Constant(node.i('value'))
-            elif prim_type == 'float':
+            elif prim_type == 'f':
                 activation = Constant(node.f('value'))
-            elif prim_type == 'str':
+            elif prim_type == 's':
                 activation = Constant(node.s('value'))
-            elif prim_type == 'bool':
-                activation = Constant(node.b('value'))
-            elif prim_type == 'nonetype':
-                continue
             else:
                 print('WARNING: Unknown primitive type for node:', node)
         else:
