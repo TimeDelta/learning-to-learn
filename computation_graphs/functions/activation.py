@@ -7,10 +7,10 @@ import torch.jit
 
 @torch.jit.script
 class Constant(object):
-    def __init__(self, c: float):
+    def __init__(self, c):
         self.c = c
 
-    def __call__(self, x: float) -> float:
+    def __call__(self, x):
         return self.c
 
 @torch.jit.script

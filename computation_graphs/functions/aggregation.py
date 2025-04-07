@@ -48,6 +48,11 @@ class Mean(object):
     def __call__(self, x):
         return torch.mean(x)
 
+@torch.jit.script
+class ListConstruction(object):
+    def __call__(self, x):
+        return x
+
 class InvalidAggregationFunction(TypeError):
     pass
 
@@ -63,6 +68,7 @@ class AggregationFunctionSet(object):
         self.add('min', Min())
         self.add('median', Median())
         self.add('mean', Mean())
+        self.add('prim::ListConstruct', ListConstruction())
 
     def add(self, name, function):
         self.functions[name] = function
