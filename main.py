@@ -1,6 +1,7 @@
 import copy
 import math
 import neat
+import re
 import torch
 import torch.nn as nn
 
@@ -69,6 +70,60 @@ def eval_genomes_wrapper(genomes, config):
     # TODO: load data
     eval_genomes(genomes, config, MSELoss(data), steps=10)
 
+def convert_node_to_gene(node, next_node_id, activation_mapping, aggregation_mapping):
+    op_kind = node.kind()
+    # %named_parameters.[0-9]+ are inputs to graph
+    if op_kind == 'prim::Constant':
+        if not node.hasAttribute('value'):
+            print(f'WARNING: expected value attribute not present for node [{node}]')
+            return None
+        prim_type = node.kindOf('value')
+        if prim_type == 'i':
+            activation = Constant(node.i('value'))
+        elif prim_type == 'f':
+            activation = Constant(node.f('value'))
+        elif prim_type == 's':
+            activation = Constant(node.s('value'))
+        else:
+            print('WARNING: Unknown primitive type for node:', node)
+    elif op_kind == 'prim::Loop':
+        # For a loop node, extract loop-specific info.
+        blocks = list(node.blocks())
+        # max iteration count may be stored as either attribute or input
+        try:
+            # "max_iter" might not be available
+            max_iterations = node.i("max_iter")
+        except Exception:
+            # try to parse from node's repr if possible
+            m = re.search(r"max_iter=([0-9]+)", str(node))
+            max_iterations = int(m.group(1)) if m else None
+            if max_iterations is None:
+                print(f'WARNING: Unable to parse max iteration count for loop [{node}]')
+                return None
+        if blocks:
+            block_genes = []
+            for block in blocks:
+                block_genes.append([convert_node_to_gene(sub_node) for sub_node in block.nodes()])
+        else:
+            block_genes = []
+
+        activation = LoopActivation(max_iterations, block_genes)
+    else:
+        activation = activation_mapping.get(op_kind)
+    aggregation = aggregation_mapping.get(op_kind)
+    if not activation and not aggregation:
+        print(node.schema())
+        print([i for i in node.inputs()])
+        print([o for o in node.outputs()])
+        for name in node.attributeNames():
+            print(name, node.kindOf(name))
+        raise Exception('Unknown function mapping: ' + str(op_kind))
+
+    new_node_gene = config.genome_type.create_node(config, next_node_id, aggregation, activation)
+    new_node_gene.activation = activation
+    new_node_gene.aggregation = aggregation
+    return new_node_gene
+
 def create_initial_genome(config, optimizer):
     """
     Creates an initial genome that mirrors the structure of the provided TorchScript optimizer computation graph.
@@ -83,38 +138,11 @@ def create_initial_genome(config, optimizer):
     node_mapping = {} # from TorchScript nodes to genome node keys
     next_node_id = 0
     for node in graph.nodes():
-        op_kind = node.kind()
-        # %named_parameters.[0-9]+ are inputs to graph
-        if op_kind == 'prim::Constant':
-            if not node.hasAttribute('value'):
-                print(f'WARNING: expected value attribute not present for node [{node}]')
-                continue
-            prim_type = node.kindOf('value')
-            if prim_type == 'i':
-                activation = Constant(node.i('value'))
-            elif prim_type == 'f':
-                activation = Constant(node.f('value'))
-            elif prim_type == 's':
-                activation = Constant(node.s('value'))
-            else:
-                print('WARNING: Unknown primitive type for node:', node)
-        else:
-            activation = activation_mapping.get(op_kind)
-        aggregation = aggregation_mapping.get(op_kind)
-        if not activation and not aggregation:
-            print([i for i in node.inputs()])
-            print([o for o in node.outputs()])
-            for name in node.attributeNames():
-                print(name, node.kindOf(name))
-            raise Exception('Unknown function mapping: ' + str(op_kind))
-
-        new_node = config.genome_type.create_node(config, next_node_id, aggregation, activation)
-        new_node.activation = activation
-        new_node.aggregation = aggregation
-        genome.nodes[next_node_id] = new_node
-
-        node_mapping[node] = next_node_id
-        next_node_id += 1
+        new_node_gene = convert_node_to_gene(node, next_node_id, activation_mapping, aggregation_mapping)
+        if new_node_gene:
+            genome.nodes[next_node_id] = new_node_gene
+            node_mapping[node] = next_node_id
+            next_node_id += 1
 
     connections = {}
     innovation = 0

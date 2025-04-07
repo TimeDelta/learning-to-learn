@@ -77,6 +77,27 @@ class Cube(object):
     def __call__(self, x:float):
         return x ** 3
 
+@torch.jit.script
+class LoopActivation:
+    def __init__(self, max_iterations: int, block_genes):
+        """
+        Construct a LoopActivation from a TorchScript prim::Loop node.
+
+        Extracts loop-specific attributes and converts the loop body (the first block)
+        into a sub-genome representation.
+        """
+        self.max_iterations = max_iterations
+        self.block_genes = block_genes
+
+    def __call__(self, x: float) -> float:
+        for block_gene in self.block_genes:
+            # TODO
+            print(block_gene)
+        return x
+
+    def __str__(self) -> str:
+        return f"LoopActivation(max_iter={self.max_iterations}, subgenome={self.block_genes})"
+
 class InvalidActivationFunction(TypeError):
     pass
 
