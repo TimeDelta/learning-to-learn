@@ -53,6 +53,15 @@ class ListConstruction(object):
     def __call__(self, x):
         return x
 
+@torch.jit.script
+class Length(object):
+    def __call__(self, x):
+        if isinstance(x, list):
+            return len(x)
+        if x is not None:
+            return 1
+        return 0
+
 class InvalidAggregationFunction(TypeError):
     pass
 
@@ -68,6 +77,7 @@ class AggregationFunctionSet(object):
         self.add('min', Min())
         self.add('median', Median())
         self.add('mean', Mean())
+        self.add('aten::len', Length())
         self.add('prim::ListConstruct', ListConstruction())
 
     def add(self, name, function):
