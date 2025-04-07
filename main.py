@@ -84,9 +84,10 @@ def create_initial_genome(config, optimizer):
     next_node_id = 0
     for node in graph.nodes():
         op_kind = node.kind()
+        # %named_parameters.[0-9]+ are inputs to graph
         if op_kind == 'prim::Constant':
             if not node.hasAttribute('value'):
-                print('WARNING: primitive constant node has no value attribute:', node)
+                print(f'WARNING: expected value attribute not present for node [{node}]')
                 continue
             prim_type = node.kindOf('value')
             if prim_type == 'i':
@@ -101,9 +102,13 @@ def create_initial_genome(config, optimizer):
             activation = activation_mapping.get(op_kind)
         aggregation = aggregation_mapping.get(op_kind)
         if not activation and not aggregation:
+            print([i for i in node.inputs()])
+            print([o for o in node.outputs()])
+            for name in node.attributeNames():
+                print(name, node.kindOf(name))
             raise Exception('Unknown function mapping: ' + str(op_kind))
 
-        new_node = config.genome_type.create_node(config, next_node_id)
+        new_node = config.genome_type.create_node(config, next_node_id, aggregation, activation)
         new_node.activation = activation
         new_node.aggregation = aggregation
         genome.nodes[next_node_id] = new_node
