@@ -9,13 +9,12 @@ class NodeGene(BaseGene):
         StringAttribute('aggregation', options=''),
     ]
 
-
-    def __init__(self, node_id: int):
+    def __init__(self, node_id: int, activation, aggregation):
         assert isinstance(node_id, int), f"NodeGene id must be an int, not {node_id!r}"
         BaseGene.__init__(self, node_id)
         self.node_type = 'normal' # ['input', 'normal', 'output']
-        self.activation = None
-        self.aggregation = None
+        self.activation = activation
+        self.aggregation = aggregation
 
     def copy(self):
         return NodeGene(self.id, self.node_type, self.activation, self.aggregation)

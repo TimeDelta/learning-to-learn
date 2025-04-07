@@ -377,9 +377,11 @@ class OptimizerGenome(object):
         return s
 
     @staticmethod
-    def create_node(config, node_id):
-        node = NodeGene(node_id)
-        node.init_attributes(config)
+    def create_node(config, node_id, aggregation=Sum(), activation=None):
+        """
+        only creates the node gene not the node itself but leave function name alone for now in case neat uses it
+        """
+        node = NodeGene(node_id, aggregation, activation)
         return node
 
     @staticmethod
@@ -392,7 +394,7 @@ class OptimizerGenome(object):
         used_node_genes, used_connection_genes = get_pruned_genes(
             self.nodes, self.connections, genome_config.input_keys, genome_config.output_keys
         )
-        new_genome = DefaultGenome(None)
+        new_genome = OptimizerGenome(None)
         new_genome.nodes = used_node_genes
         new_genome.connections = used_connection_genes
         return new_genome
