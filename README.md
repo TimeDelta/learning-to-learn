@@ -22,7 +22,7 @@
   - [MVP](#mvp)
   - [Final State](#final-state)
   - [Choosing Base Evolutionary Algorithm](#choosing-base-evolutionary-algorithm)
-  - [Initial Population](#initial-population)
+  - [Initial Populations](#initial-populations)
   - [Known Unsolved Problems](#known-unsolved-problems)
   - [Mechanisms that Might Evolve](#mechanisms-that-might-evolve)
 - [Other Papers that Might be Useful](#other-papers-that-might-be-useful)
@@ -180,11 +180,15 @@ According to [43](#references), blurred boundary continual learning is when the 
       - Scoring metric is defined separately for each task.
       - This adds competing evolutionary pressures. One to generalize to unseen data (test set fitness) and another to quickly learn or memorize (area under training curve) with the ability to change each factor’s relative importance
     - This also adds pressure to compress the behavioral dynamics across time and memory
-  - Start with an initial population that is implementations of existing algorithms in this framework ([details](#initial-population))
-    - Can generate computation graphs from open source code using PyTorch's TorchScript
+  - Start with multiple initial populations (1 per part of the optimization process: losses, model arch, credit assignment, optimizer, etc.)
+    - Each species would start from an implementation of existing algorithms ([details](#initial-populations))
+      - Can generate computation graphs from open source code using PyTorch's TorchScript
+    - Competition happens within each population but evaluation happens via combinations of members of each population in ways that make sense
+      - each population should specify a set of required attachment points
+      - Maintain separate population of combinations that also evolves
+    - Fitness for each member is then aggregated across evaluated combinations
     - Look for gene combinations common to high performing individuals in species to find useful things to propagate across species
-    - Use a boolean on each origin species that prevents it from full collapse for the first X generations (minimum population of Y) to ensure the final learner has a fair chance of incorporating the important components from the initial population.
-      - We won’t know when adding another piece of the initial population to a species would be beneficial.
+    - Use a boolean on each new species that prevents it from full collapse for the first X generations (minimum population of Y) to ensure time for innovation
 - To allow for reinforcement, supervised and unsupervised learning in the same network, there will be at least five special input nodes (likely more). One will represent reward for reinforcement learning. For each output node, include an extra input node for that node’s loss (minimum of one node). The remaining three in the minimum set are to signify which of these learning types should be used.
 - Set aside a held out data set (equal distribution across every task) to ensure generalization of final learner
 - Basic reinforcement learning tasks necessary for a cognitive map of task space [38](#references)
@@ -223,8 +227,9 @@ According to [43](#references), blurred boundary continual learning is when the 
 - NEAT [4](#references)
   - Remove the bias toward smaller structures since it is supplanted by the use of the inverse normalized time and memory costs in the fitness function.
 
-### Initial Population
-#### SNNs
+### Initial Populations
+#### Model Architectures
+##### SNNs
   - Delay Learning methods:
     - Delay selection
     - Delay shift
@@ -271,6 +276,7 @@ According to [43](#references), blurred boundary continual learning is when the 
   - Maybe try to just equally disperse the optimization methods used by each initial agent within a species. In addition, could force each piece (model architecture, optimization algorithm, loss/reward function, etc.) to compete ONLY with other options of the same type and score them all separately.
   - Also could record the performance of each model along each dimension of the fitness function and then choose mating partners based on complementary performance metrics but this still leaves it wondering how to optimally mix the parents.
 - Translation between genes and network
+- How to best avoid search searching parts of the space that have compatibility issues: i.e. some model architecture / credit assignment combinations due to i.e. non-differentiability
 
 ### Mechanisms that Might Evolve
 - Stabilization of the system away from an infinite positive feedback loop between two nodes or two populations
