@@ -69,6 +69,28 @@ class GraphEncoder(nn.Module):
         logvar = self.lin_logvar(x)
         return mu, logvar
 
+    def prune_latent_dims(self, kept_idx: torch.LongTensor):
+        """
+        Keep only the latent dims in `kept_idx` for lin_mu and lin_logvar.
+        """
+        device = self.lin_mu.weight.device
+        in_feats = self.lin_mu.in_features
+        new_dim  = kept_idx.numel()
+
+        # mu
+        old_mu = self.lin_mu
+        new_mu = nn.Linear(in_feats, new_dim, bias=True).to(device)
+        new_mu.weight.data.copy_(old_mu.weight.data[kept_idx, :])
+        new_mu.bias.data.copy_(old_mu.bias.data[kept_idx])
+        self.lin_mu = new_mu
+
+        # logvar
+        old_lv = self.lin_logvar
+        new_lv = nn.Linear(in_feats, new_dim, bias=True).to(device)
+        new_lv.weight.data.copy_(old_lv.weight.data[kept_idx, :])
+        new_lv.bias.data.copy_(old_lv.bias.data[kept_idx])
+        self.lin_logvar = new_lv
+
 
 class GraphDecoder(nn.Module):
     """
@@ -89,6 +111,22 @@ class GraphDecoder(nn.Module):
         feat_logits = self.fc_feat(h).view(batch_size, self.max_nodes, self.node_feat_dim)
         return adj_logits, feat_logits
 
+    def prune_latent_dims(self, kept_idx: torch.LongTensor):
+        """
+        Keep only the latent dims in `kept_idx` for decoder.fc1.
+        fc_adj and fc_feat stay the same.
+        """
+        device = self.fc1.weight.device
+        out_feats = self.fc1.out_features
+        new_dim   = kept_idx.numel()
+
+        old_fc1 = self.fc1
+        new_fc1 = nn.Linear(new_dim, out_feats, bias=True).to(device)
+        # copy only the kept columns
+        new_fc1.weight.data.copy_(old_fc1.weight.data[:, kept_idx])
+        new_fc1.bias.data.copy_(old_fc1.bias.data)
+        self.fc1 = new_fc1
+
 
 class FitnessPredictor(nn.Module):
     """Auxiliary predictor: maps latent z to fitness."""
@@ -100,6 +138,21 @@ class FitnessPredictor(nn.Module):
     def forward(self, z):
         h = F.relu(self.fc1(z))
         return self.fc2(h).squeeze(-1)
+
+    def prune_latent_dims(self, kept_idx: torch.LongTensor):
+        """
+        Keep only the latent dims in `kept_idx` for predictor.fc1.
+        fc2 stays the same.
+        """
+        device = self.fc1.weight.device
+        out_feats = self.fc1.out_features
+        new_dim   = kept_idx.numel()
+
+        old_p1 = self.fc1
+        new_p1 = nn.Linear(new_dim, out_feats, bias=True).to(device)
+        new_p1.weight.data.copy_(old_p1.weight.data[:, kept_idx])
+        new_p1.bias.data.copy_(old_p1.bias.data)
+        self.fc1 = new_p1
 
 
 class DAGVAE(nn.Module):
@@ -134,6 +187,33 @@ class DAGVAE(nn.Module):
         adj_logits, feat_logits = self.decode(z)
         fitness_pred = self.predictor(z)
         return adj_logits, feat_logits, fitness_pred, mu, logvar, z
+
+    def resize_bottleneck(self, device):
+        """
+        Permanently shrink bottleneck to active dims via the per-module prune methods.
+        """
+        mask = self.latent_mask.to(device)
+        kept_idx = mask.nonzero(as_tuple=True)[0]
+        old_dim = mask.numel()
+        new_dim = kept_idx.numel()
+        if new_dim == old_dim:
+            print("No latent dims to permanently prune.")
+            return
+
+        print(f"Permanently resizing bottleneck: {old_dim} → {new_dim} dims")
+
+        # delegate to each module
+        self.encoder.prune_latent_dims(kept_idx)
+        self.decoder.prune_latent_dims(kept_idx)
+        self.predictor.prune_latent_dims(kept_idx)
+        self.log_alpha = nn.Parameter(self.log_alpha.data[kept_idx].clone().to(device))
+
+
+        # update metadata
+        self.latent_dim  = new_dim
+        self.latent_mask = torch.ones(new_dim, dtype=torch.bool, device=device)
+
+        print("Bottleneck resized")
 
 
 class OnlineTrainer:
@@ -173,16 +253,18 @@ class OnlineTrainer:
 
     def train(self, epochs=1, batch_size=16, kl_weight=1.0, fitness_weight=1.5,
               warmup_epochs=None, loss_threshold=0.9, min_prune_break=5,
-              prune_amount=1, min_active_dims=1, stop_epsilon=1E-5, verbose=True):
+              prune_amount=1, min_active_dims=1, stop_epsilon=1E-3, verbose=True):
         loader = DataLoader(self.dataset, batch_size=batch_size, shuffle=True)
         epoch = 1
-        prev_loss = 0.0
-        avg_loss = 0.0
+        num_loss_terms = 4
+        prev_loss_terms = np.array([0.0] * num_loss_terms)
+        avg_loss_terms = np.array([0.0] * num_loss_terms)
         def stop():
-            return (epochs is not None and epoch == epochs + 1) or (epoch > 1 and abs(avg_loss-prev_loss) < stop_epsilon)
+            max_loss_term_change = np.max(abs(avg_loss_terms - prev_loss_terms))
+            return (epochs is not None and epoch == epochs + 1) or (epoch > 1 and max_loss_term_change < stop_epsilon)
         while not stop():
-            prev_loss = avg_loss
-            total_loss = 0.0
+            prev_loss_terms = avg_loss_terms
+            total_loss_terms = np.array([0.0] * num_loss_terms)
             self.model.train()
             for batch in loader:
                 batch = batch.to(self.device)
@@ -236,35 +318,43 @@ class OnlineTrainer:
                 )
                 kl_loss = kl_per_dim.sum(dim=1).mean()
                 loss_fitness = F.mse_loss(fitness_pred, batch.y.to(self.device))
-                loss = loss_adj + loss_feat + kl_weight * kl_loss + fitness_weight * loss_fitness
+                loss_terms = [loss_adj, loss_feat, kl_weight * kl_loss, fitness_weight * loss_fitness]
+                loss = sum(loss_terms)
                 loss.backward()
                 self.optimizer.step()
-                total_loss += loss.item()
-            avg_loss = total_loss / len(loader)
-            self.loss_history.append(avg_loss)
+                total_loss_terms += np.array([t.detach().numpy() for t in loss_terms])
+            avg_loss_terms = total_loss_terms / len(loader)
+            self.loss_history.append(avg_loss_terms)
             if verbose:
                 if not epochs:
-                    print(f"Epoch {epoch}, Loss per batch: {avg_loss:.4f}")
+                    print(f"Epoch {epoch}, Loss terms per batch: {avg_loss_terms} = {avg_loss_terms.sum():.4f}")
                 else:
-                    print(f"Epoch {epoch}/{epochs}, Loss per batch: {avg_loss:.4f}")
+                    print(f"Epoch {epoch}/{epochs}, Loss terms per batch: {avg_loss_terms} = {avg_loss_terms.sum():.4f}")
 
             # set baseline after warmup
             if epoch == warmup_epochs:
-                self.initial_loss = avg_loss
+                self.initial_loss = avg_loss_terms.sum()
 
             # pruning condition
             if (self.initial_loss is not None
-                and avg_loss <= loss_threshold * self.initial_loss
+                and avg_loss_terms.sum() <= loss_threshold * self.initial_loss
                 and (epoch - self.last_prune_epoch) >= min_prune_break
             ):
                 active_count = int(self.model.latent_mask.sum().item())
                 if active_count > min_active_dims:
                     self.prune_low_precision_dims(num_prune=prune_amount)
                     self.last_prune_epoch = epoch
-                    self.initial_loss = avg_loss  # reset baseline
+                    self.initial_loss = avg_loss_terms.sum()  # reset baseline
 
             epoch += 1
         return self.loss_history
+
+    def resize_bottleneck(self):
+        self.model.resize_bottleneck(self.device)
+        # reinit optimizer so it only holds new params
+        lr = self.optimizer.defaults.get("lr", 1e-3)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        print("Optimizer Reinitialized")
 
 
 if __name__ == "__main__":
@@ -310,7 +400,8 @@ if __name__ == "__main__":
     trainer = OnlineTrainer(model, optimizer, device=device)
     trainer.add_data(graphs, fitnesses)
     print('Training')
-    trainer.train(epochs=None, batch_size=8, kl_weight=0.1, warmup_epochs=10, stop_epsilon=.1)
+    trainer.train(epochs=None, batch_size=8, kl_weight=0.1, warmup_epochs=10)
+    trainer.resize_bottleneck()
 
     # Continue training with new data
     graphs, fitnesses = generate_data(10)
