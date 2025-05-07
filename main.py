@@ -103,7 +103,7 @@ def create_initial_genome(config, optimizer):
                 conn.innovation = innovation
                 innovation += 1
                 connections[key] = conn
-            else:
+            elif '%self.1 : __torch__.BackpropGD, %loss.1 : Tensor, %prev_loss : Tensor, %named_parameters.1 : (str, Tensor)[] = prim::Param()' not in str(producer):
                 print(f'WARNING: missing mapping for input node [{producer}]')
 
     genome.connections = connections
