@@ -177,10 +177,12 @@ class OnlineTrainer:
         loader = DataLoader(self.dataset, batch_size=batch_size, shuffle=True)
         epoch = 1
         prev_loss = 0.0
-        total_loss = 0.0
+        avg_loss = 0.0
         def stop():
-            return (epochs is not None and epoch == epochs + 1) or (epoch > 1 and abs(total_loss-prev_loss) < stop_epsilon)
+            return (epochs is not None and epoch == epochs + 1) or (epoch > 1 and abs(avg_loss-prev_loss) < stop_epsilon)
         while not stop():
+            prev_loss = avg_loss
+            total_loss = 0.0
             self.model.train()
             for batch in loader:
                 batch = batch.to(self.device)
@@ -233,7 +235,7 @@ class OnlineTrainer:
                     - 1
                 )
                 kl_loss = kl_per_dim.sum(dim=1).mean()
-                loss_fitness = F.mse_loss(fitness_pred, batch.y.view(-1).to(self.device))
+                loss_fitness = F.mse_loss(fitness_pred, batch.y.to(self.device))
                 loss = loss_adj + loss_feat + kl_weight * kl_loss + fitness_weight * loss_fitness
                 loss.backward()
                 self.optimizer.step()
@@ -241,7 +243,10 @@ class OnlineTrainer:
             avg_loss = total_loss / len(loader)
             self.loss_history.append(avg_loss)
             if verbose:
-                print(f"Epoch {epoch}/{epochs}, Loss: {avg_loss:.4f}")
+                if not epochs:
+                    print(f"Epoch {epoch}, Loss per batch: {avg_loss:.4f}")
+                else:
+                    print(f"Epoch {epoch}/{epochs}, Loss per batch: {avg_loss:.4f}")
 
             # set baseline after warmup
             if epoch == warmup_epochs:
@@ -290,31 +295,25 @@ if __name__ == "__main__":
 
     # Create synthetic dataset
     print('Generating random graphs')
-    graphs = []
-    fitnesses = []
-    for _ in range(50):
-        n = random.randint(3, max_nodes)
-        graph = generate_random_dag(n, num_node_types, edge_prob=0.4)
-        fit = []
-        for f in range(fitness_dim):
-            fit.append(graph.edge_index.size(1) + 0.1 * random.random())
-        graphs.append(graph)
-        fitnesses.append(fit)
+    def generate_data(num_fitnesses):
+        graphs, fitnesses = [], []
+        for _ in range(num_fitnesses):
+            graph = generate_random_dag(random.randint(3, max_nodes), num_node_types, edge_prob=0.4)
+            fit = []
+            for f in range(fitness_dim):
+                fit.append(graph.edge_index.size(1) + 0.1 * random.random())
+            graphs.append(graph)
+            fitnesses.append(fit)
+        return graphs, fitnesses
+    graphs, fitnesses = generate_data(50)
 
     trainer = OnlineTrainer(model, optimizer, device=device)
     trainer.add_data(graphs, fitnesses)
     print('Training')
-    trainer.train(epochs=20, batch_size=8, kl_weight=0.1, fitness_weight=1.0)
+    trainer.train(epochs=None, batch_size=8, kl_weight=0.1, warmup_epochs=10, stop_epsilon=.1)
 
     # Continue training with new data
-    new_graphs = []
-    new_fits = []
-    for _ in range(10):
-        n = random.randint(3, max_nodes)
-        graph = generate_random_dag(n, num_node_types, edge_prob=0.5)
-        fit = graph.edge_index.size(1) + 0.1 * random.random()
-        new_graphs.append(graph)
-        new_fits.append(fit)
-    trainer.add_data(new_graphs, new_fits)
+    graphs, fitnesses = generate_data(10)
+    trainer.add_data(graphs, fitnesses)
     print('Continuing training')
-    trainer.train(epochs=10, batch_size=8, kl_weight=0.1, fitness_weight=1.0)
+    trainer.train(epochs=3, batch_size=8, kl_weight=0.1)
