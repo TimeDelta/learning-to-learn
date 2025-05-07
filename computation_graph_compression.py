@@ -16,9 +16,8 @@ class DAGAttention(MessagePassing):
     Each node attends over its predecessors + itself (node context).
     """
     def __init__(self, in_channels, out_channels, negative_slope=0.2):
-        super().__init__(aggr='add')  # sum aggregation
+        super().__init__(aggr='add')
         self.lin = nn.Linear(in_channels, out_channels, bias=False)
-        # a^T [h_i || h_j]  => 2*out_channels parameters
         self.att = nn.Parameter(torch.Tensor(1, 2 * out_channels))
         self.leaky_relu = nn.LeakyReLU(negative_slope)
         self.reset_parameters()
@@ -28,20 +27,15 @@ class DAGAttention(MessagePassing):
         nn.init.xavier_uniform_(self.att)
 
     def forward(self, x, edge_index):
-        # Linear transform
-        x = self.lin(x)  # [N, out_channels]
-        # Add self-loops so each node attends to itself
+        x = self.lin(x)
         edge_index, _ = add_self_loops(edge_index, num_nodes=x.size(0))
-        # Message passing
         return self.propagate(edge_index, x=x)
 
     def message(self, x_i, x_j, index, ptr, size_i):
-        # Un-normalized attention scores from concatenated node pairs
         cat = torch.cat([x_i, x_j], dim=-1)
         alpha = (cat * self.att).sum(dim=-1)
         alpha = self.leaky_relu(alpha)
-        # Normalize per target node
-        alpha = softmax(alpha, index, ptr, size_i)  # [E]
+        alpha = softmax(alpha, index, ptr, size_i)
         return x_j * alpha.view(-1, 1)
 
     def update(self, aggr_out):
@@ -97,18 +91,15 @@ class GraphDecoder(nn.Module):
 
 
 class FitnessPredictor(nn.Module):
-    """
-    Auxiliary network: predicts scalar fitness from latent z.
-    """
-    def __init__(self, latent_dim, hidden_dim=64):
+    """Auxiliary predictor: maps latent z to fitness."""
+    def __init__(self, latent_dim, hidden_dim=64, fitness_dim=2):
         super().__init__()
         self.fc1 = nn.Linear(latent_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, 1)
+        self.fc2 = nn.Linear(hidden_dim, fitness_dim)
 
     def forward(self, z):
         h = F.relu(self.fc1(z))
-        fitness_pred = self.fc2(h)
-        return fitness_pred.squeeze(-1)
+        return self.fc2(h).squeeze(-1)
 
 
 class DAGVAE(nn.Module):
@@ -131,11 +122,8 @@ class DAGVAE(nn.Module):
 
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        z = mu + eps * std
-        # apply mask: pruned dims set to zero
-        z = z * self.latent_mask
-        return z
+        z = mu + torch.randn_like(std) * std
+        return z * self.latent_mask
 
     def decode(self, z):
         return self.decoder(z)
@@ -150,7 +138,7 @@ class DAGVAE(nn.Module):
 
 class OnlineTrainer:
     """
-    Incremental trainer with ARD-KL and dynamic latent pruning.
+    Incremental trainer with ARD-KL + loss-thresholded iterative pruning.
     """
     def __init__(self, model: DAGVAE, optimizer, device=torch.device('cpu')):
         self.model = model.to(device)
@@ -158,6 +146,8 @@ class OnlineTrainer:
         self.device = device
         self.dataset = []
         self.loss_history = []
+        self.initial_loss = None
+        self.last_prune_epoch = 0
 
     def add_data(self, graphs, fitnesses):
         for graph, fit in zip(graphs, fitnesses):
@@ -174,27 +164,24 @@ class OnlineTrainer:
         precisions = self.compute_ard_precisions()
         active_mask = self.model.latent_mask.cpu().numpy().astype(bool)
         active_indices = np.where(active_mask)[0]
-        active_precs = precisions[active_indices]
-        # dims to prune: highest precision
-        sorted_idx = np.argsort(active_precs)
-        dims_to_prune = active_indices[sorted_idx[-num_prune:]]
-        # update mask
+        active_indices = active_indices[np.argsort(precisions[active_indices])]
+        dims_to_prune = active_indices[-num_prune:]
         mask = self.model.latent_mask.clone()
-        device = mask.device
         mask[dims_to_prune.tolist()] = 0.0
         self.model.latent_mask.copy_(mask)
         print(f"Pruned latent dims: {dims_to_prune}")
 
-    def train(self, epochs=1, batch_size=16, kl_weight=1.0, fitness_weight=1.0,
-              prune_after=None, prune_amount=1, verbose=True):
-        """
-        Train with ARD-KL.
-        :param prune_after: epoch number after which to run pruning.
-        """
-        self.model.train()
+    def train(self, epochs=1, batch_size=16, kl_weight=1.0, fitness_weight=1.5,
+              warmup_epochs=None, loss_threshold=0.9, min_prune_break=5,
+              prune_amount=1, min_active_dims=1, stop_epsilon=1E-5, verbose=True):
         loader = DataLoader(self.dataset, batch_size=batch_size, shuffle=True)
-        for epoch in range(1, epochs + 1):
-            total_loss = 0.0
+        epoch = 1
+        prev_loss = 0.0
+        total_loss = 0.0
+        def stop():
+            return (epochs is not None and epoch == epochs + 1) or (epoch > 1 and abs(total_loss-prev_loss) < stop_epsilon)
+        while not stop():
+            self.model.train()
             for batch in loader:
                 batch = batch.to(self.device)
                 self.optimizer.zero_grad()
@@ -246,10 +233,7 @@ class OnlineTrainer:
                     - 1
                 )
                 kl_loss = kl_per_dim.sum(dim=1).mean()
-                # Fitness loss
-                fitness_target = batch.y.view(-1).to(self.device)
-                loss_fitness = F.mse_loss(fitness_pred, fitness_target)
-                # Total loss
+                loss_fitness = F.mse_loss(fitness_pred, batch.y.view(-1).to(self.device))
                 loss = loss_adj + loss_feat + kl_weight * kl_loss + fitness_weight * loss_fitness
                 loss.backward()
                 self.optimizer.step()
@@ -258,20 +242,36 @@ class OnlineTrainer:
             self.loss_history.append(avg_loss)
             if verbose:
                 print(f"Epoch {epoch}/{epochs}, Loss: {avg_loss:.4f}")
-            # Optional pruning
-            if prune_after and epoch == prune_after:
-                self.prune_low_precision_dims(num_prune=prune_amount)
+
+            # set baseline after warmup
+            if epoch == warmup_epochs:
+                self.initial_loss = avg_loss
+
+            # pruning condition
+            if (self.initial_loss is not None
+                and avg_loss <= loss_threshold * self.initial_loss
+                and (epoch - self.last_prune_epoch) >= min_prune_break
+            ):
+                active_count = int(self.model.latent_mask.sum().item())
+                if active_count > min_active_dims:
+                    self.prune_low_precision_dims(num_prune=prune_amount)
+                    self.last_prune_epoch = epoch
+                    self.initial_loss = avg_loss  # reset baseline
+
+            epoch += 1
         return self.loss_history
+
 
 if __name__ == "__main__":
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     num_node_types = 3
     max_nodes = 10
     latent_dim = 16
+    fitness_dim = 2
 
     encoder = GraphEncoder(num_node_types, node_emb_dim=10, hidden_dims=[32, 32], latent_dim=latent_dim)
     decoder = GraphDecoder(latent_dim=latent_dim, max_nodes=max_nodes, node_feat_dim=num_node_types, hidden_dim=128)
-    predictor = FitnessPredictor(latent_dim=latent_dim, hidden_dim=64)
+    predictor = FitnessPredictor(latent_dim=latent_dim, hidden_dim=64, fitness_dim=fitness_dim)
     model = DAGVAE(encoder, decoder, predictor)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
@@ -289,17 +289,21 @@ if __name__ == "__main__":
         return Data(x=types, edge_index=edge_index)
 
     # Create synthetic dataset
+    print('Generating random graphs')
     graphs = []
     fitnesses = []
     for _ in range(50):
         n = random.randint(3, max_nodes)
         graph = generate_random_dag(n, num_node_types, edge_prob=0.4)
-        fit = graph.edge_index.size(1) + 0.1 * random.random()
+        fit = []
+        for f in range(fitness_dim):
+            fit.append(graph.edge_index.size(1) + 0.1 * random.random())
         graphs.append(graph)
         fitnesses.append(fit)
 
     trainer = OnlineTrainer(model, optimizer, device=device)
     trainer.add_data(graphs, fitnesses)
+    print('Training')
     trainer.train(epochs=20, batch_size=8, kl_weight=0.1, fitness_weight=1.0)
 
     # Continue training with new data
@@ -312,4 +316,5 @@ if __name__ == "__main__":
         new_graphs.append(graph)
         new_fits.append(fit)
     trainer.add_data(new_graphs, new_fits)
+    print('Continuing training')
     trainer.train(epochs=10, batch_size=8, kl_weight=0.1, fitness_weight=1.0)
