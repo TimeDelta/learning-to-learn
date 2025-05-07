@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 from torch.nn.parameter import Parameter
 from typing import Dict, List, Tuple
-import warnings
 
 class BackpropGD(nn.Module):
     def __init__(self, step_size=0.1):
@@ -21,7 +20,6 @@ class BackpropGD(nn.Module):
         new_params = {}
         for (name, param), grad in zip(named_parameters, grads):
             if grad is None:
-                warnings.warn("Gradient is zero for parameter " + name)
                 grad = torch.zeros_like(param)
             new_params[name] = param - self.step_size * grad
 

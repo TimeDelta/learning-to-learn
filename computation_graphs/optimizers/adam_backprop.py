@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 from torch.nn.parameter import Parameter
 from typing import Dict, List, Tuple
-import warnings
 
 class AdamBackprop(nn.Module):
     moment1: Dict[str, torch.Tensor] = torch.jit.Attribute({}, Dict[str, torch.Tensor])
@@ -27,7 +26,6 @@ class AdamBackprop(nn.Module):
 
         for (name, param), grad in zip(named_parameters, grads):
             if grad is None:
-                warnings.warn("Gradient is zero for parameter " + name)
                 grad = torch.zeros_like(param)
             if name not in self.moment1:
                 self.moment1[name] = torch.zeros_like(param)
