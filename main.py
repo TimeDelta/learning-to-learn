@@ -5,71 +5,95 @@ import re
 import torch
 import torch.nn as nn
 
+import random
+import time
+import tracemalloc
+
 from computation_graphs.functions.activation import *
 from computation_graphs.functions.aggregation import *
 from genes import *
-from loss import MSELoss
+from models import *
+from pareto import *
+from tasks import *
 
-def eval_genomes(genomes, config, loss_fn, steps=10, epsilon=1e-10):
+def eval_genomes(genomes, config, task, steps=10, epsilon=1e-10):
     """
     Evaluate each genome by using its network as a meta–optimizer.
-
-    Parameters:
-      - genomes: list of (genome_id, genome) tuples
-      - config: NEAT configuration
-
-    The final fitness is defined as:
-         1.0 / (final_global_loss + average_query_loss + epsilon)
     """
-    losses = {}
+    raw_metrics: Dict[int, Dict[str, float]] = {}
+    genome_map = {gid: g for gid, g in genomes}
+
+    model = ManyLossMinimaModel(task.observed_dims)
     for genome_id, genome in genomes:
-        model_copy = copy.deepcopy(model)
-        optimizer = CustomFeedForwardNetwork.create(genome, config)
-        # TODO dynamically determine num steps based on generation num
-        loss_parts = evaluate_optimizer(optimizer, model_copy, loss_fn)
-        losses[genome_id] = loss_parts
+        model_copy = type(model)(task.observed_dims)
+        model_copy.load_state_dict(model.state_dict())
+        raw_metrics[genome_id] = evaluate_optimizer(genome.optimizer, model_copy, task, steps)
 
-    num_dims = len(next(iter(losses.values())))
-    max_vals = [max(losses[genome_id][i] for genome_id in losses) for i in range(num_dims)]
+    # 2. Prepare metric names & objectives
+    metric_names = [spec.name for spec in task.metrics]
+    objectives   = {spec.name: spec.objective for spec in task.metrics}
 
-    normalized_losses = {}
-    for genome_id, genome in genomes:
-        loss_parts = losses[genome_id]
-        # equal weighting to all parts of the loss function for now
-        normalized = sum([loss_parts[i] / max_vals[i] / num_dims for i in range(num_dims)])
-        normalized_losses[genome_id] = normalized
-        genome.fitness = 1.0 / (final_loss + epsilon)
+    # 3. Pareto front ranking
+    fronts = nondominated_sort(raw_metrics, objectives)
+    num_fronts = len(fronts)
 
-def evaluate_optimizer(optimizer, model, loss_fn, steps=10):
+    # 4. Compute global min/max per metric
+    mins = {m: min(raw_metrics[g][m] for g in raw_metrics) for m in metric_names}
+    maxs = {m: max(raw_metrics[g][m] for g in raw_metrics) for m in metric_names}
+
+    # 5. Assign fitness = Pareto rank base + composite normalized score
+    for front_idx, front in enumerate(fronts, start=1):
+        for genome_id in front:
+            vals = raw_metrics[genome_id]
+            # Composite min–max normalized score
+            scores = []
+            for m in metric_names:
+                lo, hi = mins[m], maxs[m]
+                if hi - lo < epsilon:
+                    norm = 1.0
+                else:
+                    v = vals[m]
+                    if objectives[m] == 'max':
+                        norm = (v - lo) / (hi - lo)
+                    else:
+                        norm = (hi - v) / (hi - lo)
+                scores.append(norm)
+            composite = sum(scores) / len(scores)
+            # Fitness: higher for earlier fronts, break ties by composite
+            genome_map[genome_id].fitness = (num_fronts - front_idx + 1) + composite
+
+def evaluate_optimizer(optimizer, model, task, steps=10):
     """
     Runs the optimizer over a number of steps.
 
     Args:
-      optimizer: An instance of SymbolicOptimizer (or subclass) that updates a parameter.
-      model: The model whose performance is measured by loss_fn.
-      loss_fn: Function that takes the model (or a parameter) and returns a scalar loss.
+      optimizer: A TorchScript JIT Graph instance that updates parameters.
+      model: The model whose performance is measured by the provided task.
+      task: The task on which to evaluate the optimizer.
       steps: Number of update iterations.
-
-    Returns:
-      1/∑_steps_(∑_dimensions_(loss))
     """
-    loss = loss_fn(model)
-    area_under_loss = loss
-
+    tracemalloc.start()
+    start = time.perf_counter()
+    prev_metrics_values = torch.tensor([0.0] * len(task.metrics))
     for step in range(steps):
-        # TODO measure time_taken
-        new_params = optimizer(loss_fn(model), loss, model.named_parameters())
+        metrics_values = task.evaluate_metrics(model, task.train_data)
+        new_params = optimizer(metrics_values, prev_metrics_values, model.named_parameters())
         model.load_state_dict(new_params)
-        loss = loss_fn(model)
-        area_under_loss += loss
-    # TODO add loss over validation data
-    # TODO add loss part for num nodes and edges in optimizer
-
-    return [area_under_loss, validation_loss, optimizer_time, optimizer_size]
+        prev_metric_values = task.evaluate_metrics(model, task.train_data)
+        area_under_metrics += np.sum(metrics_values.detach().data.numpy())
+    stop = time.perf_counter()
+    _, snapshot = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    time_cost = stop - start
+    validation_metrics = task.evaluate_metrics(model, task.data[1]).detach().data.numpy()
+    return [area_under_metrics, validation_metrics, time_cost, snapshot.size_diff()]
 
 def eval_genomes_wrapper(genomes, config):
-    # TODO: load data
-    eval_genomes(genomes, config, MSELoss(data), steps=10)
+    true_dims=random.randint(1, 10)
+    observed_dims=random.randint(1,10)
+    metrics=[MSELoss()]
+    task = RegressionTask(true_dims, observed_dims, metrics, num_samples=1000, train_ratio=2.0/3.0)
+    eval_genomes(genomes, config, task, steps=10)
 
 def create_initial_genome(config, optimizer):
     """
@@ -77,11 +101,9 @@ def create_initial_genome(config, optimizer):
     """
     genome = config.genome_type(0)
 
-    graph = optimizer.graph
-
     node_mapping = {} # from TorchScript nodes to genome node keys
     next_node_id = 0
-    for node in graph.nodes():
+    for node in optimizer.graph.nodes():
         new_node_gene = NodeGene(next_node_id, node)
         if new_node_gene:
             genome.nodes[next_node_id] = new_node_gene
@@ -90,7 +112,7 @@ def create_initial_genome(config, optimizer):
 
     connections = {}
     innovation = 0
-    for node in graph.nodes():
+    for node in optimizer.graph.nodes():
         current_key = node_mapping[node]
         for inp in node.inputs():
             producer = inp.node()
@@ -107,6 +129,7 @@ def create_initial_genome(config, optimizer):
                 print(f'WARNING: missing mapping for input node [{producer}]')
 
     genome.connections = connections
+    genome.optimizer = optimizer
     return genome
 
 def override_initial_population(population, config):

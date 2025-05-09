@@ -141,6 +141,7 @@ class OptimizerGenome(object):
         self.next_node_id = 0
 
         self.fitness = None
+        self.optimizer = None
 
     def configure_new(self, config):
         """Configure a new genome based on the given configuration."""

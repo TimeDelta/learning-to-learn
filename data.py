@@ -13,23 +13,14 @@ def generate_complex_loss_landscape_data(n_samples=1000, latent_dim=5, observed_
     latent_variables = np.random.uniform(low=min_val, high=max_val, size=(n_samples, latent_dim))
 
     noise_std = (max_val-min_val) / 10
-    if latent_dim < observed_dim:
-        random_input_projection = np.random.randn(latent_dim, observed_dim)
-        random_output_projection = np.random.randn(latent_dim, 1)
-    else:
-        random_input_projection = np.random.randn(latent_dim, latent_dim)
-        random_output_projection = np.random.randn(latent_dim, 1)
+    random_input_projection = np.random.randn(latent_dim, observed_dim)
+    random_output_projection = np.random.randn(latent_dim, 1)
 
     nonlinear_input = np.sin(np.dot(latent_variables, random_input_projection))
     nonlinear_output = np.tanh(np.dot(latent_variables, random_output_projection))
 
     noisy_nonlinear_input = nonlinear_input + np.random.normal(scale=noise_std, size=nonlinear_input.shape)
     noisy_nonlinear_output = nonlinear_output + np.random.normal(scale=noise_std, size=nonlinear_output.shape)
-
-    if latent_dim < observed_dim: # create extra features using additional noise
-        extra_feature_shape = (n_samples, observed_dim - latent_dim)
-        extra_features_input = np.random.normal(scale=noise_std, size=extra_feature_shape)
-        noisy_nonlinear_input = np.hstack((noisy_nonlinear_input, extra_features_input))
 
     return noisy_nonlinear_input, noisy_nonlinear_output
 

@@ -316,9 +316,6 @@ class OnlineTrainer:
             data.y = torch.tensor(fitness, dtype=torch.float) # each fitness already has multiple dimensions
             data.task_type = task_type
             data = graph.clone()
-            # fitness might be a list of floats
-            data.y = torch.as_tensor(fitness, dtype=torch.float)
-            data.task_type = task_type
             if isinstance(task_features, torch.Tensor):
                 data.task_features = task_features.detach().cpu().tolist()
             else:
@@ -469,9 +466,9 @@ if __name__ == "__main__":
 
     # Create synthetic dataset
     print('Generating random training data')
-    def generate_data(num_fitnesses):
+    def generate_data(num_samples):
         graphs, fitnesses, task_types, task_features = [], [], [], []
-        for _ in range(num_fitnesses):
+        for _ in range(num_samples):
             graph = generate_random_dag(random.randint(3, max_nodes), num_node_types, edge_prob=0.4)
             graphs.append(graph)
             fitnesses.append([graph.edge_index.size(1) + 0.1 * random.random() for _ in range(fitness_dim)])
