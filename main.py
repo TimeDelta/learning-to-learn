@@ -27,11 +27,13 @@ def eval_genomes(genomes, config, task, steps=10, epsilon=1e-10):
     for genome_id, genome in genomes:
         model_copy = type(model)(task.observed_dims)
         model_copy.load_state_dict(model.state_dict())
-        raw_metrics[genome_id] = evaluate_optimizer(genome.optimizer, model_copy, task, steps)
+        area_under_metrics, validation_metrics, time_cost, mem_cost = evaluate_optimizer(genome.optimizer, model_copy, task, steps)
+        print(validation_metrics)
+        raw_metrics[genome_id] = validation_metrics
 
     # 2. Prepare metric names & objectives
-    metric_names = [spec.name for spec in task.metrics]
-    objectives   = {spec.name: spec.objective for spec in task.metrics}
+    metric_names = [m.name for m in task.metrics]
+    objectives   = {m.name: m.objective for m in task.metrics}
 
     # 3. Pareto front ranking
     fronts = nondominated_sort(raw_metrics, objectives)
@@ -75,18 +77,20 @@ def evaluate_optimizer(optimizer, model, task, steps=10):
     tracemalloc.start()
     start = time.perf_counter()
     prev_metrics_values = torch.tensor([0.0] * len(task.metrics))
+    area_under_metrics = 0.0
     for step in range(steps):
-        metrics_values = task.evaluate_metrics(model, task.train_data)
+        metrics_values = task.evaluate_metrics(model, task.train_data).requires_grad_()
         new_params = optimizer(metrics_values, prev_metrics_values, model.named_parameters())
         model.load_state_dict(new_params)
-        prev_metric_values = task.evaluate_metrics(model, task.train_data)
+        prev_metrics_values = task.evaluate_metrics(model, task.train_data).requires_grad_()
         area_under_metrics += np.sum(metrics_values.detach().data.numpy())
     stop = time.perf_counter()
-    _, snapshot = tracemalloc.get_traced_memory()
+    _, peak_memory = tracemalloc.get_traced_memory()
     tracemalloc.stop()
     time_cost = stop - start
-    validation_metrics = task.evaluate_metrics(model, task.data[1]).detach().data.numpy()
-    return [area_under_metrics, validation_metrics, time_cost, snapshot.size_diff()]
+    validation_metrics = task.evaluate_metrics(model, task.valid_data).detach().data.numpy()
+    validation_metrics = { name: float(validation_metrics[i]) for i, name in enumerate([m.name for m in task.metrics]) }
+    return area_under_metrics, validation_metrics, time_cost, peak_memory
 
 def eval_genomes_wrapper(genomes, config):
     true_dims=random.randint(1, 10)

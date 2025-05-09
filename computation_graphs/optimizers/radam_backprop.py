@@ -23,7 +23,7 @@ class RAdamBackprop(nn.Module):
         self.step += 1
         rho_inf = 2.0 / (1.0 - self.beta2) - 1.0
         params = [param for _, param in named_parameters]
-        grads = torch.autograd.grad([loss], params, create_graph=False)
+        grads = torch.autograd.grad([loss], params, create_graph=False, allow_unused=True)
         new_params: Dict[str, torch.Tensor] = {}
         for (name, param), grad in zip(named_parameters, grads):
             if grad is None:
