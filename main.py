@@ -142,12 +142,15 @@ def override_initial_population(population, config):
     """
     new_population = {}
     optimizers = []
+    optimizer_paths = []
     for optimizer in config.genome_config.optimizers.split(','):
         optimizers.append(torch.jit.load(f'computation_graphs/optimizers/{optimizer}.pt'))
+        optimizer_paths.append(f'computation_graphs/optimizers/{optimizer}.pt')
     i = 0
     for key in population.population.keys():
         new_genome = create_initial_genome(config, optimizers[i % len(optimizers)])
         new_genome.key = key
+        new_genome.optimizer_path = optimizer_paths[i % len(optimizers)]
         new_population[key] = new_genome
         i += 1
     population.population = new_population

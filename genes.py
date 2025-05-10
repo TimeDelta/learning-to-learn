@@ -34,7 +34,6 @@ class NodeGene(BaseGene):
     ]
     def __init__(self, node_id: int, node: torch._C.Node=None):
         if node:
-            self.node = node
             self.node_type = node.kind()
             for attribute_name in node.attributeNames():
                 attribute_type = node.kindOf(attribute_name)

@@ -142,6 +142,20 @@ class OptimizerGenome(object):
 
         self.fitness = None
         self.optimizer = None
+        self.optimizer_path = None
+
+    def __deepcopy__(self, memo):
+        # Create a blank instance
+        new = self.__class__.__new__(self.__class__)
+        memo[id(self)] = new
+
+        # Deepcopy everything except 'optimizer'
+        for k, v in self.__dict__.items():
+            if k == 'optimizer':
+                setattr(new, k, torch.jit.load(self.optimizer_path))
+            else:
+                setattr(new, k, copy.deepcopy(v, memo))
+        return new
 
     def configure_new(self, config):
         """Configure a new genome based on the given configuration."""
