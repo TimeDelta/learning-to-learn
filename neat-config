@@ -9,6 +9,8 @@ activation_default      = none
 activation_mutate_rate  = 2.5
 aggregation_default     = sum
 aggregation_mutate_rate = 2.5
+attribute_add_prob      = 0.03
+attribute_delete_prob   = 0.03
 
 conn_add_prob         = 0.5
 conn_delete_prob      = 0.5

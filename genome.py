@@ -7,6 +7,7 @@ from typing import Dict, List, Tuple
 from computation_graphs.functions.activation import *
 from computation_graphs.functions.aggregation import *
 from neat.aggregations import AggregationFunctionSet
+from neat.attributes import BaseAttribute, BoolAttribute, StringAttribute, FloatAttribute
 from neat.config import ConfigParameter, write_pretty_params
 from neat.graphs import creates_cycle
 from neat.graphs import required_for_output
@@ -25,6 +26,8 @@ class OptimizerGenomeConfig(object):
         self._params = [
             ConfigParameter('compatibility_disjoint_coefficient', float),
             ConfigParameter('compatibility_weight_coefficient', float),
+            ConfigParameter('attribute_add_prob', float),
+            ConfigParameter('attribute_delete_prob', float),
             ConfigParameter('conn_add_prob', float),
             ConfigParameter('conn_delete_prob', float),
             ConfigParameter('node_add_prob', float),
@@ -137,7 +140,7 @@ class OptimizerGenome(object):
 
         # (gene_key, gene) pairs for gene sets
         self.nodes: Dict[int, NodeGene] = {}
-        self.connections: List[Tuple[int, int]] = [] # [from, to]
+        self.connections: Dict[int, int] = {} # [from, to]
         self.next_node_id = 0
 
         self.fitness = None
@@ -417,11 +420,6 @@ class OptimizerGenome(object):
         self.nodes[self.next_node_id] = node
         self.next_node_id += 1
         return node
-
-    def add_connection(self, in_id: int, out_id: int, weight: float = None):
-        if weight is None:
-            weight = random.uniform(-1, 1)
-        self.connections.append((in_id, out_id, weight))
 
     def crossover(self, other: 'Genome') -> 'Genome':
         # TODO find better crossover method than this code from the superclass

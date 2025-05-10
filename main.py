@@ -28,7 +28,6 @@ def eval_genomes(genomes, config, task, steps=10, epsilon=1e-10):
         model_copy = type(model)(task.observed_dims)
         model_copy.load_state_dict(model.state_dict())
         area_under_metrics, validation_metrics, time_cost, mem_cost = evaluate_optimizer(genome.optimizer, model_copy, task, steps)
-        print(validation_metrics)
         raw_metrics[genome_id] = validation_metrics
 
     # 2. Prepare metric names & objectives
@@ -154,6 +153,7 @@ def override_initial_population(population, config):
         new_population[key] = new_genome
         i += 1
     population.population = new_population
+    population.species.speciate(config, population.population, population.generation)
 
 if __name__ == "__main__":
     from genome import OptimizerGenome
