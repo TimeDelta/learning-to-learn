@@ -8,10 +8,12 @@ import numpy as np
 from torch_geometric.nn import MessagePassing, global_mean_pool
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
-from torch_geometric.utils import add_self_loops, softmax
+from torch_geometric.utils import add_self_loops, softmax, degree, to_dense_adj, to_dense_batch
 
 from typing import Dict, Any
 from warnings import warn
+
+from tasks import TASK_FEATURE_DIMS, TASK_TYPE_TO_INDEX
 
 
 class DAGAttention(MessagePassing):
@@ -44,35 +46,34 @@ class DAGAttention(MessagePassing):
 
 
 class TasksEncoder(nn.Module):
-    def __init__(self, task_feature_dims:Dict[Any,int], hidden_dim:int, latent_dim:int, type_embedding_dim:int):
+    def __init__(self, hidden_dim:int, latent_dim:int, type_embedding_dim:int):
         super().__init__()
         # Separate module per task type because each task has different number of features
         # and features don't semantically align
         self.latent_dim = latent_dim
-        self.embedder = nn.Embedding(len(task_feature_dims), type_embedding_dim)
+        self.embedder = nn.Embedding(len(TASK_FEATURE_DIMS), type_embedding_dim)
         self.encoders = nn.ModuleDict({
-            str(type): nn.Sequential(
+            str(TASK_TYPE_TO_INDEX[type]): nn.Sequential(
                 nn.Linear(num_features + type_embedding_dim, hidden_dim),
                 nn.ReLU(),
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.ReLU()
-            ) for type, num_features in task_feature_dims.items()
+            ) for type, num_features in TASK_FEATURE_DIMS.items()
         })
         # Shared mu/logvar heads
         self.lin_mu     = nn.Linear(hidden_dim, latent_dim)
         self.lin_logvar = nn.Linear(hidden_dim, latent_dim)
-        self.task_type_indices = {k: i for i, k in enumerate(task_feature_dims.keys())}
 
     def forward(self, task_types, feature_vecs):
         """
-        task_types: list[str]   of length B
+        task_types: list[str] of length B
         feature_vecs: list[Tensor] of length B, each shape (feat_dim,)
         """
         mu_list, logvar_list = [], []
         for task_type, feature_vec in zip(task_types, feature_vecs):
-            task_type_embedding = self.embedder(torch.tensor(self.task_type_indices[task_type]))
+            task_type_embedding = self.embedder(task_type)
             feature_vec = torch.as_tensor(feature_vec, dtype=torch.float, device=device)
-            h = self.encoders[task_type](torch.cat((task_type_embedding, feature_vec), dim=0))
+            h = self.encoders[str(task_type.item())](torch.cat((task_type_embedding, feature_vec), dim=0))
             mu_list.append(self.lin_mu(h))
             logvar_list.append(self.lin_logvar(h))
         # stack into B×latent_dim tensors
@@ -136,41 +137,131 @@ class GraphEncoder(nn.Module):
         self.latent_dim = len(kept_idx)
 
 
-class GraphDecoder(nn.Module):
+class GraphDeconvNet(MessagePassing):
     """
-    Reconstruct adjacency and node features from latent code.
+    A Graph Deconvolutional Network (GDN) layer that acts as the
+    transpose/inverse of a GCNConv.  It takes an input signal X of
+    size [N, in_channels] on a graph with edge_index, and produces
+    an output signal of size [N, out_channels], without any fixed
+    max_nodes or feature‐size assumptions.
     """
-    def __init__(self, latent_dim, max_nodes, node_feat_dim, hidden_dim=128):
-        super().__init__()
-        self.max_nodes = max_nodes
-        self.node_feat_dim = node_feat_dim
-        self.fc1 = nn.Linear(latent_dim, hidden_dim)
-        self.fc_adj = nn.Linear(hidden_dim, max_nodes * max_nodes)
-        self.fc_feat = nn.Linear(hidden_dim, max_nodes * node_feat_dim)
+    def __init__(self, in_channels:int, out_channels:int, aggr:str='add'):
+        super().__init__(aggr=aggr)
+        # weight for the "transpose" convolution
+        self.lin = nn.Linear(in_channels, out_channels, bias=True)
+        # optional bias after aggregation
+        self.bias = nn.Parameter(torch.zeros(out_channels))
 
-    def forward(self, z):
-        batch_size = z.size(0)
-        h = F.relu(self.fc1(z))
-        adj_logits = self.fc_adj(h).view(batch_size, self.max_nodes, self.max_nodes)
-        node_features = self.fc_feat(h).view(batch_size, self.max_nodes, self.node_feat_dim)
-        return adj_logits, node_features
+    def forward(self, edge_index: torch.LongTensor, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            edge_index: LongTensor of shape [2, E] with COO edges.
+            x:          FloatTensor of shape [N, in_channels] node signals.
+        Returns:
+            FloatTensor of shape [N, out_channels].
+        """
+        x = self.lin(x) # (acts like W^T in a transposed convolution)
+        # if there are no edges, skip the propagate/unpack step
+        if edge_index.numel() == 0 or edge_index.shape[1] == 0:
+            return F.relu(x + self.bias) # just apply bias + activation
+        row, col = edge_index
+        deg = degree(col, x.size(0), dtype=x.dtype)
+        out = self.propagate(edge_index, x=x, norm=deg.pow(0.5)[col] * deg.pow(0.5)[row]) # each node collects from neighbors
+        return out + self.bias
+
+    def message(self, x_j: torch.Tensor, norm: torch.Tensor) -> torch.Tensor:
+        # x_j: neighbor features [E, out_channels]
+        # norm: normalization per edge [E]
+        return x_j * norm.view(-1, 1)
+
+    def update(self, aggr_out: torch.Tensor) -> torch.Tensor:
+        # optional nonlinearity
+        return F.relu(aggr_out)
+
+
+class ARGraphDecoder(nn.Module):
+    """
+    Autoregressive generation + GDN refinement.
+    1) Autoregressively generate node embeddings & edges (GraphRNN style).
+    2) Refine embeddings via Graph Deconvolutional Nets (GDNs).
+    """
+    def __init__(self, latent_dim:int, hidden_dim:int=128, gdn_layers:int=2):
+        super().__init__()
+        # — map latent → initial Node‐RNN state
+        self.hidden_node_state_init = nn.Linear(latent_dim, hidden_dim)
+
+        # — Node‐RNN (no input, only hidden evolves)
+        self.node_rnn = nn.GRUCell(input_size=0, hidden_size=hidden_dim)
+        self.fc_stop  = nn.Linear(hidden_dim, 1)
+        self.fc_node  = nn.Linear(hidden_dim, hidden_dim)
+        self.edge_rnn = nn.GRUCell(input_size=1, hidden_size=hidden_dim)
+        self.fc_edge  = nn.Linear(hidden_dim, 1)
+
+        # — GraphDeconvNet stack (learned spectral decoders)
+        self.gdns = nn.ModuleList([GraphDeconvNet(hidden_dim, hidden_dim) for _ in range(gdn_layers)])
+
+    def forward(self, latent):
+        """
+        (num_graphs, latent_dim)
+        returns: list of graphs, each {'node_features': Tensor[N, hidden_dim],
+                                       'edge_index': LongTensor[2, E]}
+        """
+        device = latent.device
+        all_graphs = []
+
+        for l in range(latent.size(0)):
+            hidden_node = F.relu(self.hidden_node_state_init(latent[l])).unsqueeze(0) # (hidden_dim,)
+            node_features = []
+            edges = []
+            t = 0
+            while True:
+                # inside forward, for each graph or each time step:
+                hidden_node = self.node_rnn(torch.zeros(hidden_node.shape[0], 0, device=device), hidden_node)
+
+                p_stop = torch.sigmoid(self.fc_stop(hidden_node))
+                if torch.bernoulli(1 - p_stop).item() == 0:
+                    break
+                new_node = self.fc_node(hidden_node).squeeze(0)
+                node_features.append(new_node)
+
+                # edge generation to previous nodes
+                hidden_edge = hidden_node
+                edge_in = torch.zeros(1, 1, device=device)
+                for i in range(t):
+                    hidden_edge = self.edge_rnn(edge_in, hidden_edge)
+                    p_edge = torch.sigmoid(self.fc_edge(hidden_edge)).view(-1)
+                    if torch.bernoulli(p_edge).item() == 1:
+                        edges.append([i, t])
+                    edge_in = p_edge.unsqueeze(0)
+                t += 1
+
+            if node_features:
+                X = torch.stack(node_features, dim=0)
+                E = torch.tensor(edges, dtype=torch.long).t().contiguous()
+            else:
+                X = torch.zeros((0, self.fc_node.out_features), device=device)
+                E = torch.zeros((2, 0), dtype=torch.long, device=device)
+
+            # refine via graph deconvolution
+            for gdn in self.gdns:
+                X = gdn(E, X)
+
+            all_graphs.append({'node_features': X, 'edge_index': E})
+
+        return all_graphs
 
     def prune_latent_dims(self, kept_idx: torch.LongTensor):
         """
-        Keep only the latent dims in `kept_idx` for decoder.fc1.
-        fc_adj and fc_feat stay the same.
+        Permanently remove unused latent dimensions from the hidden_node_state_init layer.
+        kept_idx: 1D LongTensor of indices to keep from the original latent vector.
         """
-        device = self.fc1.weight.device
-        out_feats = self.fc1.out_features
-        new_dim   = kept_idx.numel()
+        device = self.hidden_node_state_init.weight.device
+        new_hidden_node_state_init = nn.Linear(kept_idx.numel(), self.hidden_node_state_init.out_features, bias=True).to(device)
+        new_hidden_node_state_init.weight.data.copy_(old.weight.data[:, kept_idx])
 
-        old_fc1 = self.fc1
-        new_fc1 = nn.Linear(new_dim, out_feats, bias=True).to(device)
-        # copy only the kept columns
-        new_fc1.weight.data.copy_(old_fc1.weight.data[:, kept_idx])
-        new_fc1.bias.data.copy_(old_fc1.bias.data)
-        self.fc1 = new_fc1
-
+        new_hidden_node_state_init.bias.data.copy_(old.bias.data)
+        self.hidden_node_state_init = new_hidden_node_state_init
+        self.latent_dim = kept_idx.numel()
 
 class FitnessPredictor(nn.Module):
     """
@@ -206,7 +297,7 @@ class DAGTaskFitnessRegularizedVAE(nn.Module):
     def __init__(self,
         graph_encoder: GraphEncoder,
         tasks_encoder: TasksEncoder,
-        decoder: GraphDecoder,
+        decoder: ARGraphDecoder,
         fitness_predictor: FitnessPredictor
     ):
         super().__init__()
@@ -232,15 +323,16 @@ class DAGTaskFitnessRegularizedVAE(nn.Module):
         return z if latent_mask is None else z * latent_mask
 
     def decode(self, z):
-        return self.decoder(z)
+        graphs = self.decoder(z)
+        return [{'edge_index': g['edge_index'], 'node_features': g['node_features']} for g in graphs]
 
     def forward(self, x, edge_index, batch, task_type, task_features):
         mu_g, lv_g, mu_t, lv_t = self.encode(x, edge_index, batch, task_type, task_features)
         graph_latent = self.reparameterize(mu_g, lv_g, self.graph_latent_mask)
         task_latent = self.reparameterize(mu_t, lv_t, self.tasks_latent_mask)
-        adj_logits, node_features = self.decode(graph_latent)
+        decoded_graphs = self.decode(graph_latent)
         fitness_pred = self.fitness_predictor(graph_latent, task_latent)
-        return adj_logits, node_features, fitness_pred, graph_latent, task_latent, mu_g, lv_g, mu_t, lv_t
+        return decoded_graphs, fitness_pred, graph_latent, task_latent, mu_g, lv_g, mu_t, lv_t
 
     def prune_latent_dims(self, num_prune=1):
         # Identify and mask out dims with highest precision (least variance)
@@ -299,7 +391,8 @@ class DAGTaskFitnessRegularizedVAE(nn.Module):
 
 class OnlineTrainer:
     """
-    Incremental trainer with ARD-KL + loss-thresholded iterative pruning.
+    Incremental trainer with ARD-KL + loss-thresholded iterative pruning,
+    supporting variable node-feature dimensions via list-of-graphs decoding.
     """
     def __init__(self, model: DAGTaskFitnessRegularizedVAE, optimizer, device=torch.device('cpu')):
         self.model = model.to(device)
@@ -311,11 +404,18 @@ class OnlineTrainer:
         self.last_prune_epoch = 0
 
     def add_data(self, graphs, fitnesses, task_types, task_feats):
+        """
+        Each Data in self.dataset must have:
+         - .x : Tensor[Ni, Fi]      (raw node features)
+         - .edge_index : [2, Ei]
+         - .y : Tensor[1, fitness_dim]
+         - .task_type : Tensor[1]
+         - .task_features : list of length Fi_task
+        """
         for graph, fitness, task_type, task_features in zip(graphs, fitnesses, task_types, task_feats):
             data = graph.clone()
-            data.y = torch.tensor(fitness, dtype=torch.float) # each fitness already has multiple dimensions
-            data.task_type = task_type
-            data = graph.clone()
+            data.y = torch.as_tensor(fitness, dtype=torch.float).unsqueeze(0)
+            data.task_type = torch.tensor([TASK_TYPE_TO_INDEX[task_type]], dtype=torch.long)
             if isinstance(task_features, torch.Tensor):
                 data.task_features = task_features.detach().cpu().tolist()
             else:
@@ -324,65 +424,91 @@ class OnlineTrainer:
 
     def train(self, epochs=1, batch_size=16, kl_weight=1.0, fitness_weight=1.5,
               warmup_epochs=None, loss_threshold=0.9, min_prune_break=5,
-              prune_amount=1, min_active_dims=1, stop_epsilon=1E-3, verbose=True):
+              prune_amount=1, min_active_dims=5, stop_epsilon=1E-3, verbose=True):
         loader = DataLoader(self.dataset, batch_size=batch_size, shuffle=True)
         epoch = 1
         num_loss_terms = 5
-        prev_loss_terms = np.array([0.0] * num_loss_terms)
-        avg_loss_terms = np.array([0.0] * num_loss_terms)
+        prev_loss_terms = torch.zeros(num_loss_terms)
+        avg_loss_terms = torch.zeros(num_loss_terms)
+
         def stop():
-            max_loss_term_change = np.max(abs(avg_loss_terms - prev_loss_terms))
+            max_loss_term_change = (avg_loss_terms - prev_loss_terms).abs().max().item()
             return (epochs is not None and epoch == epochs + 1) or (epoch > 1 and max_loss_term_change < stop_epsilon)
+
         while not stop():
-            prev_loss_terms = avg_loss_terms
-            total_loss_terms = np.array([0.0] * num_loss_terms)
+            prev_loss_terms = avg_loss_terms.clone()
+            total_loss_terms = torch.zeros(num_loss_terms)
             self.model.train()
             for batch in loader:
                 batch = batch.to(self.device)
                 self.optimizer.zero_grad()
-                adj_logits, node_features, fitness_pred, graph_latent, task_latent, mu_g, lv_g, mu_t, lv_t = self.model(
+
+                # --- 1) forward pass ---
+                # assume model.forward now returns:
+                #   decoded_graphs: List[{'edge_index', 'node_features'}] (len=B)
+                #   fitness_pred: Tensor[B, fitness_dim]
+                #   mu_g, lv_g, mu_t, lv_t: Tensors[B, latent_dim]
+                decoded_graphs, fitness_pred, graph_latent, task_latent, mu_g, lv_g, mu_t, lv_t = self.model(
                     batch.x, batch.edge_index, batch.batch, batch.task_type, batch.task_features
                 )
                 # --- trivial task-latent check ---
                 mean_var = task_latent.var(dim=0).mean().item()
                 if mean_var < 1E-3:
                     warn(f"Task latent collapsed (mean variance={mean_var:.2e}): Consider adding task reconstruction to cost")
-                num_graphs = batch.num_graphs
-                ptr = batch.ptr  # tensor of size (num_graphs+1)
 
-                # Reconstruction losses
-                loss_adj = 0.0
-                loss_feat = 0.0
-                for i in range(num_graphs):
-                    start_idx = ptr[i].item()
-                    end_idx = ptr[i+1].item()
-                    Ni = end_idx - start_idx
-                    if Ni == 0:
+                dense_adj = to_dense_adj(batch.edge_index, batch.batch, max_num_nodes=None)
+                # slice out GT node-features per graph
+                gt_node_features = []
+                for i in range(batch.num_graphs):
+                    mask_i = (batch.batch == i)
+                    gt_node_features.append(batch.x[mask_i])
+
+                # --- 2) reconstruction losses ---
+                loss_adj, loss_feat = 0.0, 0.0
+                for i, dg in enumerate(decoded_graphs):
+                    edge_predictions = dg['edge_index']
+                    pred_features = dg['node_features']
+                    target_features = gt_node_features[i]
+                    Ni_pred = pred_features.size(0)
+                    Ni_gt   = target_features.size(0)
+                    if Ni_pred == 0 or Ni_gt == 0:
                         continue
-                    # Build adjacency target
-                    edge_mask = ((batch.batch[batch.edge_index[0]] == i) &
-                                 (batch.batch[batch.edge_index[1]] == i))
-                    edges_i = batch.edge_index[:, edge_mask]
-                    src_local = edges_i[0] - start_idx
-                    dst_local = edges_i[1] - start_idx
-                    adj_target = torch.zeros((Ni, Ni), device=self.device)
-                    adj_target[src_local, dst_local] = 1.0
-                    # Upper triangle mask (i < j)
-                    mask = torch.triu(torch.ones((Ni, Ni), device=self.device), diagonal=1) == 1
+
+                    # compare only the overlap
+                    Ni = min(Ni_pred, Ni_gt)
+                    # build binary adjacency preds/targets on 0..Ni-1
+                    adj_pred = torch.zeros((Ni,Ni), device=self.device)
+                    for s,d in edge_predictions.t().tolist():
+                        if s < Ni and d < Ni:
+                            adj_pred[s,d] = 1.0
+                    adj_true = dense_adj[i, :Ni, :Ni]
+
+                    mask = torch.triu(torch.ones_like(adj_pred), diagonal=1).bool()
                     if mask.any():
-                        pred_flat = adj_logits[i, :Ni, :Ni][mask]
-                        target_flat = adj_target[mask]
-                        loss_adj += F.binary_cross_entropy_with_logits(pred_flat, target_flat)
-                    # Node feature loss (one-hot -> class labels)
-                    target_features = batch.x[start_idx:end_idx] # (Ni, node_feat_dim)
-                    # Node feature loss (class labels from integer features)
-                    target_classes = batch.x[start_idx:end_idx]  # (Ni,)
-                    pred_feats = node_features[i, :Ni, :]        # (Ni, node_feat_dim)
-                    loss_feat += F.cross_entropy(pred_feats, target_classes.to(self.device))
+                        pred_flat = adj_pred[mask]
+                        true_flat = adj_true[mask]
+                        loss_adj += F.binary_cross_entropy_with_logits(pred_flat, true_flat)
 
-                loss_adj = loss_adj / num_graphs
-                loss_feat = loss_feat / num_graphs
+                    # node feature loss
+                    if pred_features.ndim < 2 and target_features.ndim < 2:
+                        continue # correctly predicted no features present
+                    if pred_features.ndim < 2:
+                        loss_feat += pred_features[:Ni,].sum()
+                        continue
+                    if target_features.ndim < 2:
+                        loss_feat += target_features[:Ni,].sum()
+                        continue
+                    feat_overlap = min(pred_features.size(1), target_features.size(1))
+                    loss_feat += F.mse_loss(pred_features[:Ni, :feat_overlap], target_features[:Ni, :feat_overlap].to(self.device))
+                    if pred_features.size(1) < target_features.size(1):
+                        loss_feat += target_features[:Ni, feat_overlap:].sum()
+                    elif pred_features.size(1) > target_features.size(1):
+                        loss_feat += pred_features[:Ni, feat_overlap:].sum()
 
+                loss_adj  /= batch.num_graphs
+                loss_feat /= batch.num_graphs
+
+                # --- 3) ARD-KL losses ---
                 def calc_kl_div_per_dim(log_alpha, logvar, mu):
                     # ARD-KL divergence per sample and per dim
                     precision = torch.exp(log_alpha)
@@ -396,26 +522,37 @@ class OnlineTrainer:
                     )
                 graph_kl_loss = calc_kl_div_per_dim(self.model.log_alpha_g, lv_g, mu_g).sum(dim=1).mean()
                 task_kl_loss = calc_kl_div_per_dim(self.model.log_alpha_t, lv_t, mu_t).sum(dim=1).mean()
-                loss_fitness = F.mse_loss(fitness_pred, batch.y.to(self.device).view_as(fitness_pred))
-                loss_terms = [loss_adj, loss_feat, kl_weight*graph_kl_loss, kl_weight*task_kl_loss, fitness_weight * loss_fitness]
+
+                # --- 4) fitness loss ---
+                loss_fitness = F.mse_loss(fitness_pred, batch.y.to(self.device))
+
+                # --- 5) total & backward ---
+                loss_terms = [
+                    loss_adj,
+                    loss_feat,
+                    kl_weight*graph_kl_loss,
+                    kl_weight*task_kl_loss,
+                    fitness_weight*loss_fitness,
+                ]
                 sum(loss_terms).backward()
                 self.optimizer.step()
-                total_loss_terms += np.array([t.detach().numpy() for t in loss_terms])
+                total_loss_terms += torch.tensor([t for t in loss_terms])
             avg_loss_terms = total_loss_terms / len(loader)
-            self.loss_history.append(avg_loss_terms)
+            self.loss_history.append(avg_loss_terms.cpu().numpy())
+
             if verbose:
                 if not epochs:
                     print(f"Epoch {epoch}, Loss terms per batch: {avg_loss_terms} = {avg_loss_terms.sum():.4f}")
                 else:
                     print(f"Epoch {epoch}/{epochs}, Loss terms per batch: {avg_loss_terms} = {avg_loss_terms.sum():.4f}")
 
-            # set baseline after warmup
+            # warm-up baseline
             if epoch == warmup_epochs:
-                self.initial_loss = avg_loss_terms.sum()
+                self.initial_loss = avg_loss_terms.sum().item()
 
             # pruning condition
             if (self.initial_loss is not None
-                and avg_loss_terms.sum() <= loss_threshold * self.initial_loss
+                and avg_loss_terms.sum().item() <= loss_threshold * self.initial_loss
                 and (epoch - self.last_prune_epoch) >= min_prune_break
             ):
                 active_count = int(self.model.graph_latent_mask.sum().item())
@@ -428,6 +565,7 @@ class OnlineTrainer:
         return self.loss_history
 
     def resize_bottleneck(self):
+        """Rebuild all modules to permanently prune inactive dims."""
         self.model.resize_bottleneck(self.device)
         # reinit optimizer so it only holds new params
         lr = self.optimizer.defaults.get("lr", 1e-3)
@@ -442,11 +580,10 @@ if __name__ == "__main__":
     graph_latent_dim = 32
     fitness_dim = 2
     task_latent_dim = graph_latent_dim - 2
-    task_feature_dims = {'a':3,'b':5,'c':7}
 
     graph_encoder = GraphEncoder(num_node_types, node_emb_dim=10, hidden_dims=[32, 32], latent_dim=graph_latent_dim)
-    task_encoder = TasksEncoder(task_feature_dims=task_feature_dims, hidden_dim=16, latent_dim=task_latent_dim, type_embedding_dim=8)
-    decoder = GraphDecoder(latent_dim=graph_latent_dim, max_nodes=max_nodes, node_feat_dim=num_node_types, hidden_dim=128)
+    task_encoder = TasksEncoder(hidden_dim=16, latent_dim=task_latent_dim, type_embedding_dim=8)
+    decoder = ARGraphDecoder(latent_dim=graph_latent_dim, hidden_dim=128)
     predictor = FitnessPredictor(latent_dim=graph_latent_dim+task_latent_dim, hidden_dim=64, fitness_dim=fitness_dim)
     model = DAGTaskFitnessRegularizedVAE(graph_encoder, task_encoder, decoder, predictor)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
@@ -472,9 +609,9 @@ if __name__ == "__main__":
             graph = generate_random_dag(random.randint(3, max_nodes), num_node_types, edge_prob=0.4)
             graphs.append(graph)
             fitnesses.append([graph.edge_index.size(1) + 0.1 * random.random() for _ in range(fitness_dim)])
-            task_type = random.choice(['a', 'b', 'c'])
+            task_type = random.choice(list(TASK_FEATURE_DIMS.keys()))
             task_types.append(task_type)
-            task_features.append(torch.randn((task_feature_dims[task_type],)))
+            task_features.append(torch.randn((TASK_FEATURE_DIMS[task_type],)))
         return graphs, fitnesses, task_types, task_features
 
     trainer = OnlineTrainer(model, optimizer, device=device)

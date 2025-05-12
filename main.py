@@ -5,6 +5,7 @@ import re
 import torch
 import torch.nn as nn
 
+import os
 import random
 import time
 import tracemalloc
@@ -14,6 +15,7 @@ from computation_graphs.functions.aggregation import *
 from genes import *
 from models import *
 from pareto import *
+from population import *
 from tasks import *
 
 def eval_genomes(genomes, config, task, steps=10, epsilon=1e-10):
@@ -128,7 +130,7 @@ def create_initial_genome(config, optimizer):
                 conn.innovation = innovation
                 innovation += 1
                 connections[key] = conn
-            elif '%self.1 : __torch__.BackpropGD, %loss.1 : Tensor, %prev_loss : Tensor, %named_parameters.1 : (str, Tensor)[] = prim::Param()' not in str(producer):
+            elif ', %loss.1 : Tensor, %prev_loss : Tensor, %named_parameters.1 : (str, Tensor)[] = prim::Param()' not in str(producer):
                 print(f'WARNING: missing mapping for input node [{producer}]')
 
     genome.connections = connections
@@ -142,9 +144,10 @@ def override_initial_population(population, config):
     new_population = {}
     optimizers = []
     optimizer_paths = []
-    for optimizer in config.genome_config.optimizers.split(','):
-        optimizers.append(torch.jit.load(f'computation_graphs/optimizers/{optimizer}.pt'))
-        optimizer_paths.append(f'computation_graphs/optimizers/{optimizer}.pt')
+    for fname in os.listdir('computation_graphs/optimizers/'):
+        if fname.endswith('.pt'):
+            optimizers.append(torch.jit.load(f'computation_graphs/optimizers/{fname}'))
+            optimizer_paths.append(f'computation_graphs/optimizers/{fname}')
     i = 0
     for key in population.population.keys():
         new_genome = create_initial_genome(config, optimizers[i % len(optimizers)])
@@ -164,7 +167,7 @@ if __name__ == "__main__":
         neat.DefaultStagnation,
         'neat-config'
     )
-    population = neat.Population(config)
+    population = GuidedPopulation(config)
 
     override_initial_population(population, config)
 

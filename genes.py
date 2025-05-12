@@ -1,4 +1,3 @@
-from neat.attributes import BaseAttribute, BoolAttribute, StringAttribute, FloatAttribute
 from neat.genes import BaseGene
 from typing import Dict
 import torch
@@ -6,17 +5,8 @@ import torch
 import random
 from warnings import warn
 
+from attributes import BaseAttribute, BoolAttribute, StringAttribute, FloatAttribute, IntAttribute
 from utility import generate_random_string
-
-class IntAttribute(FloatAttribute):
-    def clamp(self, value, config):
-        return int(super.clamp(value, config))
-
-    def init_value(self, config):
-        return int(super.init_value(config))
-
-    def mutate_value(self, value, config):
-        return int(super.mutate_value(value, config))
 
 # modified from neat-python versions
 node_type_options = [ # for mutation
@@ -31,41 +21,46 @@ node_type_options = [ # for mutation
     'aten::min',
     'aten::sum',
     'aten::len',
+    'prim::Constant',
 ]
+NODE_TYPE_TO_INDEX = {nt: i for i, nt in enumerate(node_type_options)}
+NODE_TYPE_TO_INDEX['input'] = len(NODE_TYPE_TO_INDEX)
+NODE_TYPE_TO_INDEX['hidden'] = len(NODE_TYPE_TO_INDEX)
+NODE_TYPE_TO_INDEX['output'] = len(NODE_TYPE_TO_INDEX)
 
 class NodeGene(BaseGene):
     _gene_attributes = [
         StringAttribute('node_type', options=','.join(node_type_options))
     ]
     def __init__(self, node_id: int, node: torch._C.Node=None):
+        self.dynamic_attributes = {}
         if node:
             self.node_type = node.kind()
             for attribute_name in node.attributeNames():
                 attribute_type = node.kindOf(attribute_name)
                 if attribute_type == 'i':
                     attribute = IntAttribute(attribute_name)
-                    setattr(self, attribute_name, node.i(attribute_name))
+                    self.dynamic_attributes[attribute] = node.i(attribute_name)
                 elif attribute_type == 'f':
                     attribute = FloatAttribute(attribute_name)
-                    setattr(self, attribute_name, node.f(attribute_name))
+                    self.dynamic_attributes[attribute] = node.f(attribute_name)
                 elif attribute_type == 's':
                     attribute = StringAttribute(attribute_name)
-                    setattr(self, attribute_name, node.s(attribute_name))
+                    self.dynamic_attributes[attribute] = node.s(attribute_name)
                 else:
                     warn(f'WARNING: Unknown attribute type for node [{node}]: {attribute_type}')
-                self._gene_attributes.append(attribute)
         else:
             self.node_type = None
-        if not hasattr(self, 'value'):
-            self.value = None
+        # if not hasattr(self, 'value'):
+        #     self.value = None
         BaseGene.__init__(self, node_id)
 
     def copy(self):
         new_gene = NodeGene(self.id)
         new_gene.node_type = self.node_type
-        new_gene._gene_attributes = self._gene_attributes.copy()
-        for attribute in self._gene_attributes:
-            setattr(new_gene, attribute.name, getattr(self, attribute.name))
+        new_gene.dynamic_attributes = self.dynamic_attributes.copy()
+        for attribute in self.dynamic_attributes:
+            new_gene.dynamic_attributes[attribute] = self.dynamic_attributes[attribute]
         return new_gene
 
     def mutate(self, config):
@@ -83,27 +78,23 @@ class NodeGene(BaseGene):
             self.add_attribute(attr, config)
 
         # with some probability, remove an existing one
-        if random.random() < config.attribute_delete_prob:
-            to_remove = random.choice(self._gene_attributes).name
-            while to_remove == 'node_type':
-                to_remove = random.choice(self._gene_attributes).name
+        if len(self.dynamic_attributes) > 0 and random.random() < config.attribute_delete_prob:
+            to_remove = random.choice(self.dynamic_attributes.keys())
             self.remove_attribute(to_remove)
 
     def add_attribute(self, attr: BaseAttribute, config):
         """Add a new attribute to this gene at runtime."""
-        self._gene_attributes.append(attr)
-        setattr(self, attr.name, attr.init_value(config))
+        self.dynamic_attributes[attr] = attr.init_value(config)
 
-    def remove_attribute(self, name: str):
+    def remove_attribute(self, attr_to_remove: BaseAttribute):
         """Remove a dynamically added attribute."""
-        self._gene_attributes = [a for a in self._gene_attributes if a.name != name]
-        delattr(self, name)
+        self.dynamic_attributes = {a: v for a, v in self.dynamic_attributes.items() if a != attr_to_remove}
 
     def distance(self, other, config):
-        d = 0.0
-        for attribute in self._gene_attributes:
-            if hasattr(other, attribute.name):
-                if getattr(self, attribute.name) != getattr(other, attribute.name):
+        d = 0.0 if self.node_type == other.node_type else 1.0
+        for attribute, value in self.dynamic_attributes.items():
+            if attribute in other.dynamic_attributes.keys():
+                if self.dynamic_attributes[attribute] != other.dynamic_attributes[attribute]:
                     d += 1
             else:
                 d += 1
@@ -116,11 +107,11 @@ class NodeGene(BaseGene):
         # Note: we use "a if random() > 0.5 else b" instead of choice((a, b))
         # here because `choice` is substantially slower.
         new_gene = self.__class__(self.key)
-        for a in self._gene_attributes:
-            if not hasattr(gene2, a.name) or random.random() > 0.5:
-                setattr(new_gene, a.name, getattr(self, a.name))
+        for a in self.dynamic_attributes:
+            if a not in gene2.dynamic_attributes.keys() or random.random() > 0.5:
+                new_gene.dynamic_attributes[a] = self.dynamic_attributes[a]
             elif hasattr(gene2, a.name):
-                setattr(new_gene, a.name, getattr(gene2, a.name))
+                new_gene.dynamic_attributes[a] = gene2.dynamic_attributes[a]
             else:
                 warn('Missing Attribute: ' + a.name)
         return new_gene

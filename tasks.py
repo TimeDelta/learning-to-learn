@@ -12,6 +12,7 @@ from metrics import *
 
 class Task:
     feature_functions = []
+    name = str(__name__).replace('tasks.', '')
 
     def __init__(self, metrics: List[Metric], num_samples:int, train_ratio:float):
         self.metrics = metrics
@@ -45,3 +46,8 @@ class RegressionTask(Task):
         cut_index = int(num_samples*train_ratio)
         self.train_data = (inputs[:cut_index], outputs[:cut_index])
         self.valid_data = (inputs[cut_index:], outputs[cut_index:])
+
+TASK_FEATURE_DIMS = {
+    RegressionTask.name: len(RegressionTask.feature_functions),
+}
+TASK_TYPE_TO_INDEX = {k: i for i, k in enumerate(TASK_FEATURE_DIMS.keys())}
