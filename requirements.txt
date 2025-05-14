@@ -2,3 +2,4 @@ neat-python
 numpy
 torch
 torch_geometric
+sentence_transformers

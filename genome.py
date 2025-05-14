@@ -137,6 +137,7 @@ class OptimizerGenome(object):
         self.next_node_id = 0
 
         self.fitness = None
+        self.fitnesses = []
         self.optimizer = None
         self.optimizer_path = None
 

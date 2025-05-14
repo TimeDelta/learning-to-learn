@@ -5,11 +5,12 @@ from torch_geometric.data import Data
 
 import random
 from typing import List
+from warnings import warn
 
 from genome import OptimizerGenome
-from genes import NODE_TYPE_TO_INDEX
+from genes import NODE_TYPE_TO_INDEX, NODE_TYPE_OPTIONS
 from search_space_compression import *
-from tasks import TASK_FEATURE_DIMS
+from tasks import *
 
 
 class GuidedPopulation(Population):
@@ -21,7 +22,7 @@ class GuidedPopulation(Population):
         num_node_types = 10
         fitness_dim = 2
         graph_encoder = GraphEncoder(
-            num_node_types=10,
+            num_node_types=len(NODE_TYPE_OPTIONS),
             node_emb_dim=10,
             hidden_dims=[32, 32],
             latent_dim=graph_latent_dim
@@ -60,7 +61,30 @@ class GuidedPopulation(Population):
             if idx is None:
                 raise KeyError(f"Unknown node_type {node.node_type!r}")
             x_type_list.append(idx)
+            node_features = []
+            # Decide a consistent ordering of attribute‐names
+            attr_names = sorted(node.dynamic_attributes.keys())
+            nums = []
+            strs = []
+            for name in attr_names:
+                val = node.dynamic_attributes.get(name)
+                if isinstance(val, (int, float)):
+                    nums.append(float(val))
+                elif isinstance(val, str):
+                    strs.append(self.guide.string_embedder.encode(val, convert_to_tensor=True, device=self.device))
+                else:
+                    warn('missing attribute type in genome-to-data conversion')
+            if len(nums) > 0:
+                parts = [torch.tensor(nums, dtype=torch.float, device=self.device)] + strs
+            else:
+                parts = strs
+            if len(parts) > 0:
+                node_features.append(torch.cat(parts, dim=0))
+            else:
+                node_features.append(torch.tensor([]))
         x_type = torch.tensor(x_type_list, dtype=torch.long, device=self.device)
+        node_features = torch.stack(node_features, dim=0)
+        node_types = torch.tensor(x_type_list, dtype=torch.long, device=self.device)
 
         # 2) edge_index: collect all enabled connections
         edges = []
@@ -78,7 +102,7 @@ class GuidedPopulation(Population):
             # no edges
             edge_index = torch.empty((2, 0), dtype=torch.long, device=self.device)
 
-        return Data(x_type=x_type, edge_index=edge_index)
+        return Data(x=node_types, edge_index=edge_index, node_attributes=node_features)
 
     def generate_guided_offspring(self,
         task_type: str,
@@ -144,7 +168,7 @@ class GuidedPopulation(Population):
 
         return new_genomes
 
-    def run(self, fitness_function, n=None, keep_per_species=2, offspring_per_species=None):
+    def run(self, n=None, keep_per_species=2, offspring_per_species=None):
         """
         Runs NEAT with guided offspring replacing standard reproduction.
         - keep_per_species:   number of top genomes in each species to preserve
@@ -154,24 +178,37 @@ class GuidedPopulation(Population):
             raise RuntimeError("Cannot have no generational limit with no fitness termination")
 
         generation = 0
+        gen_for_full_train_resize = 25
         while n is None or generation < n:
             generation += 1
             self.reporters.start_generation(self.generation)
 
+            task_type = random.choice(list(TASK_FEATURE_DIMS.keys()))
+            task = TASK_TYPE_TO_CLASS[task_type].random_init()
+
             # 1) Evaluate real fitness
-            fitness_function(list(self.population.items()), self.config)
+            eval_genomes(list(self.population.items()), self.config, task, steps=2*generation)
 
             # 2) Train surrogate one epoch on all evaluated genomes
-            graphs, fits, types, feats = [], [], [], []
+            graphs, fits = [], []
             for gid, genome in self.population.items():
-                g, ttype, tfeat = self.genome_to_data(genome)
+                g = self.genome_to_data(genome)
                 graphs.append(g)
-                types.append(ttype)
-                feats.append(tfeat)
                 # shape [1,fitness_dim]
-                fits.append([genome.fitness]*self.guide.fitness_predictor.fc2.out_features)
-            self.trainer.add_data(graphs, fits, types, feats)
-            self.trainer.train(epochs=1, batch_size=len(graphs))
+                fits.append(genome.fitnesses)
+            task_train_features, task_valid_features = task.get_features()
+            distance = torch.linalg.norm(task_train_features - task_valid_features)
+            if distance > len(task_train_features)/2:
+                warn(f'distance between training ({task_train_features}) and validation ({task_valid_features}) task features = {distance}')
+
+            self.trainer.add_data(graphs, fits, task_type, task_train_features)
+
+            if generation < gen_for_full_train_resize:
+                self.trainer.train(epochs=5, batch_size=len(graphs))
+            elif generation > gen_for_full_train_resize:
+                self.trainer.train(epochs=1, batch_size=len(graphs))
+            else:
+                self.trainer.train(warmup_epochs=10, batch_size=len(graphs))
 
             # 3) Build next‐gen population by species
             new_pop = {}
@@ -187,8 +224,8 @@ class GuidedPopulation(Population):
                                if offspring_per_species is not None
                                else len(members) - keep_per_species)
                 guided_kids = self.generate_guided_offspring(
-                    task_type     = species.representative_task_type,
-                    task_features = species.representative_task_features,
+                    task_type     = task_type,
+                    task_features = task_features,
                     n_offspring   = num_to_make
                 )
                 # assign predicted fitness
@@ -239,3 +276,79 @@ class GuidedPopulation(Population):
         best = max(self.population.values(), key=lambda g: g.fitness)
         self.reporters.found_solution(self.config, self.generation, best)
         return best
+
+    def eval_genomes(genomes, config, task, steps=10, epsilon=1e-10):
+        """
+        Evaluate each genome by using its network as a meta–optimizer.
+        """
+        raw_metrics: Dict[int, Dict[str, float]] = {}
+        genome_map = {gid: g for gid, g in genomes}
+
+        model = ManyLossMinimaModel(task.observed_dims)
+        for genome_id, genome in genomes:
+            model_copy = type(model)(task.observed_dims)
+            model_copy.load_state_dict(model.state_dict())
+            area_under_metrics, validation_metrics, time_cost, mem_cost = evaluate_optimizer(genome.optimizer, model_copy, task, steps)
+            raw_metrics[genome_id] = validation_metrics
+
+        # 2. Prepare metric names & objectives
+        metric_names = [m.name for m in task.metrics]
+        objectives   = {m.name: m.objective for m in task.metrics}
+
+        # 3. Pareto front ranking
+        fronts = nondominated_sort(raw_metrics, objectives)
+        num_fronts = len(fronts)
+
+        # 4. Compute global min/max per metric
+        mins = {m: min(raw_metrics[g][m] for g in raw_metrics) for m in metric_names}
+        maxs = {m: max(raw_metrics[g][m] for g in raw_metrics) for m in metric_names}
+
+        # 5. Assign fitness = Pareto rank base + composite normalized score
+        for front_idx, front in enumerate(fronts, start=1):
+            for genome_id in front:
+                vals = raw_metrics[genome_id]
+                # Composite min–max normalized score
+                scores = []
+                for m in metric_names:
+                    lo, hi = mins[m], maxs[m]
+                    if hi - lo < epsilon:
+                        norm = 1.0
+                    else:
+                        v = vals[m]
+                        if objectives[m] == 'max':
+                            norm = (v - lo) / (hi - lo)
+                        else:
+                            norm = (hi - v) / (hi - lo)
+                    scores.append(norm)
+                composite = sum(scores) / len(scores)
+                # Fitness: higher for earlier fronts, break ties by composite
+                genome_map[genome_id].fitness = (num_fronts - front_idx + 1) + composite
+                genome.fitnesses = vals
+
+    def evaluate_optimizer(optimizer, model, task, steps=10):
+        """
+        Runs the optimizer over a number of steps.
+
+        Args:
+          optimizer: A TorchScript JIT Graph instance that updates parameters.
+          model: The model whose performance is measured by the provided task.
+          task: The task on which to evaluate the optimizer.
+          steps: Number of update iterations.
+        """
+        tracemalloc.start()
+        start = time.perf_counter()
+        prev_metrics_values = torch.tensor([0.0] * len(task.metrics))
+        area_under_metrics = 0.0
+        for step in range(steps):
+            metrics_values = task.evaluate_metrics(model, task.train_data).requires_grad_()
+            new_params = optimizer(metrics_values, prev_metrics_values, model.named_parameters())
+            model.load_state_dict(new_params)
+            prev_metrics_values = task.evaluate_metrics(model, task.train_data).requires_grad_()
+            area_under_metrics += np.sum(metrics_values.detach().data.numpy())
+        stop = time.perf_counter()
+        _, peak_memory = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        time_cost = stop - start
+        validation_metrics = task.evaluate_metrics(model, task.valid_data).detach().data.numpy()
+        validation_metrics = { name: float(validation_metrics[i]) for i, name in enumerate([m.name for m in task.metrics]) }
+        return area_under_metrics, validation_metrics, time_cost, peak_memory

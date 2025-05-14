@@ -9,7 +9,7 @@ from attributes import BaseAttribute, BoolAttribute, StringAttribute, FloatAttri
 from utility import generate_random_string
 
 # modified from neat-python versions
-node_type_options = [ # for mutation
+NODE_TYPE_OPTIONS = [ # for mutation
     'aten::add',
     'aten::sub',
     'aten::mul',
@@ -21,16 +21,23 @@ node_type_options = [ # for mutation
     'aten::min',
     'aten::sum',
     'aten::len',
+    'aten::grad',
     'prim::Constant',
+    'prim::ListConstruct',
+    'prim::DictConstruct',
+    'prim::Loop',
+    'prim::GetAttr',
+    'prim::SetAttr',
+    'prim::min',
 ]
-NODE_TYPE_TO_INDEX = {nt: i for i, nt in enumerate(node_type_options)}
+NODE_TYPE_TO_INDEX = {nt: i for i, nt in enumerate(NODE_TYPE_OPTIONS)}
 NODE_TYPE_TO_INDEX['input'] = len(NODE_TYPE_TO_INDEX)
 NODE_TYPE_TO_INDEX['hidden'] = len(NODE_TYPE_TO_INDEX)
 NODE_TYPE_TO_INDEX['output'] = len(NODE_TYPE_TO_INDEX)
 
 class NodeGene(BaseGene):
     _gene_attributes = [
-        StringAttribute('node_type', options=','.join(node_type_options))
+        StringAttribute('node_type', options=','.join(NODE_TYPE_OPTIONS))
     ]
     def __init__(self, node_id: int, node: torch._C.Node=None):
         self.dynamic_attributes = {}

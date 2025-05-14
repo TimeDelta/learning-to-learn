@@ -6,13 +6,12 @@ from pyentrp import entropy
 
 SERIES_STATS = [
     # lambda to map series into single value
+    lambda series: len(series),
     lambda series: np.mean(hurst_exponent(series)),
     lambda series: lempel_ziv_complexity_continuous(series, quantize_signal_bayesian_block_feature_bins),
     lambda series: np.mean(optimized_multiscale_permutation_entropy(series)),
     lambda series: differential_entropy(series, quantize_signal_bayesian_block_feature_bins),
 ]
-def analyze_data_complexity(data):
-    return [function(data) for function in SERIES_STATS]
 
 def differential_entropy(data, quantizer):
     discrete_signal = quantizer(data)

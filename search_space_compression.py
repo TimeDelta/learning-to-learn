@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from sentence_transformers import SentenceTransformer
 from torch_geometric.nn import MessagePassing, global_mean_pool
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
@@ -301,6 +302,7 @@ class DAGTaskFitnessRegularizedVAE(nn.Module):
         fitness_predictor: FitnessPredictor
     ):
         super().__init__()
+        self.string_embedder = SentenceTransformer('all-MiniLM-L6-v2')
         self.graph_encoder = graph_encoder
         self.decoder = decoder
         self.fitness_predictor = fitness_predictor
@@ -403,16 +405,16 @@ class OnlineTrainer:
         self.initial_loss = None
         self.last_prune_epoch = 0
 
-    def add_data(self, graphs, fitnesses, task_types, task_feats):
+    def add_data(self, graphs, fitnesses, task_type:str, task_features):
         """
         Each Data in self.dataset must have:
          - .x : Tensor[Ni, Fi]      (raw node features)
          - .edge_index : [2, Ei]
          - .y : Tensor[1, fitness_dim]
-         - .task_type : Tensor[1]
-         - .task_features : list of length Fi_task
+         - .task_type : str
+         - .task_features : Tensor with task features
         """
-        for graph, fitness, task_type, task_features in zip(graphs, fitnesses, task_types, task_feats):
+        for graph, fitness in zip(graphs, fitnesses):
             data = graph.clone()
             data.y = torch.as_tensor(fitness, dtype=torch.float).unsqueeze(0)
             data.task_type = torch.tensor([TASK_TYPE_TO_INDEX[task_type]], dtype=torch.long)
@@ -459,9 +461,11 @@ class OnlineTrainer:
                 dense_adj = to_dense_adj(batch.edge_index, batch.batch, max_num_nodes=None)
                 # slice out GT node-features per graph
                 gt_node_features = []
+                gt_node_types = []
                 for i in range(batch.num_graphs):
                     mask_i = (batch.batch == i)
-                    gt_node_features.append(batch.x[mask_i])
+                    gt_node_types.append(batch.x)
+                    gt_node_features.append(batch.node_attributes[mask_i])
 
                 # --- 2) reconstruction losses ---
                 loss_adj, loss_feat = 0.0, 0.0
@@ -469,6 +473,7 @@ class OnlineTrainer:
                     edge_predictions = dg['edge_index']
                     pred_features = dg['node_features']
                     target_features = gt_node_features[i]
+                    target_types = gt_node_types[i]
                     Ni_pred = pred_features.size(0)
                     Ni_gt   = target_features.size(0)
                     if Ni_pred == 0 or Ni_gt == 0:
@@ -599,20 +604,30 @@ if __name__ == "__main__":
                 if random.random() < edge_prob:
                     edges.append([i, j])
         edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous() if edges else torch.empty((2,0), dtype=torch.long)
-        return Data(x=types, edge_index=edge_index)
+        dyn_attrs = []
+        categories = ['alpha', 'beta', 'gamma', 'delta']
+        for _ in range(num_nodes):
+            attributes = []
+            for _ in range(random.randint(0, 5)):
+                attributes.append(random.randint(0, 10))
+                attributes.append(random.random() * 5.0)
+                attributes.append(model.string_embedder.encode(random.choice(categories), convert_to_tensor=True, device=device))
+            dyn_attrs.append({
+                str(i): v for i, v in enumerate(attributes)
+            })
+        return Data(x=types, edge_index=edge_index, node_attributes=torch.tensor(dyn_attrs))
 
     # Create synthetic dataset
     print('Generating random training data')
     def generate_data(num_samples):
-        graphs, fitnesses, task_types, task_features = [], [], [], []
+        graphs, fitnesses = [], []
+        task_type = random.choice(list(TASK_FEATURE_DIMS.keys()))
+        task_features = torch.randn((TASK_FEATURE_DIMS[task_type],))
         for _ in range(num_samples):
             graph = generate_random_dag(random.randint(3, max_nodes), num_node_types, edge_prob=0.4)
             graphs.append(graph)
             fitnesses.append([graph.edge_index.size(1) + 0.1 * random.random() for _ in range(fitness_dim)])
-            task_type = random.choice(list(TASK_FEATURE_DIMS.keys()))
-            task_types.append(task_type)
-            task_features.append(torch.randn((TASK_FEATURE_DIMS[task_type],)))
-        return graphs, fitnesses, task_types, task_features
+        return graphs, fitnesses, task_type, torch.randn((TASK_FEATURE_DIMS[task_type],))
 
     trainer = OnlineTrainer(model, optimizer, device=device)
     trainer.add_data(*generate_data(50))
