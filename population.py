@@ -1,4 +1,5 @@
 from neat.population import Population
+from sentence_transformers import SentenceTransformer
 import torch
 import torch.nn.functional as F
 from torch_geometric.data import Data
@@ -16,7 +17,6 @@ from tasks import *
 class GuidedPopulation(Population):
     def __init__(self, config):
         super().__init__(config)
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         graph_latent_dim = 16
         task_latent_dim = 10
         num_node_types = 10
@@ -26,22 +26,24 @@ class GuidedPopulation(Population):
             node_emb_dim=10,
             hidden_dims=[32, 32],
             latent_dim=graph_latent_dim
-        ).to(self.device)
+        )
         task_encoder = TasksEncoder(
             hidden_dim=16,
             latent_dim=task_latent_dim,
             type_embedding_dim=max(len(TASK_FEATURE_DIMS)//2, 1)
-        ).to(self.device)
-        decoder = ARGraphDecoder(latent_dim=graph_latent_dim, hidden_dim=128).to(self.device)
+        )
+        # TODO: globally track attribute names from NodeGene and then pass to GraphDecoder
+        decoder = GraphDecoder(latent_dim=graph_latent_dim, hidden_dim=128).to(self.device)
         predictor = FitnessPredictor(
             latent_dim=graph_latent_dim+task_latent_dim,
             hidden_dim=64,
             fitness_dim=fitness_dim
-        ).to(self.device)
+        )
 
         self.guide = DAGTaskFitnessRegularizedVAE(graph_encoder, task_encoder, decoder, predictor).to(self.device)
         self.optimizer = torch.optim.Adam(self.guide.parameters(), lr=0.001)
-        self.trainer = OnlineTrainer(self.guide, self.optimizer, self.device)
+        self.trainer = OnlineTrainer(self.guide, self.optimizer)
+        self.string_embedder = SentenceTransformer('all-MiniLM-L6-v2')
 
     def genome_to_data(self, genome: OptimizerGenome):
         """
@@ -71,7 +73,7 @@ class GuidedPopulation(Population):
                 if isinstance(val, (int, float)):
                     nums.append(float(val))
                 elif isinstance(val, str):
-                    strs.append(self.guide.string_embedder.encode(val, convert_to_tensor=True, device=self.device))
+                    strs.append(self.string_embedder.encode(val, convert_to_tensor=True, device=self.device))
                 else:
                     warn('missing attribute type in genome-to-data conversion')
             if len(nums) > 0:
