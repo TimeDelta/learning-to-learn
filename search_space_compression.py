@@ -622,7 +622,12 @@ class OnlineTrainer:
                     adj_true = dense_adj[i, :num_nodes, :num_nodes]
 
                     mask = torch.triu(torch.ones_like(adj_pred), diagonal=1).bool()
-                    loss_adj += F.binary_cross_entropy_with_logits(adj_pred[mask], adj_true[mask])
+                    if adj_pred[mask].size(0) > 0 and adj_true[mask].size(0) > 0:
+                        loss_adj += F.binary_cross_entropy_with_logits(adj_pred[mask], adj_true[mask])
+                    elif adj_pred[mask].size(0) > 0:
+                        loss_adj += adj_pred[mask].sum()
+                    else:
+                        loss_adj += adj_true[mask].sum()
 
                     # node feature loss
                     def convert_string(value):
@@ -685,7 +690,7 @@ class OnlineTrainer:
                 ]
                 sum(loss_terms).backward()
                 self.optimizer.step()
-                total_loss_terms += torch.tensor([t for t in loss_terms])
+                total_loss_terms += torch.tensor(loss_terms)
             avg_loss_terms = total_loss_terms / len(loader)
             self.loss_history.append(avg_loss_terms.cpu().numpy())
 
