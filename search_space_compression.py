@@ -29,8 +29,8 @@ class DAGAttention(MessagePassing):
         self.lin = nn.Linear(in_channels, out_channels, bias=False)
         self.att = nn.Parameter(torch.Tensor(1, 2 * out_channels))
         self.leaky_relu = nn.LeakyReLU(negative_slope)
-        nn.init.xavier_uniform_(self.lin.weight)
-        nn.init.xavier_uniform_(self.att)
+        nn.init.kaiming_uniform_(self.lin.weight, negative_slope, mode='fan_in', nonlinearity='leaky_relu')
+        nn.init.kaiming_uniform_(self.att, negative_slope, mode='fan_in', nonlinearity='leaky_relu')
 
     def forward(self, x, edge_index):
         x = self.lin(x)
@@ -387,8 +387,8 @@ class GraphDecoder(nn.Module):
 
                     attr_dims = max(1, int(math.ceil(F.softplus(self.attr_dims_head(embedding)).item())))
                     values = []
-                    value_hidden = embedding.unsqueeze(0)
-                    value_input = torch.zeros(1, 1, device=device)
+                    value_hidden = embedding.unsqueeze(0).unsqueeze(1)
+                    value_input  = torch.zeros(1, 1, 1, device=device)
                     for _ in range(attr_dims):
                         value_out, value_hidden = self.attr_val_rnn(value_input, value_hidden)
                         v = self.attr_val_head(value_out).view(-1)
@@ -720,7 +720,7 @@ class OnlineTrainer:
 
     def resize_bottleneck(self):
         """Rebuild all modules to permanently prune inactive dims."""
-        self.model.resize_bottleneck(self.device)
+        self.model.resize_bottleneck()
         # reinit optimizer so it only holds new params
         lr = self.optimizer.defaults.get("lr", 1e-3)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
@@ -788,7 +788,7 @@ if __name__ == "__main__":
     trainer = OnlineTrainer(model, optimizer)
     trainer.add_data(*generate_data(50))
     print('Training')
-    trainer.train(epochs=None, batch_size=8, kl_weight=0.1, warmup_epochs=10)
+    trainer.train(epochs=None, batch_size=8, kl_weight=0.1, warmup_epochs=10, stop_epsilon=1)
     trainer.resize_bottleneck()
 
     # Continue training with new data
