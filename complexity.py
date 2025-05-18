@@ -57,11 +57,14 @@ def lempel_ziv_complexity_continuous(data, quantizer):
     max_complexity = len(symbol_seq) / np.emath.logn(alphabet_size, len(symbol_seq))
     return complexity / max_complexity
 
-def _hurst_exponent_1d(data, window_sizes):
+def _hurst_exponent_1d(data):
     """
     slope of log-log regression
     """
     RS = []
+    # use logspace for mixed local / ranged correlation structure
+    window_sizes = np.unique(np.floor(np.logspace(np.log10(10), np.log10(data.shape[0] // 2), num=20)).astype(int))
+    window_sizes = window_sizes[window_sizes > 0]
     for window in window_sizes:
         n_segments = len(data) // window
         RS_vals = []
@@ -80,19 +83,20 @@ def _hurst_exponent_1d(data, window_sizes):
         raise ValueError("No valid RS values computed; check window sizes and data.")
     logs = np.log(window_sizes[:len(RS)])
     log_RS = np.log(RS)
+    mask = np.isfinite(logs) & np.isfinite(log_RS)
+    logs, log_RS = logs[mask], log_RS[mask]
     slope, _ = np.polyfit(logs, log_RS, 1)
     return slope
 
 def hurst_exponent(data):
+    if data.ndim == 1:
+        return _hurst_exponent_1d(data)
     # compute separately for each feature (column)
     n_samples, n_features = data.shape
     hurst_vals = []
     for f_i in range(n_features):
         col = data[:, f_i]
-        # use logspace for mixed local / ranged correlation structure
-        window_sizes = np.unique(np.floor(np.logspace(np.log10(10), np.log10(n_samples // 2), num=20)).astype(int))
-        window_sizes = window_sizes[window_sizes > 0]
-        hurst_vals.append(_hurst_exponent_1d(col, window_sizes))
+        hurst_vals.append(_hurst_exponent_1d(col))
     return hurst_vals
 
 def optimized_multiscale_permutation_entropy(time_series) -> float:
