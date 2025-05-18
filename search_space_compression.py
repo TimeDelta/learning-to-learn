@@ -75,7 +75,7 @@ class TasksEncoder(nn.Module):
         mu_list, logvar_list = [], []
         for task_type, feature_vec in zip(task_types, feature_vecs):
             task_type_embedding = self.embedder(task_type)
-            feature_vec = torch.as_tensor(feature_vec, dtype=torch.float, device=device)
+            feature_vec = torch.as_tensor(feature_vec, dtype=torch.float)
             h = self.encoders[str(task_type.item())](torch.cat((task_type_embedding, feature_vec), dim=0))
             mu_list.append(self.lin_mu(h))
             logvar_list.append(self.lin_logvar(h))
@@ -140,13 +140,13 @@ class NodeAttributeDeepSetEncoder(nn.Module):
         shared_attr_vocab: SharedAttributeVocab,
         encoder_hdim:int,
         aggregator_hdim:int,
-        out_dim:int,
-        max_value_dim:int
+        out_dim:int
     ):
         super().__init__()
         self.shared_attr_vocab = shared_attr_vocab
+        self.max_value_dim = shared_attr_vocab.embedding.embedding_dim
         self.attr_encoder = nn.Sequential( # phi
-            nn.Linear(shared_attr_vocab.embedding.embedding_dim + max_value_dim, encoder_hdim),
+            nn.Linear(shared_attr_vocab.embedding.embedding_dim + self.max_value_dim, encoder_hdim),
             nn.ReLU(),
             nn.Linear(encoder_hdim, encoder_hdim),
             nn.ReLU()
@@ -156,21 +156,32 @@ class NodeAttributeDeepSetEncoder(nn.Module):
             nn.ReLU(),
             nn.Linear(aggregator_hdim, out_dim),
         )
-        self.max_value_dim = max_value_dim
         self.out_dim = out_dim
 
-    def forward(self, attr_dict: Dict[int, torch.Tensor]) -> torch.Tensor:
+    def forward(self, attr_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
         if not attr_dict:
             return torch.zeros(self.aggregator[-1].out_features)
 
         phis = []
-        for name_index, value in attr_dict.items():
-            name_index = torch.tensor(name_index, dtype=torch.long)
-            flat_value = val.view(-1)
-            pad = self.max_value_dim - flat_value.numel()
-            if pad > 0:
-                flat_value = F.pad(flat_value, (0, pad), "constant", 0.0)
-            phis.append(self.attr_encoder(torch.cat([self.shared_attr_vocab.embedding(name_index), flat_value], dim=0)))
+        for name, value in attr_dict.items():
+            name_index = torch.tensor(self.shared_attr_vocab.name_to_index[name], dtype=torch.long)
+            if isinstance(value, torch.Tensor):
+                value = value.view(-1)
+            elif isinstance(value, (int, float)):
+                value = torch.tensor([value], dtype=torch.float)
+            elif isinstance(value, str):
+                index = self.shared_attr_vocab.name_to_index.get(value, self.shared_attr_vocab.name_to_index['<UNK>'])
+                index = torch.tensor(index, dtype=torch.long)
+                value = self.shared_attr_vocab.embedding(index)
+            else:
+                raise TypeError(f"Unsupported attribute value type: {type(value)}")
+            value = value.view(-1)
+            if value.numel() < self.max_value_dim:
+                pad_amt = self.max_value_dim - value.numel()
+                value = F.pad(value, (0, pad_amt), "constant", 0.0)
+            else:
+                value = value[:self.max_value_dim]
+            phis.append(self.attr_encoder(torch.cat([self.shared_attr_vocab.embedding(name_index), value], dim=0)))
         return self.aggregator(torch.stack(phis, dim=0).sum(dim=0))
 
 
@@ -196,7 +207,7 @@ class GraphEncoder(nn.Module):
 
     def forward(self, node_types, edge_index, node_attributes, batch):
         type_embedding = self.node_type_embedding(node_types)
-        attr_embedding = torch.stack([[self.attr_encoder(attrs) for attrs in graph] for graph in node_attributes], dim=0)
+        attr_embedding = torch.stack([self.attr_encoder(attrs) for graph in node_attributes for attrs in graph], dim=0)
         x = torch.cat([type_embedding, attr_embedding], dim=-1)
         for conv in self.convs:
             x = conv(x, edge_index)
@@ -359,15 +370,15 @@ class GraphDecoder(nn.Module):
                     name_input = torch.zeros(1, 1, device=device)
                     name_out, name_hidden = self.attr_name_rnn(name_input, name_hidden)
                     name_index = int(torch.cos(self.attr_name_head(name_out)).item())
-                    if name_index == self.shared_vocab.name_to_index['<EOS>']:
+                    if name_index == self.shared_attr_vocab.name_to_index['<EOS>']:
                         break
-                    elif name_index == self.shared_vocab.name_to_index['<UNK>']:
-                        name_index = len(self.shared_vocab.name_to_index)
+                    elif name_index == self.shared_attr_vocab.name_to_index['<UNK>']:
+                        name_index = len(self.shared_attr_vocab.name_to_index)
                         name = generate_random_string(8)
-                        self.shared_vocab.name_to_index[name] = name_index
-                        self.shared_vocab.index_to_name[name_index] = name
+                        self.shared_attr_vocab.name_to_index[name] = name_index
+                        self.shared_attr_vocab.index_to_name[name_index] = name
                     else:
-                        name = self.shared_vocab.index_to_name[name_index]
+                        name = self.shared_attr_vocab.index_to_name[name_index]
 
                     attr_dims = max(1, int(math.ceil(F.softplus(self.attr_dims_head(embedding)).item())))
                     values = []
@@ -713,8 +724,7 @@ if __name__ == "__main__":
         shared_attr_vocab,
         encoder_hdim=10,
         aggregator_hdim=20,
-        out_dim=50,
-        max_value_dim=10)
+        out_dim=50)
 
     graph_encoder = GraphEncoder(num_node_types, attr_encoder, graph_latent_dim, hidden_dims=[32, 32])
     task_encoder = TasksEncoder(hidden_dim=16, latent_dim=task_latent_dim, type_embedding_dim=8)

@@ -26,8 +26,7 @@ class GuidedPopulation(Population):
             self.shared_attr_vocab,
             encoder_hdim=10,
             aggregator_hdim=20,
-            out_dim=50,
-            max_value_dim=10)
+            out_dim=50)
         graph_encoder = GraphEncoder(
             len(NODE_TYPE_OPTIONS),
             attr_encoder,
