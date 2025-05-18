@@ -106,24 +106,26 @@ def optimized_multiscale_permutation_entropy(time_series) -> float:
       - delays swept from min_delay to max_delay (averaged)
       - scale fixed to 3
     """
-    per_feature = []
-    delays = list(range(1, len(time_series)//20))
-    for f_i in range(len(time_series[0])):
-        feature_series = time_series[:,f_i]
-
-        scale = 3
+    scale = 3
+    delays = list(range(1, time_series.shape[0]//20))
+    def single_feature(feature_series):
         mpe_vals = []
         for order in [2, 3]: # Orders to average over (maintains N ≫ m! guideline)
             for delay in delays:
                 mpe = entropy.multiscale_permutation_entropy(feature_series, order, delay, scale) / np.log2(math.factorial(order))
                 mpe_vals.append(mpe.mean())
-        per_feature.append(float(np.mean(mpe_vals)))
+        return float(np.mean(mpe_vals))
+    if time_series.ndim == 1:
+        return single_feature(time_series)
+    per_feature = []
+    for f_i in range(time_series[0].shape[0]):
+        per_feature.append(single_feature(time_series[:,f_i]))
     return per_feature
 
 def quantize_signal_bayesian_block_feature_bins(data):
     if data.ndim == 1:
-        edges = bayesian_blocks(data[:, i])
-        quantized = np.digitize(data[:, i], edges) - 1
+        edges = bayesian_blocks(data)
+        quantized = np.digitize(data, edges) - 1
         return quantized.tolist()
     elif data.ndim == 2:
         n_samples, n_features = data.shape
