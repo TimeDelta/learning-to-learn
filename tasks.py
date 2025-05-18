@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import numpy as np
 
@@ -42,14 +43,12 @@ class Task:
 
     def check_partition_similarity(self):
         train_feats, valid_feats = self.get_features()
-        cos_sim = F.cosine_similarity(train_feats, valid_feats, dim=0)
+        cos_sim = F.cosine_similarity(torch.tensor(train_feats), torch.tensor(valid_feats), dim=0)
         if cos_sim < 0.85:
             warn(f"Cosine similarity of task data partitions low (cos={cos_sim:.3f})")
 
 class RegressionTask(Task):
     feature_functions = [*SERIES_STATS,
-        lambda _: self.true_dims,
-        lambda _: self.observed_dims,
     ]
 
     @staticmethod
@@ -70,7 +69,8 @@ class RegressionTask(Task):
         cut_index = int(num_samples*train_ratio)
         self.train_data = self.data[0] = (inputs[:cut_index,], outputs[:cut_index,])
         self.valid_data = self.data[1] = (inputs[cut_index:,], outputs[cut_index:,])
-        print(self.train_data[0].shape)
+        self.feature_functions.append(lambda _: self.true_dims)
+        self.feature_functions.append(lambda _: self.observed_dims)
         self.check_partition_similarity()
 
 TASK_FEATURE_DIMS = {

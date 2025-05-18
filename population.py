@@ -5,11 +5,15 @@ import torch.nn.functional as F
 from torch_geometric.data import Data
 
 import random
+import time
+import tracemalloc
 from typing import List
 from warnings import warn
 
 from genome import OptimizerGenome
 from genes import NODE_TYPE_TO_INDEX, NODE_TYPE_OPTIONS
+from models import *
+from pareto import *
 from search_space_compression import *
 from tasks import *
 
@@ -78,20 +82,20 @@ class GuidedPopulation(Population):
                 if isinstance(val, (int, float)):
                     nums.append(float(val))
                 elif isinstance(val, str):
-                    strs.append(self.string_embedder.encode(val, convert_to_tensor=True, device=self.device))
+                    strs.append(self.string_embedder.encode(val, convert_to_tensor=True))
                 else:
                     warn('missing attribute type in genome-to-data conversion')
             if len(nums) > 0:
-                parts = [torch.tensor(nums, dtype=torch.float, device=self.device)] + strs
+                parts = [torch.tensor(nums, dtype=torch.float)] + strs
             else:
                 parts = strs
             if len(parts) > 0:
                 node_features.append(torch.cat(parts, dim=0))
             else:
                 node_features.append(torch.tensor([]))
-        x_type = torch.tensor(x_type_list, dtype=torch.long, device=self.device)
+        x_type = torch.tensor(x_type_list, dtype=torch.long)
         node_features = torch.stack(node_features, dim=0)
-        node_types = torch.tensor(x_type_list, dtype=torch.long, device=self.device)
+        node_types = torch.tensor(x_type_list, dtype=torch.long)
 
         # 2) edge_index: collect all enabled connections
         edges = []
@@ -104,10 +108,10 @@ class GuidedPopulation(Population):
                     local_dst = node_ids.index(dst)
                     edges.append([local_src, local_dst])
         if len(edges) > 0:
-            edge_index = torch.tensor(edges, dtype=torch.long, device=self.device).t().contiguous()
+            edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
         else:
             # no edges
-            edge_index = torch.empty((2, 0), dtype=torch.long, device=self.device)
+            edge_index = torch.empty((2, 0), dtype=torch.long)
 
         return Data(x=node_types, edge_index=edge_index, node_attributes=node_features)
 
@@ -194,9 +198,9 @@ class GuidedPopulation(Population):
             task = TASK_TYPE_TO_CLASS[task_type].random_init()
 
             # 1) Evaluate real fitness
-            eval_genomes(list(self.population.items()), self.config, task, steps=2*generation)
+            self.eval_genomes(list(self.population.items()), self.config, task, steps=2*generation)
 
-            # 2) Train surrogate one epoch on all evaluated genomes
+            # 2) Train surrogate on all evaluated genomes
             graphs, fits = [], []
             for gid, genome in self.population.items():
                 g = self.genome_to_data(genome)
@@ -204,7 +208,7 @@ class GuidedPopulation(Population):
                 # shape [1,fitness_dim]
                 fits.append(genome.fitnesses)
             task_train_features, task_valid_features = task.get_features()
-            distance = torch.linalg.norm(task_train_features - task_valid_features)
+            distance = torch.linalg.norm(torch.tensor(task_train_features) - torch.tensor(task_valid_features))
             if distance > len(task_train_features)/2:
                 warn(f'distance between training ({task_train_features}) and validation ({task_valid_features}) task features = {distance}')
 
@@ -239,11 +243,7 @@ class GuidedPopulation(Population):
                 for kid in guided_kids:
                     # use surrogate to score
                     g, t = self.genome_to_data(kid)
-                    mu_g, lv_g = self.guide.graph_encoder(
-                        g.x_type.to(self.device),
-                        g.edge_index.to(self.device),
-                        torch.zeros(g.num_nodes, dtype=torch.long, device=self.device)
-                    )
+                    mu_g, lv_g = self.guide.graph_encoder(g.x_type, g.edge_index, torch.zeros(g.num_nodes, dtype=torch.long))
                     mu_t, lv_t = self.guide.tasks_encoder([t], [[*tfeat]])
                     z_g = self.guide.reparameterize(mu_g, lv_g, self.guide.graph_latent_mask)
                     z_t = self.guide.reparameterize(mu_t, lv_t, self.guide.tasks_latent_mask)
@@ -284,7 +284,7 @@ class GuidedPopulation(Population):
         self.reporters.found_solution(self.config, self.generation, best)
         return best
 
-    def eval_genomes(genomes, config, task, steps=10, epsilon=1e-10):
+    def eval_genomes(self, genomes, config, task, steps=10, epsilon=1e-10):
         """
         Evaluate each genome by using its network as a meta–optimizer.
         """
@@ -295,7 +295,7 @@ class GuidedPopulation(Population):
         for genome_id, genome in genomes:
             model_copy = type(model)(task.observed_dims)
             model_copy.load_state_dict(model.state_dict())
-            area_under_metrics, validation_metrics, time_cost, mem_cost = evaluate_optimizer(genome.optimizer, model_copy, task, steps)
+            area_under_metrics, validation_metrics, time_cost, mem_cost = self.evaluate_optimizer(genome.optimizer, model_copy, task, steps)
             raw_metrics[genome_id] = validation_metrics
 
         # 2. Prepare metric names & objectives
@@ -332,7 +332,7 @@ class GuidedPopulation(Population):
                 genome_map[genome_id].fitness = (num_fronts - front_idx + 1) + composite
                 genome.fitnesses = vals
 
-    def evaluate_optimizer(optimizer, model, task, steps=10):
+    def evaluate_optimizer(self, optimizer, model, task, steps=10):
         """
         Runs the optimizer over a number of steps.
 

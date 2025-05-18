@@ -548,7 +548,7 @@ class OnlineTrainer:
     Incremental trainer with ARD-KL + loss-thresholded iterative pruning,
     supporting variable node-feature dimensions via list-of-graphs decoding.
     """
-    def __init__(self, model: DAGTaskFitnessRegularizedVAE, optimizer):
+    def __init__(self, model: DAGTaskFitnessRegularizedVAE, optimizer, fitness_key_ordering=[]):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = model.to(self.device)
         self.optimizer = optimizer
@@ -558,8 +558,9 @@ class OnlineTrainer:
         self.last_prune_epoch = 0
 
     def add_data(self, graphs, fitnesses, task_type:str, task_features):
-        for graph, fitness in zip(graphs, fitnesses):
+        for graph, fitness_dict in zip(graphs, fitnesses):
             data = graph.clone()
+            fitness = []
             data.y = torch.as_tensor(fitness, dtype=torch.float).unsqueeze(0)
             data.task_type = torch.tensor([TASK_TYPE_TO_INDEX[task_type]], dtype=torch.long)
             if isinstance(task_features, torch.Tensor):

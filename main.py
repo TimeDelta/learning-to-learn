@@ -6,15 +6,10 @@ import torch
 import torch.nn as nn
 
 import os
-import random
-import time
-import tracemalloc
 
 from computation_graphs.functions.activation import *
 from computation_graphs.functions.aggregation import *
 from genes import *
-from models import *
-from pareto import *
 from population import *
 
 def create_initial_genome(config, optimizer):
