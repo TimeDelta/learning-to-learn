@@ -63,7 +63,7 @@ def _hurst_exponent_1d(data):
     """
     RS = []
     # use logspace for mixed local / ranged correlation structure
-    window_sizes = np.unique(np.floor(np.logspace(np.log10(10), np.log10(data.shape[0] // 2), num=20)).astype(int))
+    window_sizes = np.unique(np.floor(np.logspace(1, int(np.log10(data.shape[0] // 2)), num=20)).astype(int))
     window_sizes = window_sizes[window_sizes > 0]
     for window in window_sizes:
         n_segments = len(data) // window
@@ -85,7 +85,8 @@ def _hurst_exponent_1d(data):
     log_RS = np.log(RS)
     mask = np.isfinite(logs) & np.isfinite(log_RS)
     logs, log_RS = logs[mask], log_RS[mask]
-    slope, _ = np.polyfit(logs, log_RS, 1)
+    cov = np.cov(logs, log_RS, bias=True)
+    slope = cov[0,1] / cov[0,0]
     return slope
 
 def hurst_exponent(data):
