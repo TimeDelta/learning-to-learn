@@ -127,7 +127,7 @@ class SharedAttributeVocab(nn.Module):
         old_weight = self.embedding.weight.data
         fan_in = old_weight.size(1)
         new_rows = torch.randn(len(names_to_add), fan_in) * math.sqrt(2/fan_in)
-        new_weight = torch.cat([old_weight, new_row], dim=0)
+        new_weight = torch.cat([old_weight, new_rows], dim=0)
         self.embedding = nn.Embedding.from_pretrained(new_weight, freeze=False)
 
 
