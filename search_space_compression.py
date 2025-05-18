@@ -158,6 +158,22 @@ class NodeAttributeDeepSetEncoder(nn.Module):
         )
         self.out_dim = out_dim
 
+    def get_value_tensor(self, value:Any):
+        if isinstance(value, (int, float)):
+            value = torch.tensor([value], dtype=torch.float)
+        elif isinstance(value, str):
+            index = self.shared_attr_vocab.name_to_index.get(value, self.shared_attr_vocab.name_to_index['<UNK>'])
+            index = torch.tensor(index, dtype=torch.long)
+            value = self.shared_attr_vocab.embedding(index)
+        else:
+            raise TypeError(f"Unsupported attribute value type: {type(value)}")
+        value = value.view(-1)
+        if value.numel() < self.max_value_dim:
+            pad_amt = self.max_value_dim - value.numel()
+            return F.pad(value, (0, pad_amt), "constant", 0.0)
+        else:
+            return value[:self.max_value_dim]
+
     def forward(self, attr_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
         if not attr_dict:
             return torch.zeros(self.aggregator[-1].out_features)
@@ -165,22 +181,7 @@ class NodeAttributeDeepSetEncoder(nn.Module):
         phis = []
         for name, value in attr_dict.items():
             name_index = torch.tensor(self.shared_attr_vocab.name_to_index[name], dtype=torch.long)
-            if isinstance(value, torch.Tensor):
-                value = value.view(-1)
-            elif isinstance(value, (int, float)):
-                value = torch.tensor([value], dtype=torch.float)
-            elif isinstance(value, str):
-                index = self.shared_attr_vocab.name_to_index.get(value, self.shared_attr_vocab.name_to_index['<UNK>'])
-                index = torch.tensor(index, dtype=torch.long)
-                value = self.shared_attr_vocab.embedding(index)
-            else:
-                raise TypeError(f"Unsupported attribute value type: {type(value)}")
-            value = value.view(-1)
-            if value.numel() < self.max_value_dim:
-                pad_amt = self.max_value_dim - value.numel()
-                value = F.pad(value, (0, pad_amt), "constant", 0.0)
-            else:
-                value = value[:self.max_value_dim]
+            value = self.get_value_tensor(value)
             phis.append(self.attr_encoder(torch.cat([self.shared_attr_vocab.embedding(name_index), value], dim=0)))
         return self.aggregator(torch.stack(phis, dim=0).sum(dim=0))
 
@@ -296,7 +297,7 @@ class GraphDecoder(nn.Module):
         self.attr_type_rnn  = nn.GRU(input_size=1, hidden_size=hidden_dim)
         self.attr_type_head = nn.Linear(hidden_dim, 1)
         self.attr_name_rnn  = nn.GRU(input_size=1, hidden_size=hidden_dim)
-        self.attr_name_head = nn.Linear(hidden_dim, 1)
+        self.attr_name_head = nn.Linear(hidden_dim, shared_attr_vocab.embedding.embedding_dim)
         self.attr_dims_head = nn.Linear(hidden_dim, 1) # determine num dimensions per attr
         self.attr_val_rnn   = nn.GRU(input_size=1, hidden_size=hidden_dim)
         self.attr_val_head  = nn.Linear(hidden_dim, 1) # extract value per attr dimension
@@ -369,7 +370,11 @@ class GraphDecoder(nn.Module):
                         break
                     name_input = torch.zeros(1, 1, device=device)
                     name_out, name_hidden = self.attr_name_rnn(name_input, name_hidden)
-                    name_index = int(torch.cos(self.attr_name_head(name_out)).item())
+                    similarity_logits = torch.matmul(
+                        self.shared_attr_vocab.embedding.weight, # [vocab_size, embedding_dim]
+                        self.attr_name_head(name_out).squeeze(0) # query vector [embedding_dim]
+                    )
+                    name_index = int(similarity_logits.argmax().item())
                     if name_index == self.shared_attr_vocab.name_to_index['<EOS>']:
                         break
                     elif name_index == self.shared_attr_vocab.name_to_index['<UNK>']:
@@ -459,6 +464,12 @@ class DAGTaskFitnessRegularizedVAE(nn.Module):
         # masks for active latent dims (1=active, 0=pruned)
         self.register_buffer('graph_latent_mask', torch.ones(self.graph_encoder.latent_dim))
         self.register_buffer('tasks_latent_mask', torch.ones(self.tasks_encoder.latent_dim))
+
+    def shared_attr_vocab(self):
+        return self.graph_encoder.shared_attr_vocab
+
+    def attr_encoder(self):
+        return self.graph_encoder.attr_encoder
 
     def encode(self, node_types, edge_index, node_attributes, batch, task_type, task_features):
         mu_g, lv_g = self.graph_encoder(node_types, edge_index, node_attributes, batch)
@@ -592,56 +603,56 @@ class OnlineTrainer:
 
                 # --- 2) reconstruction losses ---
                 dense_adj = to_dense_adj(batch.edge_index, batch.batch, max_num_nodes=None)
-                # slice out GT node features per graph
-                gt_node_attributes = []
-                gt_node_types = []
-                for i in range(batch.num_graphs):
-                    mask_i = (batch.batch == i)
-                    # each batch.node_attributes[j] is a dict {name: Tensor}
-                    gt_node_attributes.append([batch.node_attributes[j] for j in mask_i.nonzero(as_tuple=True)[0].tolist()])
-                    gt_node_types.append(batch.node_types[mask_i])
 
-                loss_adj, loss_feat = 0.0, 0.0
+                loss_adj, loss_feat = torch.tensor(0.0), torch.tensor(0.0)
                 for i, dg in enumerate(decoded_graphs):
                     pred_types = dg['node_types']
                     pred_edges = dg['edge_index']
                     pred_attrs = dg['node_attributes']
-                    target_types = gt_node_types[i]
-                    target_attrs = gt_node_attributes[i]
+                    target_types = batch.node_types[i]
+                    target_attrs = batch.node_attributes[i]
+                    num_nodes = min(len(pred_attrs), len(target_attrs)) # compare only the overlap
+                    target_edges = dense_adj[i, :num_nodes, :num_nodes]
 
-                    # compare only the overlap
-                    Ni = min(target_edges.size(0), pred_edges.size(0))
-                    # build binary adjacency preds/targets on 0..Ni-1
-                    adj_pred = torch.zeros((Ni,Ni), device=self.device)
+                    # build binary adjacency preds/targets on 0..num_nodes-1
+                    adj_pred = torch.zeros((num_nodes,num_nodes), device=self.device)
                     for s,d in pred_edges.t().tolist():
-                        if s < Ni and d < Ni:
+                        if s < num_nodes and d < num_nodes:
                             adj_pred[s,d] = 1.0
-                    adj_true = dense_adj[i, :Ni, :Ni]
+                    adj_true = dense_adj[i, :num_nodes, :num_nodes]
 
                     mask = torch.triu(torch.ones_like(adj_pred), diagonal=1).bool()
                     loss_adj += F.binary_cross_entropy_with_logits(adj_pred[mask], adj_true[mask])
 
                     # node feature loss
-                    target_attr_dict = {}
-                    for attrs in target_attrs:
-                        for name, tensor in attrs.items():
-                            target_attr_dict.setdefault(name, []).append(tensor)
-                    for name, tensor_list in target_attr_dict.items():
-                        target_attr_dict[name] = torch.stack(tensor_list, dim=0).to(self.device)
-
-                    # determine common and unmatched keys
-                    pred_keys = set(pred_attrs.keys())
-                    target_keys = set(target_attr_dict.keys())
-                    common_keys = pred_keys & target_keys
-                    pred_only = pred_keys - common_keys
-                    gt_only = target_keys - common_keys
-
-                    for name in common_keys:
-                        loss_feat += F.mse_loss(pred_attributes[name][:Ni], target_attr_dict[name][:Ni])
-                    for name in gt_only:
-                        loss_feat += target_attr_dict[name][:Ni].abs().sum()
-                    for name in pred_only:
-                        loss_feat += pred_attributes[name][:Ni].abs().sum()
+                    def convert_string(value):
+                        if isinstance(value, str):
+                            value = self.model.attr_encoder().get_value_tensor(value)
+                        return value
+                    def to_tensor(value):
+                        value = convert_string(value)
+                        if not isinstance(value, torch.Tensor):
+                            value = torch.as_tensor([value], dtype=torch.float)
+                        return value
+                    def attribute_value_loss(value):
+                        value = convert_string(value)
+                        if isinstance(value, int):
+                            value = float(value)
+                        if isinstance(value, torch.Tensor):
+                            value = value.abs().sum()
+                        return value
+                    for node_idx in range(num_nodes):
+                        all_attr_names = set(pred_attrs[node_idx].keys()) | \
+                                         set(target_attrs[node_idx].keys())
+                        for attr_name in all_attr_names:
+                            pred_value = pred_attrs[node_idx].get(attr_name)
+                            target_value = target_attrs[node_idx].get(attr_name)
+                            if (pred_value is not None) and (target_value is not None):
+                                loss_feat += F.mse_loss(to_tensor(pred_value), to_tensor(target_value))
+                            elif target_value is not None:
+                                loss_feat += attribute_value_loss(target_value)
+                            else:
+                                loss_feat += attribute_value_loss(pred_value)
 
                 loss_adj  /= batch.num_graphs
                 loss_feat /= batch.num_graphs
