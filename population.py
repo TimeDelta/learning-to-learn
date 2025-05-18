@@ -21,26 +21,32 @@ class GuidedPopulation(Population):
         task_latent_dim = 10
         num_node_types = 10
         fitness_dim = 2
+        self.shared_attr_vocab = SharedAttributeVocab([], 5)
+        attr_encoder = NodeAttributeDeepSetEncoder(
+            self.shared_attr_vocab,
+            encoder_hdim=10,
+            aggregator_hdim=20,
+            out_dim=50,
+            max_value_dim=10)
         graph_encoder = GraphEncoder(
-            num_node_types=len(NODE_TYPE_OPTIONS),
-            node_emb_dim=10,
-            hidden_dims=[32, 32],
-            latent_dim=graph_latent_dim
+            len(NODE_TYPE_OPTIONS),
+            attr_encoder,
+            latent_dim=graph_latent_dim,
+            hidden_dims=[32, 32]
         )
         task_encoder = TasksEncoder(
             hidden_dim=16,
             latent_dim=task_latent_dim,
             type_embedding_dim=max(len(TASK_FEATURE_DIMS)//2, 1)
         )
-        # TODO: globally track attribute names from NodeGene and then pass to GraphDecoder
-        decoder = GraphDecoder(latent_dim=graph_latent_dim, hidden_dim=128).to(self.device)
+        decoder = GraphDecoder(len(NODE_TYPE_OPTIONS), graph_latent_dim, self.shared_attr_vocab)
         predictor = FitnessPredictor(
             latent_dim=graph_latent_dim+task_latent_dim,
             hidden_dim=64,
             fitness_dim=fitness_dim
         )
 
-        self.guide = DAGTaskFitnessRegularizedVAE(graph_encoder, task_encoder, decoder, predictor).to(self.device)
+        self.guide = DAGTaskFitnessRegularizedVAE(graph_encoder, task_encoder, decoder, predictor)
         self.optimizer = torch.optim.Adam(self.guide.parameters(), lr=0.001)
         self.trainer = OnlineTrainer(self.guide, self.optimizer)
         self.string_embedder = SentenceTransformer('all-MiniLM-L6-v2')

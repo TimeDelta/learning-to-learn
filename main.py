@@ -73,6 +73,7 @@ def override_initial_population(population, config):
         new_population[key] = new_genome
         i += 1
     population.population = new_population
+    population.shared_attr_vocab.add_names(ATTRIBUTE_NAMES)
     population.species.speciate(config, population.population, population.generation)
 
 if __name__ == "__main__":

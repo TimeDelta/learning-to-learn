@@ -98,23 +98,55 @@ class TasksEncoder(nn.Module):
         self.latent_dim = len(kept_idx)
 
 
+class SharedAttributeVocab(nn.Module):
+    """
+    Holds one name-to-index mapping plus a single Embedding that
+    can grow on‐the‐fly as new names are added.
+    """
+    def __init__(self, initial_names:List[str], embedding_dim:int):
+        super().__init__()
+        self.name_to_index = {name: i for i, name in enumerate(initial_names)}
+        self.name_to_index['<UNK>'] = len(self.name_to_index)
+        self.name_to_index['<EOS>'] = len(self.name_to_index)
+        self.index_to_name = {i: name for name, i in self.name_to_index.items()}
+        self.embedding = nn.Embedding(len(self.name_to_index), embedding_dim)
+
+    def add_names(self, new_names:List[str]):
+        names_to_add = [name for name in new_names if name not in self.name_to_index]
+
+        starting_index = len(self.name_to_index)
+        num_new_names = len(names_to_add)
+
+        # 3) Assign a new index to each new name
+        for offset, name in enumerate(names_to_add):
+            new_idx = starting_index + offset
+            self.name_to_index[name] = new_idx
+            self.index_to_name[new_idx] = name
+
+        # expand the embedding matrix with He‐style initialization for the new rows
+        old_weight = self.embedding.weight.data
+        fan_in = old_weight.size(1)
+        new_rows = torch.randn(len(names_to_add), fan_in) * math.sqrt(2/fan_in)
+        new_weight = torch.cat([old_weight, new_row], dim=0)
+        self.embedding = nn.Embedding.from_pretrained(new_weight, freeze=False)
+
+
 class NodeAttributeDeepSetEncoder(nn.Module):
     """
     Permutation‐invariant encoder for a dictionary of arbitrary node attributes.
     See "Deep Sets" by Zaheer et al. at https://arxiv.org/abs/1703.06114
     """
     def __init__(self,
-        name_vocab_size:int,
-        name_emb_dim:int,
+        shared_attr_vocab: SharedAttributeVocab,
         encoder_hdim:int,
         aggregator_hdim:int,
         out_dim:int,
         max_value_dim:int
     ):
         super().__init__()
-        self.name_embedder = nn.Embedding(name_vocab_size, name_emb_dim)
+        self.shared_attr_vocab = shared_attr_vocab
         self.attr_encoder = nn.Sequential( # phi
-            nn.Linear(name_emb_dim + max_value_dim, encoder_hdim),
+            nn.Linear(shared_attr_vocab.embedding.embedding_dim + max_value_dim, encoder_hdim),
             nn.ReLU(),
             nn.Linear(encoder_hdim, encoder_hdim),
             nn.ReLU()
@@ -125,6 +157,7 @@ class NodeAttributeDeepSetEncoder(nn.Module):
             nn.Linear(aggregator_hdim, out_dim),
         )
         self.max_value_dim = max_value_dim
+        self.out_dim = out_dim
 
     def forward(self, attr_dict: Dict[int, torch.Tensor]) -> torch.Tensor:
         if not attr_dict:
@@ -137,7 +170,7 @@ class NodeAttributeDeepSetEncoder(nn.Module):
             pad = self.max_value_dim - flat_value.numel()
             if pad > 0:
                 flat_value = F.pad(flat_value, (0, pad), "constant", 0.0)
-            phis.append(self.attr_encoder(torch.cat([self.name_embedder(name_index), flat_value], dim=0)))
+            phis.append(self.attr_encoder(torch.cat([self.shared_attr_vocab.embedding(name_index), flat_value], dim=0)))
         return self.aggregator(torch.stack(phis, dim=0).sum(dim=0))
 
 
@@ -146,17 +179,11 @@ class GraphEncoder(nn.Module):
     Graph encoder with learnable node type embeddings, deep set encoder for node attributes and DAG attention layers.
     Outputs per-graph mu and logvar for VAE.
     """
-    def __init__(self, num_node_types:int, attr_name_vocab_size:int, latent_dim:int, hidden_dims:List[int]):
+    def __init__(self, num_node_types:int, attr_encoder:NodeAttributeDeepSetEncoder, latent_dim:int, hidden_dims:List[int]):
         super().__init__()
         self.latent_dim = latent_dim
-        attr_emb_dim = 50
-        self.attr_encoder = NodeAttributeDeepSetEncoder(
-            attr_name_vocab_size,
-            name_emb_dim=5,
-            encoder_hdim=10,
-            aggregator_hdim=20,
-            out_dim=attr_emb_dim,
-            max_value_dim=10)
+        self.attr_encoder = attr_encoder
+        attr_emb_dim = attr_encoder.out_dim
         self.node_type_embedding = nn.Embedding(num_node_types, attr_emb_dim)
         self.convs = nn.ModuleList()
         prev_dim = attr_emb_dim * 2
@@ -168,7 +195,6 @@ class GraphEncoder(nn.Module):
         self.lin_logvar = nn.Linear(prev_dim, latent_dim)
 
     def forward(self, node_types, edge_index, node_attributes, batch):
-        print(node_attributes)
         type_embedding = self.node_type_embedding(node_types)
         attr_embedding = torch.stack([[self.attr_encoder(attrs) for attrs in graph] for graph in node_attributes], dim=0)
         x = torch.cat([type_embedding, attr_embedding], dim=-1)
@@ -241,11 +267,12 @@ class GraphDecoder(nn.Module):
     1) Recurrently generate node embeddings & edges (GraphRNN style).
     2) Refine embeddings via Graph Deconvolutional Nets (GDNs).
     """
-    def __init__(self, num_node_types:int, latent_dim:int, hidden_dim:int=128, gdn_layers:int=2, attr_names:List=None):
+    def __init__(self, num_node_types:int, latent_dim:int, shared_attr_vocab:SharedAttributeVocab, hidden_dim:int=128, gdn_layers:int=2):
         super().__init__()
+        self.shared_attr_vocab = shared_attr_vocab
         self.latent_dim = latent_dim
         # — map latent → initial Node‐RNN state
-        self.hidden_node_state_init = nn.Linear(latent_dim, hidden_dim)
+        self.node_hidden_state_init = nn.Linear(latent_dim, hidden_dim)
 
         # — Node‐RNN (no input, only hidden evolves)
         self.node_rnn  = nn.GRUCell(input_size=0, hidden_size=hidden_dim)
@@ -263,11 +290,6 @@ class GraphDecoder(nn.Module):
         self.attr_val_rnn   = nn.GRU(input_size=1, hidden_size=hidden_dim)
         self.attr_val_head  = nn.Linear(hidden_dim, 1) # extract value per attr dimension
 
-        self.attr_name_vocab = {k:i+1 for i,k in enumerate(attr_names)} if attr_names else {}
-        self.attr_name_vocab['<UNK>'] = 0
-        self.attr_name_vocab['<EOS>'] = -1
-        self.index_to_attr_name = {v:k for k,v in self.attr_name_vocab.items()}
-
         # — GraphDeconvNet stack (learned spectral decoders)
         self.gdns = nn.ModuleList([GraphDeconvNet(hidden_dim, hidden_dim) for _ in range(gdn_layers)])
         self.max_nodes = 1000
@@ -284,7 +306,7 @@ class GraphDecoder(nn.Module):
         all_graphs = []
 
         for l in range(latent.size(0)):
-            hidden_node = F.relu(self.hidden_node_state_init(latent[l])).unsqueeze(0) # (hidden_dim,)
+            hidden_node = F.relu(self.node_hidden_state_init(latent[l])).unsqueeze(0) # (hidden_dim,)
             node_embeddings = []
             edges = []
             node_types = []
@@ -337,15 +359,15 @@ class GraphDecoder(nn.Module):
                     name_input = torch.zeros(1, 1, device=device)
                     name_out, name_hidden = self.attr_name_rnn(name_input, name_hidden)
                     name_index = int(torch.cos(self.attr_name_head(name_out)).item())
-                    if name_index == self.attr_name_vocab['<EOS>']:
+                    if name_index == self.shared_vocab.name_to_index['<EOS>']:
                         break
-                    elif name_index == self.attr_name_vocab['<UNK>']:
-                        name_index = len(self.attr_name_vocab)
+                    elif name_index == self.shared_vocab.name_to_index['<UNK>']:
+                        name_index = len(self.shared_vocab.name_to_index)
                         name = generate_random_string(8)
-                        self.attr_name_vocab[name] = name_index
-                        self.index_to_attr_name[name_index] = name
+                        self.shared_vocab.name_to_index[name] = name_index
+                        self.shared_vocab.index_to_name[name_index] = name
                     else:
-                        name = self.index_to_attr_name[name_index]
+                        name = self.shared_vocab.index_to_name[name_index]
 
                     attr_dims = max(1, int(math.ceil(F.softplus(self.attr_dims_head(embedding)).item())))
                     values = []
@@ -366,15 +388,15 @@ class GraphDecoder(nn.Module):
 
     def prune_latent_dims(self, kept_idx: torch.LongTensor):
         """
-        Permanently remove unused latent dimensions from the hidden_node_state_init layer.
+        Permanently remove unused latent dimensions from the node_hidden_state_init layer.
         kept_idx: 1D LongTensor of indices to keep from the original latent vector.
         """
-        device = self.hidden_node_state_init.weight.device
-        new_hidden_node_state_init = nn.Linear(kept_idx.numel(), self.hidden_node_state_init.out_features, bias=True).to(device)
-        new_hidden_node_state_init.weight.data.copy_(old.weight.data[:, kept_idx])
+        device = self.node_hidden_state_init.weight.device
+        new_node_hidden_state_init = nn.Linear(kept_idx.numel(), self.node_hidden_state_init.out_features, bias=True).to(device)
+        new_node_hidden_state_init.weight.data.copy_(old.weight.data[:, kept_idx])
 
-        new_hidden_node_state_init.bias.data.copy_(old.bias.data)
-        self.hidden_node_state_init = new_hidden_node_state_init
+        new_node_hidden_state_init.bias.data.copy_(old.bias.data)
+        self.node_hidden_state_init = new_node_hidden_state_init
         self.latent_dim = kept_idx.numel()
 
 class FitnessPredictor(nn.Module):
@@ -686,10 +708,17 @@ if __name__ == "__main__":
     task_latent_dim = graph_latent_dim - 2
     attr_name_vocab_size = 50
     attr_name_vocab = [generate_random_string(5) for _ in range(attr_name_vocab_size)]
+    shared_attr_vocab = SharedAttributeVocab(attr_name_vocab, 5)
+    attr_encoder = NodeAttributeDeepSetEncoder(
+        shared_attr_vocab,
+        encoder_hdim=10,
+        aggregator_hdim=20,
+        out_dim=50,
+        max_value_dim=10)
 
-    graph_encoder = GraphEncoder(num_node_types, attr_name_vocab_size, graph_latent_dim, hidden_dims=[32, 32])
+    graph_encoder = GraphEncoder(num_node_types, attr_encoder, graph_latent_dim, hidden_dims=[32, 32])
     task_encoder = TasksEncoder(hidden_dim=16, latent_dim=task_latent_dim, type_embedding_dim=8)
-    decoder = GraphDecoder(num_node_types, graph_latent_dim)
+    decoder = GraphDecoder(num_node_types, graph_latent_dim, shared_attr_vocab)
     predictor = FitnessPredictor(latent_dim=graph_latent_dim+task_latent_dim, hidden_dim=64, fitness_dim=fitness_dim)
     model = DAGTaskFitnessRegularizedVAE(graph_encoder, task_encoder, decoder, predictor)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)

@@ -34,6 +34,7 @@ NODE_TYPE_TO_INDEX = {nt: i for i, nt in enumerate(NODE_TYPE_OPTIONS)}
 NODE_TYPE_TO_INDEX['input'] = len(NODE_TYPE_TO_INDEX)
 NODE_TYPE_TO_INDEX['hidden'] = len(NODE_TYPE_TO_INDEX)
 NODE_TYPE_TO_INDEX['output'] = len(NODE_TYPE_TO_INDEX)
+ATTRIBUTE_NAMES = []
 
 class NodeGene(BaseGene):
     _gene_attributes = [
@@ -56,6 +57,7 @@ class NodeGene(BaseGene):
                     self.dynamic_attributes[attribute] = node.s(attribute_name)
                 else:
                     warn(f'WARNING: Unknown attribute type for node [{node}]: {attribute_type}')
+                ATTRIBUTE_NAMES.append(attribute_name)
         else:
             self.node_type = None
         # if not hasattr(self, 'value'):
