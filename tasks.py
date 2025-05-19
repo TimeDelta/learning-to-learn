@@ -85,12 +85,12 @@ class Task:
         cos_sim = F.cosine_similarity(torch.tensor(train_in_feats), torch.tensor(valid_in_feats), dim=0)
         if cos_sim < .85:
             warn(f"Cosine similarity of task data partitions' inputs low (cos={cos_sim:.3f})")
-        if cos_sim == 1.0:
+        elif cos_sim == 1.0:
             warn(f"Exact match for cosine similarity of task data partitions' inputs")
         cos_sim = F.cosine_similarity(torch.tensor(train_out_feats), torch.tensor(valid_out_feats), dim=0)
         if cos_sim < .85:
             warn(f"Cosine similarity of task data partitions' outputs low (cos={cos_sim:.3f})")
-        if cos_sim == 1.0:
+        elif cos_sim == 1.0:
             warn(f"Exact match for cosine similarity of task data partitions' outputs")
 
 
@@ -109,8 +109,8 @@ class RegressionTask(Task):
         lambda samples: np.linalg.norm(samples, 2),
         lambda samples: np.sum(np.abs(samples)),
 
-        # skew,
-        # kurtosis,
+        skew,
+        kurtosis,
     ]
 
     @staticmethod
