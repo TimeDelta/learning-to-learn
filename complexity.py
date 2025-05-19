@@ -4,58 +4,66 @@ from astropy.stats import bayesian_blocks
 from sklearn.neighbors import NearestNeighbors
 from pyentrp import entropy
 
+import math
+
 SERIES_STATS = [
-    # lambda to map series into single value
-    lambda series: len(series),
-    lambda series: np.mean(hurst_exponent(series)),
-    lambda series: lempel_ziv_complexity_continuous(series, quantize_signal_bayesian_block_feature_bins),
-    lambda series: np.mean(optimized_multiscale_permutation_entropy(series)),
-    lambda series: differential_entropy(series, quantize_signal_bayesian_block_feature_bins),
+    # lambda to map a set of sample time series into single value
+    lambda samples: np.median(hurst_exponent(samples)),
+    lambda samples: np.median(lempel_ziv_complexity_continuous(samples, quantize_signal_bayesian_block_feature_bins)),
+    lambda samples: np.median(optimized_multiscale_permutation_entropy(samples)),
+    lambda samples: np.median(differential_entropy(samples, quantize_signal_bayesian_block_feature_bins)),
 ]
 
 def differential_entropy(data, quantizer):
-    discrete_signal = quantizer(data)
-    hist, _ = np.histogram(discrete_signal, density=True)
-    nonzero = hist > 0
-    return -np.sum(hist[nonzero] * np.log(hist[nonzero])) / np.log(len(np.unique(discrete_signal)))
+    print('      Differential Entropies...')
+    discrete_signals = quantizer(data)
+    entropies = []
+    for discrete_signal in discrete_signals:
+        hist, _ = np.histogram(discrete_signal, density=True)
+        nonzero = hist > 0
+        entropies.append(-np.sum(hist[nonzero] * np.log(hist[nonzero])) / np.log(len(np.unique(discrete_signal))))
+    return entropies
 
 def lempel_ziv_complexity_continuous(data, quantizer):
-    symbol_seq = quantizer(data)
-    phrase_start = 0
-    complexity = 0
+    print('      Lempel-Ziv Complexities...')
+    symbol_seqs = quantizer(data)
+    complexities = []
+    for symbol_seq in symbol_seqs:
+        phrase_start = 0
+        complexity = 0
+        while phrase_start < len(symbol_seq):
+            phrase_length = 1
+            while True:
+                # so that a substring of target phrase length sits entirely before phrase_start
+                max_prefix_start = phrase_start - phrase_length + 1
 
-    while phrase_start < len(symbol_seq):
-        phrase_length = 1
-        while True:
-            # so that a substring of target phrase length sits entirely before phrase_start
-            max_prefix_start = phrase_start - phrase_length + 1
+                if max_prefix_start > 0:
+                    # all substrings of phrase_length in the prefix [0 : phrase_start]
+                    previous_substrings = {
+                        tuple(symbol_seq[k : k + phrase_length])
+                        for k in range(max_prefix_start)
+                    }
+                else:
+                    previous_substrings = set()
 
-            if max_prefix_start > 0:
-                # all substrings of phrase_length in the prefix [0 : phrase_start]
-                previous_substrings = {
-                    tuple(symbol_seq[k : k + phrase_length])
-                    for k in range(max_prefix_start)
-                }
-            else:
-                previous_substrings = set()
+                end_of_candidate = phrase_start + phrase_length
 
-            end_of_candidate = phrase_start + phrase_length
-
-            # does it still perfectly match something in the prefix?
-            if (
-                end_of_candidate <= len(symbol_seq)
-                and tuple(symbol_seq[phrase_start : end_of_candidate])
-                in previous_substrings
-            ):
-                phrase_length += 1
-                continue
-            else:
-                break
-        complexity += 1
-        phrase_start += phrase_length
-    alphabet_size = len(np.unique(symbol_seq))
-    max_complexity = len(symbol_seq) / np.emath.logn(alphabet_size, len(symbol_seq))
-    return complexity / max_complexity
+                # does it still perfectly match something in the prefix?
+                if (
+                    end_of_candidate <= len(symbol_seq)
+                    and tuple(symbol_seq[phrase_start : end_of_candidate])
+                    in previous_substrings
+                ):
+                    phrase_length += 1
+                    continue
+                else:
+                    break
+            complexity += 1
+            phrase_start += phrase_length
+        alphabet_size = len(np.unique(symbol_seq))
+        max_complexity = len(symbol_seq) / np.emath.logn(alphabet_size, len(symbol_seq))
+        complexities.append(complexity / max_complexity)
+    return complexities
 
 def _hurst_exponent_1d(data):
     """
@@ -90,25 +98,26 @@ def _hurst_exponent_1d(data):
     return slope
 
 def hurst_exponent(data):
+    print('      Hurst Exponents...')
     if data.ndim == 1:
         return _hurst_exponent_1d(data)
     # compute separately for each feature (column)
-    n_samples, n_features = data.shape
+    n_features = data.shape[-1]
     hurst_vals = []
     for f_i in range(n_features):
-        col = data[:, f_i]
+        col = data[..., f_i]
         hurst_vals.append(_hurst_exponent_1d(col))
     return hurst_vals
 
-def optimized_multiscale_permutation_entropy(time_series) -> float:
+def optimized_multiscale_permutation_entropy(data) -> float:
     """
     Compute the mean Multiscale Permutation Entropy (MPE) over:
       - orders m = 2 and 3 (averaged)
       - delays swept from min_delay to max_delay (averaged)
       - scale fixed to 3
     """
+    print('      Optimized Multiscale Permutation Entropies...')
     scale = 3
-    delays = list(range(1, time_series.shape[0]//20))
     def single_feature(feature_series):
         mpe_vals = []
         for order in [2, 3]: # Orders to average over (maintains N ≫ m! guideline)
@@ -116,20 +125,21 @@ def optimized_multiscale_permutation_entropy(time_series) -> float:
                 mpe = entropy.multiscale_permutation_entropy(feature_series, order, delay, scale) / np.log2(math.factorial(order))
                 mpe_vals.append(mpe.mean())
         return float(np.mean(mpe_vals))
-    if time_series.ndim == 1:
-        return single_feature(time_series)
-    per_feature = []
-    for f_i in range(time_series[0].shape[0]):
-        per_feature.append(single_feature(time_series[:,f_i]))
-    return per_feature
+
+    entropies = []
+    for time_series in data:
+        delays = list(range(1, time_series.shape[0]//20))
+        if time_series.ndim == 1:
+            return single_feature(time_series)
+        per_feature = []
+        for f_i in range(time_series[0].shape[0]):
+            per_feature.append(single_feature(time_series[:,f_i]))
+        entropies.append(np.mean(per_feature))
+    return entropies
 
 def quantize_signal_bayesian_block_feature_bins(data):
-    if data.ndim == 1:
-        edges = bayesian_blocks(data)
-        quantized = np.digitize(data, edges) - 1
-        return quantized.tolist()
-    elif data.ndim == 2:
-        n_samples, n_features = data.shape
+    def quantize_features(data):
+        n_features = data.shape[-1]
         quantized_features = []
         bases = []
 
@@ -147,5 +157,16 @@ def quantize_signal_bayesian_block_feature_bins(data):
         weights = np.cumprod(np.concatenate(([1], bases[:-1])))
         composite_symbols = np.sum(quantized_features * weights, axis=1)
         return composite_symbols.tolist()
+    if data.ndim == 1:
+        edges = bayesian_blocks(data)
+        quantized = np.digitize(data, edges) - 1
+        return quantized.tolist()
+    elif data.ndim == 2:
+        return quantize_features(data)
+    elif data.ndim == 3:
+        discrete = []
+        for sample in data:
+            discrete.append(quantize_features(sample))
+        return discrete
     else:
-        raise ValueError("Data must be 1D or 2D.")
+        raise ValueError("Data must be 1D, 2D or 3D.")

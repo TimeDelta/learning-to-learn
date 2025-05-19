@@ -55,28 +55,18 @@ class GuidedPopulation(Population):
         self.string_embedder = SentenceTransformer('all-MiniLM-L6-v2')
 
     def genome_to_data(self, genome: OptimizerGenome):
-        """
-        Convert a NEAT OptimizerGenome into:
-          1) a PyG Data object with .x_type and .edge_index
-          2) genome.task_type  (str)
-          3) genome.task_features  (List[float] or Tensor)
-        """
-        # 1) x_type: a long tensor of shape [N_nodes]
-        #    We sort by node ID so positions line up.
+        # sort by node id so positions line up
         node_ids = sorted(genome.nodes.keys())
-        x_type_list = []
+        node_types = []
         for nid in node_ids:
             node = genome.nodes[nid]
-            # map your NodeGene.node_type string → integer
             idx = NODE_TYPE_TO_INDEX.get(node.node_type)
             if idx is None:
                 raise KeyError(f"Unknown node_type {node.node_type!r}")
-            x_type_list.append(idx)
+            node_types.append(idx)
             node_features = []
-            # Decide a consistent ordering of attribute‐names
-            attr_names = sorted(node.dynamic_attributes.keys())
-            nums = []
-            strs = []
+            attr_names = sorted(node.dynamic_attributes.keys()) # consistent ordering of attribute‐names
+            nums, strs = [], []
             for name in attr_names:
                 val = node.dynamic_attributes.get(name)
                 if isinstance(val, (int, float)):
@@ -93,9 +83,9 @@ class GuidedPopulation(Population):
                 node_features.append(torch.cat(parts, dim=0))
             else:
                 node_features.append(torch.tensor([]))
-        x_type = torch.tensor(x_type_list, dtype=torch.long)
+        x_type = torch.tensor(node_types, dtype=torch.long)
         node_features = torch.stack(node_features, dim=0)
-        node_types = torch.tensor(x_type_list, dtype=torch.long)
+        node_types = torch.tensor(node_types, dtype=torch.long)
 
         # 2) edge_index: collect all enabled connections
         edges = []
@@ -113,7 +103,7 @@ class GuidedPopulation(Population):
             # no edges
             edge_index = torch.empty((2, 0), dtype=torch.long)
 
-        return Data(x=node_types, edge_index=edge_index, node_attributes=node_features)
+        return Data(node_types=node_types, edge_index=edge_index, node_attributes=node_features)
 
     def generate_guided_offspring(self,
         task_type: str,
@@ -194,10 +184,11 @@ class GuidedPopulation(Population):
             generation += 1
             self.reporters.start_generation(self.generation)
 
-            task_type = random.choice(list(TASK_FEATURE_DIMS.keys()))
+            task_type = random.choice(list(TASK_TYPE_TO_CLASS.keys()))
             task = TASK_TYPE_TO_CLASS[task_type].random_init()
 
             # 1) Evaluate real fitness
+            print(f'Evaluating genomes on {task.name()}')
             self.eval_genomes(list(self.population.items()), self.config, task, steps=2*generation)
 
             # 2) Train surrogate on all evaluated genomes
@@ -207,12 +198,7 @@ class GuidedPopulation(Population):
                 graphs.append(g)
                 # shape [1,fitness_dim]
                 fits.append(genome.fitnesses)
-            task_train_features, task_valid_features = task.get_features()
-            distance = torch.linalg.norm(torch.tensor(task_train_features) - torch.tensor(task_valid_features))
-            if distance > len(task_train_features)/2:
-                warn(f'distance between training ({task_train_features}) and validation ({task_valid_features}) task features = {distance}')
-
-            self.trainer.add_data(graphs, fits, task_type, task_train_features)
+            self.trainer.add_data(graphs, fits, task_type, task.features)
 
             if generation < gen_for_full_train_resize:
                 self.trainer.train(epochs=5, batch_size=len(graphs))
@@ -234,11 +220,7 @@ class GuidedPopulation(Population):
                 num_to_make = (offspring_per_species
                                if offspring_per_species is not None
                                else len(members) - keep_per_species)
-                guided_kids = self.generate_guided_offspring(
-                    task_type     = task_type,
-                    task_features = task_features,
-                    n_offspring   = num_to_make
-                )
+                guided_kids = self.generate_guided_offspring(task_type, task.features, num_to_make)
                 # assign predicted fitness
                 for kid in guided_kids:
                     # use surrogate to score
@@ -291,11 +273,16 @@ class GuidedPopulation(Population):
         raw_metrics: Dict[int, Dict[str, float]] = {}
         genome_map = {gid: g for gid, g in genomes}
 
-        model = ManyLossMinimaModel(task.observed_dims)
+        model = ManyLossMinimaModel(task.train_data.num_input_features)
         for genome_id, genome in genomes:
-            model_copy = type(model)(task.observed_dims)
+            model_copy = type(model)(task.train_data.num_input_features)
             model_copy.load_state_dict(model.state_dict())
+            print(f'  Evaluating {genome_id} ({genome.optimizer_path})')
             area_under_metrics, validation_metrics, time_cost, mem_cost = self.evaluate_optimizer(genome.optimizer, model_copy, task, steps)
+            print(f'    Area Under Task Metrics: {area_under_metrics}',
+                  f'    Validation Metrics: {validation_metrics}',
+                  f'    Time Cost: {time_cost}',
+                  f'    Memory Cost: {mem_cost}')
             raw_metrics[genome_id] = validation_metrics
 
         # 2. Prepare metric names & objectives
@@ -303,8 +290,8 @@ class GuidedPopulation(Population):
         objectives   = {m.name: m.objective for m in task.metrics}
 
         # 3. Pareto front ranking
+        print('  Calculating Pareto Fronts')
         fronts = nondominated_sort(raw_metrics, objectives)
-        num_fronts = len(fronts)
 
         # 4. Compute global min/max per metric
         mins = {m: min(raw_metrics[g][m] for g in raw_metrics) for m in metric_names}
@@ -329,7 +316,7 @@ class GuidedPopulation(Population):
                     scores.append(norm)
                 composite = sum(scores) / len(scores)
                 # Fitness: higher for earlier fronts, break ties by composite
-                genome_map[genome_id].fitness = (num_fronts - front_idx + 1) + composite
+                genome_map[genome_id].fitness = (len(fronts) - front_idx + 1) + composite
                 genome.fitnesses = vals
 
     def evaluate_optimizer(self, optimizer, model, task, steps=10):
