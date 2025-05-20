@@ -468,9 +468,11 @@ class DAGTaskFitnessRegularizedVAE(nn.Module):
         self.register_buffer('graph_latent_mask', torch.ones(self.graph_encoder.latent_dim))
         self.register_buffer('tasks_latent_mask', torch.ones(self.tasks_encoder.latent_dim))
 
+    @property
     def shared_attr_vocab(self):
         return self.graph_encoder.shared_attr_vocab
 
+    @property
     def attr_encoder(self):
         return self.graph_encoder.attr_encoder
 
@@ -637,7 +639,7 @@ class OnlineTrainer:
                     # node feature loss
                     def convert_string(value):
                         if isinstance(value, str):
-                            value = self.model.attr_encoder().get_value_tensor(value)
+                            value = self.model.attr_encoder.get_value_tensor(value)
                         return value
                     def to_tensor(value):
                         value = convert_string(value)
