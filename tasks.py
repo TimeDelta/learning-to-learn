@@ -170,7 +170,7 @@ class HurstTargetTimeSeriesTransformTask(Task):
 
 TASK_TYPE_TO_CLASS = {
     RegressionTask.name(): RegressionTask,
-    # HurstTargetTimeSeriesTransformTask.name(): HurstTargetTimeSeriesTransformTask,
+    HurstTargetTimeSeriesTransformTask.name(): HurstTargetTimeSeriesTransformTask,
 }
 TASK_FEATURE_DIMS = {n: 4*len(c.random_init().feature_functions) for n, c in TASK_TYPE_TO_CLASS.items()}
 TASK_TYPE_TO_INDEX = {k: i for i, k in enumerate(TASK_FEATURE_DIMS.keys())}
