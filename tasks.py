@@ -34,9 +34,6 @@ class TaskDataset(Dataset):
 
 
 class Task:
-    feature_functions = [
-    ]
-
     @staticmethod
     def random_init():
         raise NotImplementedError()
@@ -70,15 +67,8 @@ class Task:
         self.check_partition_similarity()
 
     def evaluate_metrics(self, model: nn.Module, dataset:TaskDataset) -> Dict[str, float]:
-        """ This also inverts minimization objectives """
         values = {m.name: m(model(torch.tensor(dataset.inputs, dtype=torch.float32)), dataset.outputs) for m in self.metrics}
-        final_values = []
-        for metric in self.metrics:
-            if metric.objective == 'max':
-                final_values.append(values[metric.name])
-            else: # 'min': invert
-                final_values.append(-values[metric.name])
-        return torch.tensor(final_values, dtype=torch.float32)
+        return torch.tensor([v for _,v in sorted(values.items(), key=lambda i: i[0])], dtype=torch.float32)
 
     def check_partition_similarity(self):
         train_in_feats, train_out_feats, valid_in_feats, valid_out_feats = self.features
@@ -95,23 +85,6 @@ class Task:
 
 
 class RegressionTask(Task):
-    feature_functions = [
-        lambda samples: np.mean(samples, axis=0),
-        lambda samples: np.std(samples, axis=0),
-        lambda samples: np.min(samples, axis=0),
-        lambda samples: np.max(samples, axis=0),
-        lambda samples: np.median(samples, axis=0),
-
-        lambda samples: np.percentile(samples, 25),
-        lambda samples: np.percentile(samples, 75),
-
-        lambda samples: np.linalg.norm(samples, 1),
-        lambda samples: np.linalg.norm(samples, 2),
-        lambda samples: np.sum(np.abs(samples)),
-
-        skew,
-        kurtosis,
-    ]
 
     @staticmethod
     def random_init():
@@ -127,15 +100,29 @@ class RegressionTask(Task):
         self.true_dims = true_dims
         self.observed_dims = observed_dims
         inputs, outputs = generate_complex_regression_data(num_samples, true_dims, observed_dims)
-        self.feature_functions.append(lambda _: self.true_dims)
-        self.feature_functions.append(lambda _: self.observed_dims)
+        self.feature_functions = [
+            lambda _: self.true_dims,
+            lambda _: self.observed_dims,
+
+            lambda samples: np.mean(samples, axis=0),
+            lambda samples: np.std(samples, axis=0),
+            lambda samples: np.min(samples, axis=0),
+            lambda samples: np.max(samples, axis=0),
+            lambda samples: np.median(samples, axis=0),
+
+            lambda samples: np.percentile(samples, 25),
+            lambda samples: np.percentile(samples, 75),
+
+            lambda samples: np.linalg.norm(samples, 1),
+            lambda samples: np.linalg.norm(samples, 2),
+            lambda samples: np.sum(np.abs(samples)),
+
+            skew,
+            kurtosis,
+        ]
         super().__init__(metrics, num_samples, train_ratio, inputs, outputs)
 
 class HurstTargetTimeSeriesTransformTask(Task):
-    feature_functions = [
-        *SERIES_STATS,
-    ]
-
     @staticmethod
     def random_init():
         num_features = random.randint(1, 10)
@@ -170,17 +157,20 @@ class HurstTargetTimeSeriesTransformTask(Task):
         self.num_features = num_features
         sequences = [generate_fbm_sequence(mean, stdev, hurst_target, fbm_length, num_features, series_length) for _ in range(num_samples)]
         outputs = [generate_fbm_sequence(mean, stdev, hurst_target, fbm_length, num_features, series_length) for _ in range(num_samples)]
-        self.feature_functions.append(lambda _: self.mean)
-        self.feature_functions.append(lambda _: self.stdev)
-        self.feature_functions.append(lambda _: self.hurst_target)
-        self.feature_functions.append(lambda _: self.fbm_length)
-        self.feature_functions.append(lambda _: self.series_length)
-        self.feature_functions.append(lambda _: self.num_features)
+        self,feature_functions = [
+            *SERIES_STATS,
+            lambda _: self.mean,
+            lambda _: self.stdev,
+            lambda _: self.hurst_target,
+            lambda _: self.fbm_length,
+            lambda _: self.series_length,
+            lambda _: self.num_features,
+        ]
         super().__init__(metrics, num_samples, train_ratio, np.array(sequences), np.array(outputs))
 
 TASK_TYPE_TO_CLASS = {
     RegressionTask.name(): RegressionTask,
-    HurstTargetTimeSeriesTransformTask.name(): HurstTargetTimeSeriesTransformTask,
+    # HurstTargetTimeSeriesTransformTask.name(): HurstTargetTimeSeriesTransformTask,
 }
-TASK_FEATURE_DIMS = {n: len(c.feature_functions) for n, c in TASK_TYPE_TO_CLASS.items()}
+TASK_FEATURE_DIMS = {n: 4*len(c.random_init().feature_functions) for n, c in TASK_TYPE_TO_CLASS.items()}
 TASK_TYPE_TO_INDEX = {k: i for i, k in enumerate(TASK_FEATURE_DIMS.keys())}

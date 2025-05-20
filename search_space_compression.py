@@ -71,7 +71,7 @@ class TasksEncoder(nn.Module):
         mu_list, logvar_list = [], []
         for task_type, feature_vec in zip(task_types, feature_vecs):
             task_type_embedding = self.embedder(task_type)
-            feature_vec = torch.as_tensor(feature_vec, dtype=torch.float)
+            feature_vec = torch.as_tensor(feature_vec, dtype=torch.float).flatten()
             h = self.encoders[str(task_type.item())](torch.cat((task_type_embedding, feature_vec), dim=0))
             mu_list.append(self.lin_mu(h))
             logvar_list.append(self.lin_logvar(h))
