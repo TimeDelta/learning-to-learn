@@ -94,18 +94,15 @@ class GuidedPopulation(Population):
         the surrogate predictor, decode each optimized z_g back into a DAG, then
         convert those DAGs into new NEAT genomes.
         """
-        device = self.device
-
         # 1) Get the task embedding (mu_t, lv_t) and a fixed z_t
-        mu_t, lv_t = self.guide.tasks_encoder([task_type], [task_features])
+        mu_t, lv_t = self.guide.tasks_encoder(torch.tensor([TASK_TYPE_TO_INDEX[task_type]], dtype=torch.long), task_features)
         z_t = self.guide.reparameterize(mu_t, lv_t, self.guide.tasks_latent_mask)
         # expand to match the number of offspring
         z_t = z_t.expand(n_offspring, -1).clone()   # -> (n_offspring, task_latent_dim)
 
         # 2) Initialize random graph latents and set requires_grad=True
         graph_latent_dim = self.guide.graph_encoder.latent_dim
-        z_g = torch.randn((n_offspring, graph_latent_dim), device=device,
-                          requires_grad=True)
+        z_g = torch.randn((n_offspring, graph_latent_dim), requires_grad=True)
 
         # 3) Optimize z_g via Adam ascent to maximize predictor(z_g, z_t)
         opt = torch.optim.Adam([z_g], lr=latent_lr)
@@ -187,7 +184,7 @@ class GuidedPopulation(Population):
             for species in self.species.species.values():
                 members = species.members
                 # sort descending by real fitness
-                sorted_members = sorted(members, key=lambda g: g.fitness, reverse=True)
+                sorted_members = sorted(members, key=lambda g: self.population[g].fitness, reverse=True)
                 # 3a) keep top N
                 kept = sorted_members[:keep_per_species]
 
@@ -195,6 +192,7 @@ class GuidedPopulation(Population):
                 num_to_make = (offspring_per_species
                                if offspring_per_species is not None
                                else len(members) - keep_per_species)
+                print(task.features)
                 guided_kids = self.generate_guided_offspring(task_type, task.features, num_to_make)
                 # assign predicted fitness
                 for kid in guided_kids:
