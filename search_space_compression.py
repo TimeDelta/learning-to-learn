@@ -68,10 +68,6 @@ class TasksEncoder(nn.Module):
         self.lin_logvar = nn.Linear(hidden_dim, latent_dim)
 
     def forward(self, task_types, feature_vecs):
-        """
-        task_types: list[str] of length B
-        feature_vecs: list[Tensor] of length B, each shape (feat_dim,)
-        """
         mu_list, logvar_list = [], []
         for task_type, feature_vec in zip(task_types, feature_vecs):
             task_type_embedding = self.embedder(task_type)
@@ -79,7 +75,6 @@ class TasksEncoder(nn.Module):
             h = self.encoders[str(task_type.item())](torch.cat((task_type_embedding, feature_vec), dim=0))
             mu_list.append(self.lin_mu(h))
             logvar_list.append(self.lin_logvar(h))
-        # stack into B×latent_dim tensors
         return torch.stack(mu_list, dim=0), torch.stack(logvar_list, dim=0)
 
     def reparameterize(self, mu, logvar):
@@ -117,7 +112,6 @@ class SharedAttributeVocab(nn.Module):
         starting_index = len(self.name_to_index)
         num_new_names = len(names_to_add)
 
-        # 3) Assign a new index to each new name
         for offset, name in enumerate(names_to_add):
             new_idx = starting_index + offset
             self.name_to_index[name] = new_idx
@@ -179,8 +173,8 @@ class NodeAttributeDeepSetEncoder(nn.Module):
             return torch.zeros(self.aggregator[-1].out_features)
 
         phis = []
-        for name, value in attr_dict.items():
-            name_index = torch.tensor(self.shared_attr_vocab.name_to_index[name], dtype=torch.long)
+        for attr, value in sorted(attr_dict.items(), key=lambda i: i[0].name): # consistent ordering
+            name_index = torch.tensor(self.shared_attr_vocab.name_to_index[attr.name], dtype=torch.long)
             value = self.get_value_tensor(value)
             phis.append(self.attr_encoder(torch.cat([self.shared_attr_vocab.embedding(name_index), value], dim=0)))
         return self.aggregator(torch.stack(phis, dim=0).sum(dim=0))
@@ -205,6 +199,14 @@ class GraphEncoder(nn.Module):
         # map to latent parameters
         self.lin_mu = nn.Linear(prev_dim, latent_dim)
         self.lin_logvar = nn.Linear(prev_dim, latent_dim)
+
+    @property
+    def max_value_dim(self):
+        return self.attr_encoder.max_value_dim
+
+    @property
+    def shared_attr_vocab(self):
+        return self.attr_encoder.shared_attr_vocab
 
     def forward(self, node_types, edge_index, node_attributes, batch):
         type_embedding = self.node_type_embedding(node_types)
@@ -476,6 +478,10 @@ class DAGTaskFitnessRegularizedVAE(nn.Module):
     def attr_encoder(self):
         return self.graph_encoder.attr_encoder
 
+    @property
+    def max_value_dim(self):
+        return self.graph_encoder.max_value_dim
+
     def encode(self, node_types, edge_index, node_attributes, batch, task_type, task_features):
         mu_g, lv_g = self.graph_encoder(node_types, edge_index, node_attributes, batch)
         mu_t, lv_t = self.tasks_encoder(task_type, task_features)
@@ -597,10 +603,6 @@ class OnlineTrainer:
                 self.optimizer.zero_grad()
 
                 # --- 1) forward pass ---
-                # assume model.forward now returns:
-                #   decoded_graphs: List[{'node_types', 'edge_index', 'node_attributes'}] (len=B)
-                #   fitness_pred: Tensor[B, fitness_dim]
-                #   mu_g, lv_g, mu_t, lv_t: Tensors[B, latent_dim]
                 decoded_graphs, fitness_pred, graph_latent, task_latent, mu_g, lv_g, mu_t, lv_t = self.model(
                     batch.node_types, batch.edge_index, batch.node_attributes, batch.batch, batch.task_type, batch.task_features
                 )
@@ -735,6 +737,7 @@ class OnlineTrainer:
 
 
 if __name__ == "__main__":
+    from attributes import *
     num_node_types = 3
     max_nodes = 10
     graph_latent_dim = 32
@@ -769,18 +772,22 @@ if __name__ == "__main__":
         edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous() if edges else torch.empty((2,0), dtype=torch.long)
         dyn_attrs = []
         for _ in range(num_nodes):
-            attributes = []
+            attributes = {}
             for _ in range(random.randint(0, 5)):
                 if random.random() <= .5:
-                    attributes.append(random.randint(0, 10))
+                    attributes[IntAttribute(random.choice(attr_name_vocab))] = random.randint(0, 10)
                 if random.random() <= .5:
-                    attributes.append(random.random() * 5.0)
+                   attributes[FloatAttribute(random.choice(attr_name_vocab))] = random.random() * 5.0
                 if random.random() <= .5:
-                    attributes.append(random.choice(attr_name_vocab))
-            dyn_attrs.append({random.choice(attr_name_vocab): v for v in attributes})
+                   attributes[StringAttribute(random.choice(attr_name_vocab))] = random.choice(attr_name_vocab)
+            dyn_attrs.append(attributes)
         return Data(node_types=types, edge_index=edge_index, node_attributes=dyn_attrs)
 
     # Create synthetic dataset
+    class Metric:
+        def __init__(self, name, objective):
+            self.name = name
+            self.objective = objective
     print('Generating random training data')
     def generate_data(num_samples):
         graphs, fitnesses = [], []
@@ -789,7 +796,7 @@ if __name__ == "__main__":
         for _ in range(num_samples):
             graph = generate_random_dag(random.randint(3, max_nodes), num_node_types, edge_prob=0.4)
             graphs.append(graph)
-            fitnesses.append([graph.edge_index.size(1) + 0.1 * random.random() for _ in range(fitness_dim)])
+            fitnesses.append({Metric(str(i), 'min'): graph.edge_index.size(1) + 0.1 * random.random() for i in range(fitness_dim)})
         return graphs, fitnesses, task_type, torch.randn((TASK_FEATURE_DIMS[task_type],))
 
     trainer = OnlineTrainer(model, optimizer)

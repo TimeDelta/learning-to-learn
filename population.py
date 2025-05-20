@@ -59,53 +59,28 @@ class GuidedPopulation(Population):
         # sort by node id so positions line up
         node_ids = sorted(genome.nodes.keys())
         node_types = []
+        node_attributes = []
         for nid in node_ids:
             node = genome.nodes[nid]
             idx = NODE_TYPE_TO_INDEX.get(node.node_type)
             if idx is None:
                 raise KeyError(f"Unknown node_type {node.node_type!r}")
             node_types.append(idx)
-            node_features = []
-            attr_names = sorted(node.dynamic_attributes.keys()) # consistent ordering of attribute‐names
-            nums, strs = [], []
-            for name in attr_names:
-                val = node.dynamic_attributes.get(name)
-                if isinstance(val, (int, float)):
-                    nums.append(float(val))
-                elif isinstance(val, str):
-                    strs.append(self.string_embedder.encode(val, convert_to_tensor=True))
-                else:
-                    warn('missing attribute type in genome-to-data conversion')
-            if len(nums) > 0:
-                parts = [torch.tensor(nums, dtype=torch.float)] + strs
-            else:
-                parts = strs
-            if len(parts) > 0:
-                node_features.append(torch.cat(parts, dim=0))
-            else:
-                node_features.append(torch.tensor([]))
-        x_type = torch.tensor(node_types, dtype=torch.long)
-        if len(node_features) > 0:
-            node_features = torch.stack(node_features, dim=0)
+            node_attributes.append(node.dynamic_attributes)
         node_types = torch.tensor(node_types, dtype=torch.long)
 
-        # 2) edge_index: collect all enabled connections
         edges = []
         for (src, dst), conn in genome.connections.items():
             if conn.enabled:
-                # ensure both src/dst are in our node_ids
                 if src in node_ids and dst in node_ids:
-                    # we need local indices 0…N-1, so remap via node_ids list
                     local_src = node_ids.index(src)
                     local_dst = node_ids.index(dst)
                     edges.append([local_src, local_dst])
         if len(edges) > 0:
             edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
         else:
-            # no edges
             edge_index = torch.empty((2, 0), dtype=torch.long)
-
-        return Data(node_types=node_types, edge_index=edge_index, node_attributes=node_features)
+        return Data(node_types=node_types, edge_index=edge_index, node_attributes=node_attributes)
 
     def generate_guided_offspring(self,
         task_type: str,
@@ -330,6 +305,7 @@ class GuidedPopulation(Population):
           task: The task on which to evaluate the optimizer.
           steps: Number of update iterations.
         """
+        # TODO: find way to correct for time improvements that are solely due to RAM cache tiers
         tracemalloc.start()
         start = time.perf_counter()
         prev_metrics_values = torch.tensor([0.0] * len(task.metrics))
