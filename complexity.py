@@ -1,13 +1,35 @@
 import numpy as np
 import antropy
 from astropy.stats import bayesian_blocks
+from scipy.stats import skew, kurtosis
 from sklearn.neighbors import NearestNeighbors
 from pyentrp import entropy
+# TODO: numpy, sklearn imports together causing:
+#   /usr/local/lib/python3.8/site-packages/threadpoolctl.py:1214: RuntimeWarning:
+#   Found Intel OpenMP ('libiomp') and LLVM OpenMP ('libomp') loaded at
+#   the same time. Both libraries are known to be incompatible and this
+#   can cause random crashes or deadlocks on Linux when loaded in the
+#   same Python program.
+#   Using threadpoolctl may cause crashes or deadlocks. For more
+#   information and possible workarounds, please see
+#       https://github.com/joblib/threadpoolctl/blob/master/multiple_openmp.md
 
 import math
 
 SERIES_STATS = [
     # lambda to map a set of sample time series into single value
+    # aggregated per series then per state then per feature
+    lambda samples: np.mean(np.median(np.ptp(samples, axis=0), axis=0)),
+    lambda samples: np.mean(np.median(np.percentile(samples, 75, axis=0) - np.percentile(samples, 25, axis=0), axis=0)),
+    lambda samples: np.mean(np.median(np.mean(samples, axis=0), axis=0)),
+    lambda samples: np.mean(np.median(np.std(samples, axis=0), axis=0)),
+    lambda samples: np.mean(np.median([skew(series) for series in samples], axis=0)),
+    lambda samples: np.mean(np.median([kurtosis(series) for series in samples], axis=0)),
+    lambda samples: np.median([
+        np.median(NearestNeighbors(n_neighbors=2).fit(samples[:,:,i]).kneighbors(samples[:,:,i], return_distance=True)[0][:, 1])
+        for i in range(samples.shape[2])
+    ]),
+
     lambda samples: np.median(hurst_exponent(samples)),
     lambda samples: np.median(lempel_ziv_complexity_continuous(samples, quantize_signal_bayesian_block_feature_bins)),
     lambda samples: np.median(optimized_multiscale_permutation_entropy(samples)),

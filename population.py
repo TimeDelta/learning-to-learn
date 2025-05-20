@@ -12,6 +12,7 @@ from warnings import warn
 
 from genome import OptimizerGenome
 from genes import NODE_TYPE_TO_INDEX, NODE_TYPE_OPTIONS
+from metrics import *
 from models import *
 from pareto import *
 from search_space_compression import *
@@ -84,7 +85,8 @@ class GuidedPopulation(Population):
             else:
                 node_features.append(torch.tensor([]))
         x_type = torch.tensor(node_types, dtype=torch.long)
-        node_features = torch.stack(node_features, dim=0)
+        if len(node_features) > 0:
+            node_features = torch.stack(node_features, dim=0)
         node_types = torch.tensor(node_types, dtype=torch.long)
 
         # 2) edge_index: collect all enabled connections
@@ -194,9 +196,7 @@ class GuidedPopulation(Population):
             # 2) Train surrogate on all evaluated genomes
             graphs, fits = [], []
             for gid, genome in self.population.items():
-                g = self.genome_to_data(genome)
-                graphs.append(g)
-                # shape [1,fitness_dim]
+                graphs.append(self.genome_to_data(genome))
                 fits.append(genome.fitnesses)
             self.trainer.add_data(graphs, fits, task_type, task.features)
 
@@ -279,37 +279,36 @@ class GuidedPopulation(Population):
             model_copy.load_state_dict(model.state_dict())
             print(f'  Evaluating {genome_id} ({genome.optimizer_path})')
             area_under_metrics, validation_metrics, time_cost, mem_cost = self.evaluate_optimizer(genome.optimizer, model_copy, task, steps)
+            validation_metrics_str = '{' + ';'.join([f'{m.name}: {v}' for m,v in validation_metrics.items()]) + '}'
             print(f'    Area Under Task Metrics: {area_under_metrics}',
-                  f'    Validation Metrics: {validation_metrics}',
+                  f'    Validation Metrics: {validation_metrics_str}',
                   f'    Time Cost: {time_cost}',
                   f'    Memory Cost: {mem_cost}')
+            validation_metrics[AreaUnderTaskMetrics] = area_under_metrics
+            validation_metrics[TimeCost] = time_cost
+            validation_metrics[MemoryCost] = mem_cost
             raw_metrics[genome_id] = validation_metrics
-
-        # 2. Prepare metric names & objectives
-        metric_names = [m.name for m in task.metrics]
-        objectives   = {m.name: m.objective for m in task.metrics}
 
         # 3. Pareto front ranking
         print('  Calculating Pareto Fronts')
-        fronts = nondominated_sort(raw_metrics, objectives)
+        fronts = nondominated_sort(raw_metrics)
 
         # 4. Compute global min/max per metric
-        mins = {m: min(raw_metrics[g][m] for g in raw_metrics) for m in metric_names}
-        maxs = {m: max(raw_metrics[g][m] for g in raw_metrics) for m in metric_names}
+        mins = {m: min(raw_metrics[g][m] for g in raw_metrics) for m in validation_metrics}
+        maxs = {m: max(raw_metrics[g][m] for g in raw_metrics) for m in validation_metrics}
 
         # 5. Assign fitness = Pareto rank base + composite normalized score
         for front_idx, front in enumerate(fronts, start=1):
             for genome_id in front:
-                vals = raw_metrics[genome_id]
                 # Composite min–max normalized score
                 scores = []
-                for m in metric_names:
+                for m in validation_metrics:
                     lo, hi = mins[m], maxs[m]
                     if hi - lo < epsilon:
                         norm = 1.0
                     else:
-                        v = vals[m]
-                        if objectives[m] == 'max':
+                        v = raw_metrics[genome_id][m]
+                        if m.objective == 'max':
                             norm = (v - lo) / (hi - lo)
                         else:
                             norm = (hi - v) / (hi - lo)
@@ -317,7 +316,9 @@ class GuidedPopulation(Population):
                 composite = sum(scores) / len(scores)
                 # Fitness: higher for earlier fronts, break ties by composite
                 genome_map[genome_id].fitness = (len(fronts) - front_idx + 1) + composite
-                genome.fitnesses = vals
+                print(f'    {genome_id}: {genome_map[genome_id].fitness}')
+                genome_map[genome_id].fitnesses = raw_metrics[genome_id]
+        return genomes
 
     def evaluate_optimizer(self, optimizer, model, task, steps=10):
         """
@@ -344,5 +345,5 @@ class GuidedPopulation(Population):
         tracemalloc.stop()
         time_cost = stop - start
         validation_metrics = task.evaluate_metrics(model, task.valid_data).detach().data.numpy()
-        validation_metrics = { name: float(validation_metrics[i]) for i, name in enumerate([m.name for m in task.metrics]) }
+        validation_metrics = {m: float(validation_metrics[i]) for i, m in enumerate(task.metrics)}
         return area_under_metrics, validation_metrics, time_cost, peak_memory

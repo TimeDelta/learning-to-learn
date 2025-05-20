@@ -175,7 +175,7 @@ class NodeAttributeDeepSetEncoder(nn.Module):
             return value[:self.max_value_dim]
 
     def forward(self, attr_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
-        if not attr_dict:
+        if not attr_dict or len(attr_dict) == 0:
             return torch.zeros(self.aggregator[-1].out_features)
 
         phis = []
@@ -208,7 +208,10 @@ class GraphEncoder(nn.Module):
 
     def forward(self, node_types, edge_index, node_attributes, batch):
         type_embedding = self.node_type_embedding(node_types)
-        attr_embedding = torch.stack([self.attr_encoder(attrs) for graph in node_attributes for attrs in graph], dim=0)
+        if len(node_attributes) > 0:
+            attr_embedding = torch.stack([self.attr_encoder(attrs) for graph in node_attributes for attrs in graph], dim=0)
+        else:
+            attr_embedding = torch.zeros((len(node_types), attr_encoder.out_dim))
         x = torch.cat([type_embedding, attr_embedding], dim=-1)
         for conv in self.convs:
             x = conv(x, edge_index)
@@ -560,8 +563,9 @@ class OnlineTrainer:
     def add_data(self, graphs, fitnesses, task_type:str, task_features):
         for graph, fitness_dict in zip(graphs, fitnesses):
             data = graph.clone()
-            fitness = []
-            data.y = torch.as_tensor(fitness, dtype=torch.float).unsqueeze(0)
+            # sort fitness values by key
+            fitness = [f[1] for f in sorted(fitness_dict.items(), key=lambda item: item[0].name)]
+            data.y = torch.as_tensor(fitness, dtype=torch.float)#.unsqueeze(0)
             data.task_type = torch.tensor([TASK_TYPE_TO_INDEX[task_type]], dtype=torch.long)
             if isinstance(task_features, torch.Tensor):
                 data.task_features = task_features.detach().cpu().tolist()
