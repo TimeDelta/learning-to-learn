@@ -424,7 +424,7 @@ class FitnessPredictor(nn.Module):
     """
     Auxiliary predictor: maps concatentated graph and task latents (z_g, z_t) to fitness.
     """
-    def __init__(self, latent_dim, hidden_dim=64, fitness_dim=2):
+    def __init__(self, latent_dim, hidden_dim=64, fitness_dim=4):
         super().__init__()
         self.fc1 = nn.Linear(latent_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, fitness_dim)

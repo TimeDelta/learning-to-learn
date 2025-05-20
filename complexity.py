@@ -37,7 +37,6 @@ SERIES_STATS = [
 ]
 
 def differential_entropy(data, quantizer):
-    print('      Differential Entropies...')
     discrete_signals = quantizer(data)
     entropies = []
     for discrete_signal in discrete_signals:
@@ -47,7 +46,6 @@ def differential_entropy(data, quantizer):
     return entropies
 
 def lempel_ziv_complexity_continuous(data, quantizer):
-    print('      Lempel-Ziv Complexities...')
     symbol_seqs = quantizer(data)
     complexities = []
     for symbol_seq in symbol_seqs:
@@ -120,7 +118,6 @@ def _hurst_exponent_1d(data):
     return slope
 
 def hurst_exponent(data):
-    print('      Hurst Exponents...')
     if data.ndim == 1:
         return _hurst_exponent_1d(data)
     # compute separately for each feature (column)
@@ -138,7 +135,6 @@ def optimized_multiscale_permutation_entropy(data) -> float:
       - delays swept from min_delay to max_delay (averaged)
       - scale fixed to 3
     """
-    print('      Optimized Multiscale Permutation Entropies...')
     scale = 3
     def single_feature(feature_series):
         mpe_vals = []

@@ -25,7 +25,7 @@ class GuidedPopulation(Population):
         graph_latent_dim = 16
         task_latent_dim = 10
         num_node_types = 10
-        fitness_dim = 2
+        fitness_dim = 4
         self.shared_attr_vocab = SharedAttributeVocab([], 5)
         attr_encoder = NodeAttributeDeepSetEncoder(
             self.shared_attr_vocab,
