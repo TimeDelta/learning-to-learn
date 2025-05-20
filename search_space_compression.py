@@ -565,7 +565,7 @@ class OnlineTrainer:
             data = graph.clone()
             # sort fitness values by key
             fitness = [f[1] for f in sorted(fitness_dict.items(), key=lambda item: item[0].name)]
-            data.y = torch.as_tensor(fitness, dtype=torch.float)#.unsqueeze(0)
+            data.y = torch.as_tensor(fitness, dtype=torch.float).unsqueeze(0)
             data.task_type = torch.tensor([TASK_TYPE_TO_INDEX[task_type]], dtype=torch.long)
             if isinstance(task_features, torch.Tensor):
                 data.task_features = task_features.detach().cpu().tolist()
