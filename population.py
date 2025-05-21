@@ -84,7 +84,7 @@ class GuidedPopulation(Population):
 
     def generate_guided_offspring(self,
         task_type: str,
-        task_features: List[float],
+        task_features: List[np.ndarray],
         n_offspring: int  = 10,
         latent_steps: int = 20,
         latent_lr: float  = 1e-2
@@ -95,6 +95,7 @@ class GuidedPopulation(Population):
         convert those DAGs into new NEAT genomes.
         """
         # 1) Get the task embedding (mu_t, lv_t) and a fixed z_t
+        task_features = [np.concatenate(task_features, axis=0)]
         mu_t, lv_t = self.guide.tasks_encoder(torch.tensor([TASK_TYPE_TO_INDEX[task_type]], dtype=torch.long), task_features)
         z_t = self.guide.reparameterize(mu_t, lv_t, self.guide.tasks_latent_mask)
         # expand to match the number of offspring
@@ -192,7 +193,6 @@ class GuidedPopulation(Population):
                 num_to_make = (offspring_per_species
                                if offspring_per_species is not None
                                else len(members) - keep_per_species)
-                print(task.features)
                 guided_kids = self.generate_guided_offspring(task_type, task.features, num_to_make)
                 # assign predicted fitness
                 for kid in guided_kids:
