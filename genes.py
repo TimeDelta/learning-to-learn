@@ -60,8 +60,6 @@ class NodeGene(BaseGene):
                 ATTRIBUTE_NAMES.append(attribute_name)
         else:
             self.node_type = None
-        # if not hasattr(self, 'value'):
-        #     self.value = None
         BaseGene.__init__(self, node_id)
 
     def copy(self):

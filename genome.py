@@ -347,36 +347,6 @@ class OptimizerGenome(object):
                 # Homologous gene: combine genes from both parents.
                 self.nodes[key] = ng1.crossover(ng2)
 
-    def forward(self, input_values: Dict[int, float]) -> Dict[int, float]:
-        """
-        TODO: modify this to work for recurrent networks
-        A minimal feed-forward evaluation of the genome.
-        This implementation assumes a feed-forward network with no recurrent connections.
-        'input_values' is a dictionary mapping input node id to its value.
-        Returns a dictionary mapping node id to computed output.
-        """
-        outputs: Dict[int, float] = {}
-        # Set outputs for input nodes.
-        for node_id, node in self.nodes.items():
-            if node.node_type == "input":
-                outputs[node_id] = input_values.get(node_id, 0.0)
-        unresolved = True
-        # Continue until all nodes have computed outputs.
-        while unresolved:
-            unresolved = False
-            for node_id, node in self.nodes.items():
-                if node_id in outputs:
-                    continue
-                # Find incoming connections for which the source output is known.
-                incoming = [(in_id, weight) for (in_id, out_id, weight) in self.connections if out_id == node_id]
-                if any(in_id not in outputs for in_id, _ in incoming):
-                    unresolved = True
-                    continue
-                weighted_inputs = [outputs[in_id] * weight for in_id, weight in incoming]
-                agg = node.aggregate(weighted_inputs)
-                outputs[node_id] = node.activate(agg)
-        return outputs
-
     def __str__(self):
         return f"Genome(nodes={self.nodes}, connections={self.connections})"
 

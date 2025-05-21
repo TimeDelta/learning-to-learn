@@ -334,7 +334,7 @@ class GraphDecoder(nn.Module):
                     break
                 hidden_node = self.node_rnn(torch.zeros(hidden_node.shape[0], 0, device=device), hidden_node)
 
-                p_stop = torch.sigmoid(self.stop_head(hidden_node))
+                p_stop = torch.clamp(torch.sigmoid(self.stop_head(hidden_node)), 0.0, 1.0)
                 if torch.bernoulli(1 - p_stop).item() == 0:
                     break
                 new_node = self.node_head(hidden_node).squeeze(0)

@@ -12,6 +12,7 @@ from warnings import warn
 
 from genome import OptimizerGenome
 from genes import NODE_TYPE_TO_INDEX, NODE_TYPE_OPTIONS
+from graph_builder import *
 from metrics import *
 from models import *
 from pareto import *
@@ -85,6 +86,7 @@ class GuidedPopulation(Population):
     def generate_guided_offspring(self,
         task_type: str,
         task_features: List[np.ndarray],
+        config,
         n_offspring: int  = 10,
         latent_steps: int = 20,
         latent_lr: float  = 1e-2
@@ -97,9 +99,9 @@ class GuidedPopulation(Population):
         # 1) Get the task embedding (mu_t, lv_t) and a fixed z_t
         task_features = [np.concatenate(task_features, axis=0)]
         mu_t, lv_t = self.guide.tasks_encoder(torch.tensor([TASK_TYPE_TO_INDEX[task_type]], dtype=torch.long), task_features)
-        z_t = self.guide.reparameterize(mu_t, lv_t, self.guide.tasks_latent_mask)
+        z_t = self.guide.reparameterize(mu_t, lv_t, self.guide.tasks_latent_mask).detach()
         # expand to match the number of offspring
-        z_t = z_t.expand(n_offspring, -1).clone()   # -> (n_offspring, task_latent_dim)
+        z_t = z_t.expand(n_offspring, -1).clone()
 
         # 2) Initialize random graph latents and set requires_grad=True
         graph_latent_dim = self.guide.graph_encoder.latent_dim
@@ -108,8 +110,7 @@ class GuidedPopulation(Population):
         # 3) Optimize z_g via Adam ascent to maximize predictor(z_g, z_t)
         opt = torch.optim.Adam([z_g], lr=latent_lr)
         for _ in range(latent_steps):
-            pred = self.guide.fitness_predictor(z_g, z_t)    # -> (n_offspring, fitness_dim)
-            # scalarize: e.g. maximize sum over all dims & batch‐mean
+            pred = self.guide.fitness_predictor(z_g, z_t)
             loss = - pred.sum(dim=1).mean()
             opt.zero_grad()
             loss.backward()
@@ -117,9 +118,10 @@ class GuidedPopulation(Population):
 
         # 4) Decode each optimized latent into adjacency logits & node features
         with torch.no_grad():
-            adj_logits, feat_logits = self.guide.decode(z_g)   # → (B, max_nodes, max_nodes), (B, max_nodes, node_feat_dim)
-            # threshold edges at 0
-            edge_masks = (adj_logits > 0).cpu()
+            graphs = self.guide.decode(z_g)
+        compiled = []
+        for i, graph_dict in enumerate(graphs):
+            compiled.append(rebuild_and_script(graph_dict, self.config, key=i))
 
         # 5) Convert each decoded DAG to a NEAT genome
         new_genomes = []
@@ -193,7 +195,7 @@ class GuidedPopulation(Population):
                 num_to_make = (offspring_per_species
                                if offspring_per_species is not None
                                else len(members) - keep_per_species)
-                guided_kids = self.generate_guided_offspring(task_type, task.features, num_to_make)
+                guided_kids = self.generate_guided_offspring(task_type, task.features, self.config, num_to_make)
                 # assign predicted fitness
                 for kid in guided_kids:
                     # use surrogate to score
