@@ -116,34 +116,16 @@ class GuidedPopulation(Population):
             loss.backward()
             opt.step()
 
-        # 4) Decode each optimized latent into adjacency logits & node features
+        # 4) Decode
         with torch.no_grad():
             graphs = self.guide.decode(z_g)
-        compiled = []
-        for i, graph_dict in enumerate(graphs):
-            compiled.append(rebuild_and_script(graph_dict, self.config, key=i))
-
-        # 5) Convert each decoded DAG to a NEAT genome
         new_genomes = []
-        for i in range(n_offspring):
-            # extract adjacency & node types
-            adj = edge_masks[i].nonzero(as_tuple=False).tolist()  # list of [src, dst]
-            node_types = feat_logits[i].argmax(dim=-1).cpu().tolist()  # class per node
-
-            # build a new genome (stub—adapt to your genome constructor)
-            g = self.config.genome_type(0, self.config.genome_config)  # fresh id=0
-            # add node genes
-            for nid, ntype in enumerate(node_types):
-                g.nodes[nid] = self.config.genome_config.create_node(ntype)
-            # add connection genes
-            for src, dst in adj:
-                key = (src, dst)
-                cg = self.config.genome_config.create_connection(src, dst)
-                cg.enabled = True
-                g.connections[key] = cg
-
-            new_genomes.append(g)
-
+        for i, graph_dict in enumerate(graphs):
+            optimizer = rebuild_and_script(graph_dict, self.config.genome_config, key=i)
+            if optimizer:
+                genome = OptimizerGenome(i)
+                genome.optimizer = optimizer
+                new_genomes.append(genome)
         return new_genomes
 
     def run(self, n=None, keep_per_species=2, offspring_per_species=None):
@@ -196,16 +178,17 @@ class GuidedPopulation(Population):
                                if offspring_per_species is not None
                                else len(members) - keep_per_species)
                 guided_kids = self.generate_guided_offspring(task_type, task.features, self.config, num_to_make)
+                if len(guided_kids) == 0:
+                    warn('  No valid guided children')
                 # assign predicted fitness
                 for kid in guided_kids:
                     # use surrogate to score
-                    g, t = self.genome_to_data(kid)
-                    mu_g, lv_g = self.guide.graph_encoder(g.x_type, g.edge_index, torch.zeros(g.num_nodes, dtype=torch.long))
-                    mu_t, lv_t = self.guide.tasks_encoder([t], [[*tfeat]])
+                    data = self.genome_to_data(kid)
+                    batch = torch.zeros(data.node_types.size(0), dtype=torch.long)
+                    mu_g, lv_g = self.guide.graph_encoder(data.node_types, data.edge_index, data.node_attributes, batch)
+                    mu_t, lv_t = self.guide.tasks_encoder(torch.as_tensor([TASK_TYPE_TO_INDEX[task.name()]]), [task.features])
                     z_g = self.guide.reparameterize(mu_g, lv_g, self.guide.graph_latent_mask)
                     z_t = self.guide.reparameterize(mu_t, lv_t, self.guide.tasks_latent_mask)
-                    pred = self.guide.fitness_predictor(z_g, z_t).mean().item()
-                    kid.fitness = pred
 
                 # 3c) fill species pool
                 for g in kept + guided_kids:

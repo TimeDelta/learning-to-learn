@@ -213,7 +213,7 @@ class GraphEncoder(nn.Module):
         if len(node_attributes) > 0:
             attr_embedding = torch.stack([self.attr_encoder(attrs) for graph in node_attributes for attrs in graph], dim=0)
         else:
-            attr_embedding = torch.zeros((len(node_types), attr_encoder.out_dim))
+            attr_embedding = torch.zeros((len(node_types), self.attr_encoder.out_dim))
         x = torch.cat([type_embedding, attr_embedding], dim=-1)
         for conv in self.convs:
             x = conv(x, edge_index)
@@ -334,8 +334,9 @@ class GraphDecoder(nn.Module):
                     break
                 hidden_node = self.node_rnn(torch.zeros(hidden_node.shape[0], 0, device=device), hidden_node)
 
-                p_stop = torch.clamp(torch.sigmoid(self.stop_head(hidden_node)), 0.0, 1.0)
-                if torch.bernoulli(1 - p_stop).item() == 0:
+                # clamp for precision errors
+                p_stop = (1 - torch.sigmoid(self.stop_head(hidden_node))).clamp(0.0, 1.0)
+                if torch.bernoulli(p_stop).item() == 0:
                     break
                 new_node = self.node_head(hidden_node).squeeze(0)
                 node_embeddings.append(new_node)
@@ -624,10 +625,12 @@ class OnlineTrainer:
                     target_edges = dense_adj[i, :num_nodes, :num_nodes]
 
                     # build binary adjacency preds/targets on 0..num_nodes-1
-                    adj_pred = torch.zeros((num_nodes,num_nodes), device=self.device)
+                    no_pred_edges = True
+                    adj_pred = torch.zeros((num_nodes, num_nodes), device=self.device)
                     for s,d in pred_edges.t().tolist():
                         if s < num_nodes and d < num_nodes:
                             adj_pred[s,d] = 1.0
+                            no_pred_edges = False
                     adj_true = dense_adj[i, :num_nodes, :num_nodes]
 
                     mask = torch.triu(torch.ones_like(adj_pred), diagonal=1).bool()
