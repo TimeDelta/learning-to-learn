@@ -11,6 +11,7 @@ from computation_graphs.functions.activation import *
 from computation_graphs.functions.aggregation import *
 from genes import *
 from population import *
+from reproduction import *
 
 def create_initial_genome(config, optimizer):
     """
@@ -75,7 +76,7 @@ if __name__ == "__main__":
     from genome import OptimizerGenome
     config = neat.Config(
         OptimizerGenome,
-        neat.DefaultReproduction,
+        GuidedReproduction,
         neat.DefaultSpeciesSet,
         neat.DefaultStagnation,
         'neat-config'

@@ -140,6 +140,7 @@ class OptimizerGenome(object):
         self.fitnesses = []
         self.optimizer = None
         self.optimizer_path = None
+        self.graph_dict = None
 
     def __deepcopy__(self, memo):
         # Create a blank instance

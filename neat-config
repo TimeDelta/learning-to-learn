@@ -35,6 +35,6 @@ species_fitness_func = max
 max_stagnation       = 15
 species_elitism      = 2
 
-[DefaultReproduction]
+[GuidedReproduction]
 elitism            = 2
 survival_threshold = 0.2

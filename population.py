@@ -16,6 +16,7 @@ from graph_builder import *
 from metrics import *
 from models import *
 from pareto import *
+from reproduction import GuidedReproduction
 from search_space_compression import *
 from tasks import *
 
@@ -54,9 +55,13 @@ class GuidedPopulation(Population):
         self.guide = DAGTaskFitnessRegularizedVAE(graph_encoder, task_encoder, decoder, predictor)
         self.optimizer = torch.optim.Adam(self.guide.parameters(), lr=0.001)
         self.trainer = OnlineTrainer(self.guide, self.optimizer)
-        self.string_embedder = SentenceTransformer('all-MiniLM-L6-v2')
+        stagnation = config.stagnation_type(config.stagnation_config, self.reporters)
+        self.reproduction = GuidedReproduction(self.config, self.reporters, stagnation)
+        self.reproduction.guide_fn = self.generate_guided_offspring
 
     def genome_to_data(self, genome: OptimizerGenome):
+        if genome.graph_dict:
+            return Data(*genome.graph_dict)
         # sort by node id so positions line up
         node_ids = sorted(genome.nodes.keys())
         node_types = []
@@ -86,9 +91,10 @@ class GuidedPopulation(Population):
     def generate_guided_offspring(self,
         task_type: str,
         task_features: List[np.ndarray],
+        starting_genomes: List[OptimizerGenome],
         config,
         n_offspring: int  = 10,
-        latent_steps: int = 20,
+        latent_steps: int = 50,
         latent_lr: float  = 1e-2
     ) -> List[OptimizerGenome]:
         """
@@ -105,7 +111,32 @@ class GuidedPopulation(Population):
 
         # 2) Initialize random graph latents and set requires_grad=True
         graph_latent_dim = self.guide.graph_encoder.latent_dim
-        z_g = torch.randn((n_offspring, graph_latent_dim), requires_grad=True)
+        # encode the optimizer graphs from top half of starting_genomes then optimize, rest are cross-species
+        sorted_genomes = sorted(starting_genomes, key=lambda g: g.fitness, reverse=True)
+        num_encode = n_offspring // 2
+        top_genomes = sorted_genomes[:num_encode]
+        data_list = []
+        for g in top_genomes:
+            data_list.append(Data(
+                node_types = torch.tensor(g.graph_dict['node_types'], dtype=torch.long),
+                edge_index = torch.tensor(g.graph_dict['edge_index'], dtype=torch.long),
+                node_attributes = torch.tensor(g.graph_dict['node_attributes'], dtype=torch.float),
+            ))
+        batch = Batch.from_data_list(data_list)
+        mu_g, lv_g = self.guide.graph_encoder(
+            batch.node_types,
+            batch.edge_index,
+            batch.node_attributes,
+            batch.batch
+        )
+        z_g_encoded = self.guide.reparameterize(mu_g, lv_g, self.guide.graph_latent_mask)
+        z_g_encoded = z_g_encoded.clone().detach().requires_grad_(True)
+        num_random = n_offspring - num_encode
+        if num_random > 0:
+            z_g_random = torch.randn((num_random, graph_latent_dim), requires_grad=True)
+            z_g = torch.cat([z_g_encoded, z_g_random], dim=0)
+        else:
+            z_g = z_g_encoded
 
         # 3) Optimize z_g via Adam ascent to maximize predictor(z_g, z_t)
         opt = torch.optim.Adam([z_g], lr=latent_lr)
@@ -125,6 +156,7 @@ class GuidedPopulation(Population):
             if optimizer:
                 genome = OptimizerGenome(i)
                 genome.optimizer = optimizer
+                genome.graph_dict = graph_dict
                 new_genomes.append(genome)
         return new_genomes
 
@@ -166,33 +198,7 @@ class GuidedPopulation(Population):
 
             # 3) Build next‐gen population by species
             new_pop = {}
-            for species in self.species.species.values():
-                members = species.members
-                # sort descending by real fitness
-                sorted_members = sorted(members, key=lambda g: self.population[g].fitness, reverse=True)
-                # 3a) keep top N
-                kept = sorted_members[:keep_per_species]
-
-                # 3b) generate guided children
-                num_to_make = (offspring_per_species
-                               if offspring_per_species is not None
-                               else len(members) - keep_per_species)
-                guided_kids = self.generate_guided_offspring(task_type, task.features, self.config, num_to_make)
-                if len(guided_kids) == 0:
-                    warn('  No valid guided children')
-                # assign predicted fitness
-                for kid in guided_kids:
-                    # use surrogate to score
-                    data = self.genome_to_data(kid)
-                    batch = torch.zeros(data.node_types.size(0), dtype=torch.long)
-                    mu_g, lv_g = self.guide.graph_encoder(data.node_types, data.edge_index, data.node_attributes, batch)
-                    mu_t, lv_t = self.guide.tasks_encoder(torch.as_tensor([TASK_TYPE_TO_INDEX[task.name()]]), [task.features])
-                    z_g = self.guide.reparameterize(mu_g, lv_g, self.guide.graph_latent_mask)
-                    z_t = self.guide.reparameterize(mu_t, lv_t, self.guide.tasks_latent_mask)
-
-                # 3c) fill species pool
-                for g in kept + guided_kids:
-                    new_pop[g.key] = g
+            std_offspring = self.reproduction.reproduce(self.config, self.species, self.config.pop_size, self.generation, task)
 
             # 4) Replace population & re‐speciate
             self.population = new_pop
