@@ -2,7 +2,8 @@ from neat.population import Population
 from sentence_transformers import SentenceTransformer
 import torch
 import torch.nn.functional as F
-from torch_geometric.data import Data
+from torch_geometric.data import Data, Batch
+from torch_geometric.loader import DataLoader
 
 import random
 import time
@@ -56,7 +57,7 @@ class GuidedPopulation(Population):
         self.optimizer = torch.optim.Adam(self.guide.parameters(), lr=0.001)
         self.trainer = OnlineTrainer(self.guide, self.optimizer)
         stagnation = config.stagnation_type(config.stagnation_config, self.reporters)
-        self.reproduction = GuidedReproduction(self.config, self.reporters, stagnation)
+        self.reproduction = GuidedReproduction(config.reproduction_config, self.reporters, stagnation)
         self.reproduction.guide_fn = self.generate_guided_offspring
 
     def genome_to_data(self, genome: OptimizerGenome):
@@ -86,6 +87,11 @@ class GuidedPopulation(Population):
             edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
         else:
             edge_index = torch.empty((2, 0), dtype=torch.long)
+        genome.graph_dict = {
+            'node_types': node_types,
+            'edge_index': edge_index,
+            'node_attributes': node_attributes
+        }
         return Data(node_types=node_types, edge_index=edge_index, node_attributes=node_attributes)
 
     def generate_guided_offspring(self,
@@ -118,9 +124,9 @@ class GuidedPopulation(Population):
         data_list = []
         for g in top_genomes:
             data_list.append(Data(
-                node_types = torch.tensor(g.graph_dict['node_types'], dtype=torch.long),
-                edge_index = torch.tensor(g.graph_dict['edge_index'], dtype=torch.long),
-                node_attributes = torch.tensor(g.graph_dict['node_attributes'], dtype=torch.float),
+                node_types = g.graph_dict['node_types'].clone().detach().long(),
+                edge_index = g.graph_dict['edge_index'].clone().detach().long(),
+                node_attributes = g.graph_dict['node_attributes'],
             ))
         batch = Batch.from_data_list(data_list)
         mu_g, lv_g = self.guide.graph_encoder(
@@ -134,7 +140,7 @@ class GuidedPopulation(Population):
         num_random = n_offspring - num_encode
         if num_random > 0:
             z_g_random = torch.randn((num_random, graph_latent_dim), requires_grad=True)
-            z_g = torch.cat([z_g_encoded, z_g_random], dim=0)
+            z_g = torch.cat([z_g_encoded, z_g_random], dim=0).clone().detach().requires_grad_(True)
         else:
             z_g = z_g_encoded
 

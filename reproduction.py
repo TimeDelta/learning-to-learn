@@ -1,5 +1,8 @@
 import numpy as np
 
+import math
+import random
+
 from neat.config import *
 from neat.reproduction import DefaultReproduction
 
@@ -67,6 +70,7 @@ class GuidedReproduction(DefaultReproduction):
         spawn_amounts = self.compute_spawn(adjusted_fitnesses, previous_sizes, pop_size, min_species_size)
 
         species.species = {}
+        new_population = {}
         for spawn, s in zip(spawn_amounts, remaining_species):
             spawn = max(spawn, self.reproduction_config.elitism)
             old_members = sorted(s.members.items(), key=lambda item: item[1].fitness, reverse=True)
