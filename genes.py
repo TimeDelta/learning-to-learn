@@ -81,20 +81,21 @@ class NodeGene(BaseGene):
         if random.random() < config.attribute_add_prob:
             r = random.random()
             if r <= .25:
-                attr = BoolAttribute(generate_random_string(5)).init_value(config)
+                attr = BoolAttribute(generate_random_string(5))
             elif r <= .5:
-                attr = IntAttribute(generate_random_string(5)).init_value(config)
+                attr = IntAttribute(generate_random_string(5))
             elif r <= .75:
-                attr = FloatAttribute(generate_random_string(5)).init_value(config)
+                attr = FloatAttribute(generate_random_string(5))
             else:
-                attr = StringAttribute(generate_random_string(5), options=','.join(ATTRIBUTE_NAMES)).init_value(config)
+                attr = StringAttribute(generate_random_string(5), options=','.join(ATTRIBUTE_NAMES))
+            print(attr)
             self.add_attribute(attr, config)
 
         if len(self.dynamic_attributes) > 0 and random.random() < config.attribute_delete_prob:
             to_remove = random.choice(list(self.dynamic_attributes.keys()))
             self.remove_attribute(to_remove)
 
-    def add_attribute(self, attr: BaseAttribute, config):
+    def add_attribute(self, attr:BaseAttribute, config):
         """Add a new attribute to this gene at runtime."""
         self.dynamic_attributes[attr] = attr.init_value(config)
 
