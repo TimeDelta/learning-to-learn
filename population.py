@@ -1,5 +1,4 @@
 from neat.population import Population
-from sentence_transformers import SentenceTransformer
 import torch
 import torch.nn.functional as F
 from torch_geometric.data import Data, Batch
@@ -53,7 +52,7 @@ class GuidedPopulation(Population):
             fitness_dim=fitness_dim
         )
 
-        self.guide = DAGTaskFitnessRegularizedVAE(graph_encoder, task_encoder, decoder, predictor)
+        self.guide = SelfCompressingFitnessRegularizedDAGVAE(graph_encoder, task_encoder, decoder, predictor)
         self.optimizer = torch.optim.Adam(self.guide.parameters(), lr=0.001)
         self.trainer = OnlineTrainer(self.guide, self.optimizer)
         stagnation = config.stagnation_type(config.stagnation_config, self.reporters)

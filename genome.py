@@ -11,7 +11,7 @@ from neat.config import ConfigParameter, write_pretty_params
 from neat.graphs import creates_cycle
 from neat.graphs import required_for_output
 
-from attributes import BaseAttribute, BoolAttribute, StringAttribute, FloatAttribute, IntAttribute
+from attributes import BoolAttribute, StringAttribute, FloatAttribute, IntAttribute
 from genes import NodeGene, ConnectionGene
 
 class OptimizerGenomeConfig(object):
@@ -26,6 +26,12 @@ class OptimizerGenomeConfig(object):
         self._params = [
             ConfigParameter('compatibility_disjoint_coefficient', float),
             ConfigParameter('compatibility_weight_coefficient', float),
+            ConfigParameter('attribute_add_prob', float),
+            ConfigParameter('attribute_delete_prob', float),
+            ConfigParameter('conn_add_prob', float),
+            ConfigParameter('conn_delete_prob', float),
+            ConfigParameter('node_add_prob', float),
+            ConfigParameter('node_delete_prob', float),
             ConfigParameter('single_structural_mutation', bool, 'false'),
             ConfigParameter('structural_mutation_surer', str, 'default'),
         ]
@@ -110,8 +116,8 @@ class OptimizerGenome(object):
 
     Design assumptions and conventions.
         1. Each output pin is connected only to the output of its own unique
-           neuron by an implicit connection with weight one. This connection
-           is permanently enabled.
+           neuron by an implicit connection. This connection is permanently
+           enabled.
         2. The output pin's key is always the same as the key for its
            associated neuron.
         3. Output neurons can be modified but not deleted.
@@ -194,13 +200,65 @@ class OptimizerGenome(object):
                 self.nodes[key] = ng1.crossover(ng2)
 
     def mutate(self, config):
-        raise Exception()
+        """ Mutates this genome. """
+
+        if config.single_structural_mutation:
+            div = max(1, (config.node_add_prob + config.node_delete_prob +
+                          config.conn_add_prob + config.conn_delete_prob))
+            r = random()
+            if r < (config.node_add_prob / div):
+                self.mutate_add_node(config)
+            elif r < ((config.node_add_prob + config.node_delete_prob) / div):
+                self.mutate_delete_node(config)
+            elif r < ((config.node_add_prob + config.node_delete_prob +
+                       config.conn_add_prob) / div):
+                self.mutate_add_connection(config)
+            elif r < ((config.node_add_prob + config.node_delete_prob +
+                       config.conn_add_prob + config.conn_delete_prob) / div):
+                self.mutate_delete_connection()
+        else:
+            if random() < config.node_add_prob:
+                self.mutate_add_node(config)
+
+            if random() < config.node_delete_prob:
+                self.mutate_delete_node(config)
+
+            if random() < config.conn_add_prob:
+                self.mutate_add_connection(config)
+
+            if random() < config.conn_delete_prob:
+                self.mutate_delete_connection()
+
+        # Mutate connection genes.
+        for cg in self.connections.values():
+            cg.mutate(config)
+
+        # Mutate node genes (bias, response, etc.).
+        for ng in self.nodes.values():
+            ng.mutate(config)
 
     def mutate_add_node(self, config):
-        raise Exception()
+        if not self.connections:
+            if config.check_structural_mutation_surer():
+                self.mutate_add_connection(config)
+            return
+
+        # Choose a random connection to split
+        conn_to_split = choice(list(self.connections.values()))
+        new_node_id = config.get_new_node_key(self.nodes)
+        ng = self.create_node(config, new_node_id)
+        self.nodes[new_node_id] = ng
+
+        # Disable this connection and create two new connections joining its nodes via
+        # the given node.  The new node+connections have roughly the same behavior as
+        # the original connection (depending on the activation function of the new node).
+        conn_to_split.enabled = False
+
+        i, o = conn_to_split.key
+        self.add_connection(config, i, new_node_id, True)
+        self.add_connection(config, new_node_id, o, True)
 
     def add_connection(self, config, input_key, output_key, enabled):
-        # TODO: Add further validation of this connection addition?
         assert isinstance(input_key, int)
         assert isinstance(output_key, int)
         assert output_key >= 0
@@ -212,13 +270,62 @@ class OptimizerGenome(object):
         self.connections[key] = connection
 
     def mutate_add_connection(self, config):
-        raise Exception()
+        """
+        Attempt to add a new connection, the only restriction being that the output
+        node cannot be one of the network input pins.
+        """
+        possible_outputs = list(self.nodes)
+        out_node = choice(possible_outputs)
+
+        possible_inputs = possible_outputs + config.input_keys
+        in_node = choice(possible_inputs)
+
+        # Don't duplicate connections.
+        key = (in_node, out_node)
+        if key in self.connections:
+            # TODO: Should this be using mutation to/from rates? Hairy to configure...
+            if config.check_structural_mutation_surer():
+                self.connections[key].enabled = True
+            return
+
+        # Don't allow connections between two output nodes
+        if in_node in config.output_keys and out_node in config.output_keys:
+            return
+
+        # No need to check for connections between input nodes:
+        # they cannot be the output end of a connection (see above).
+
+        # For feed-forward networks, avoid creating cycles.
+        # if config.feed_forward and creates_cycle(list(self.connections), key):
+        #     return
+
+        cg = self.create_connection(config, in_node, out_node)
+        self.connections[cg.key] = cg
 
     def mutate_delete_node(self, config):
-        raise Exception()
+        # Do nothing if there are no non-output nodes.
+        available_nodes = [k for k in self.nodes if k not in config.output_keys]
+        if not available_nodes:
+            return -1
+
+        del_key = choice(available_nodes)
+
+        connections_to_delete = set()
+        for k, v in self.connections.items():
+            if del_key in v.key:
+                connections_to_delete.add(v.key)
+
+        for key in connections_to_delete:
+            del self.connections[key]
+
+        del self.nodes[del_key]
+
+        return del_key
 
     def mutate_delete_connection(self):
-        raise Exception()
+        if self.connections:
+            key = choice(list(self.connections.keys()))
+            del self.connections[key]
 
     def distance(self, other, config):
         """

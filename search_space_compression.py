@@ -448,7 +448,7 @@ class FitnessPredictor(nn.Module):
         self.fc1 = prune_lin(self.fc1)
 
 
-class DAGTaskFitnessRegularizedVAE(nn.Module):
+class SelfCompressingFitnessRegularizedDAGVAE(nn.Module):
     """
     DAG-VAE with ARD prior that is regularized by fitness prediction from latent and has
     latent-mask for dynamic pruning.
@@ -560,7 +560,7 @@ class OnlineTrainer:
     Incremental trainer with ARD-KL + loss-thresholded iterative pruning,
     supporting variable node-feature dimensions via list-of-graphs decoding.
     """
-    def __init__(self, model: DAGTaskFitnessRegularizedVAE, optimizer, fitness_key_ordering=[]):
+    def __init__(self, model: SelfCompressingFitnessRegularizedDAGVAE, optimizer, fitness_key_ordering=[]):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = model.to(self.device)
         self.optimizer = optimizer
@@ -759,7 +759,7 @@ if __name__ == "__main__":
     task_encoder = TasksEncoder(hidden_dim=16, latent_dim=task_latent_dim, type_embedding_dim=8)
     decoder = GraphDecoder(num_node_types, graph_latent_dim, shared_attr_vocab)
     predictor = FitnessPredictor(latent_dim=graph_latent_dim+task_latent_dim, hidden_dim=64, fitness_dim=fitness_dim)
-    model = DAGTaskFitnessRegularizedVAE(graph_encoder, task_encoder, decoder, predictor)
+    model = SelfCompressingFitnessRegularizedDAGVAE(graph_encoder, task_encoder, decoder, predictor)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
     # Synthetic DAG generator
