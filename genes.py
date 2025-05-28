@@ -1,6 +1,6 @@
 from neat.attributes import BaseAttribute
 from neat.genes import BaseGene
-from typing import Dict
+from typing import Dict, Tuple
 import torch
 
 import random
@@ -45,8 +45,9 @@ class NodeGene(BaseGene):
     ]
 
     def __init__(self, node_id: int, node: torch._C.Node=None):
+        super().__init__(node_id)
         self.dynamic_attributes = {}
-        if node:
+        if node is not None:
             self.node_type = node.kind()
             for attribute_name in node.attributeNames():
                 attribute_type = node.kindOf(attribute_name)
@@ -60,16 +61,21 @@ class NodeGene(BaseGene):
                     attribute = StringAttribute(attribute_name, options=','.join(ATTRIBUTE_NAMES))
                     self.dynamic_attributes[attribute] = node.s(attribute_name)
                 else:
-                    warn(f'WARNING: Unknown attribute type for node [{node}]: {attribute_type}')
+                    warn(f'Unknown attribute type for node [{node}]: {attribute_type}')
                 ATTRIBUTE_NAMES.add(attribute_name)
                 if not self.dynamic_attributes[attribute]:
                     warn(f'Missing value for ' + str(attribute))
+            self.num_outputs = len(list(node.outputs()))
+            self.output_debug_names = [o.debugName() for o in node.outputs()]
+            self.scope = node.scopeName()
         else:
+            # placeholder for non-TORCH-NODE instantiation
             self.node_type = None
+            self.num_outputs = 0
+            self.output_debug_names = []
+            self.scope = ''
 
-        # DEBUG: see *this* gene's attrs, not the global set
-        print(f"NodeGene {node_id} attrs:", self.dynamic_attributes)
-        super().__init__(node_id)
+        print(f"NodeGene {node_id} kind={self.node_type}, outputs={self.num_outputs}, attrs={self.dynamic_attributes}")
 
     def mutate(self, config):
         if random.random() < config.attribute_add_prob:
@@ -109,18 +115,18 @@ class NodeGene(BaseGene):
 
         return d * config.compatibility_weight_coefficient
 
-    def crossover(self, gene2):
+    def crossover(self, other):
         """ Creates a new gene randomly inheriting attributes from its parents."""
-        assert self.key == gene2.key
+        assert self.key == other.key
 
         # Note: we use "a if random() > 0.5 else b" instead of choice((a, b))
         # here because `choice` is substantially slower.
         new_gene = self.__class__(self.key)
         for a in self.dynamic_attributes:
-            if a not in gene2.dynamic_attributes.keys() or random.random() > 0.5:
+            if a not in other.dynamic_attributes.keys() or random.random() > 0.5:
                 new_gene.dynamic_attributes[a] = self.dynamic_attributes[a]
-            elif hasattr(gene2, a.name):
-                new_gene.dynamic_attributes[a] = gene2.dynamic_attributes[a]
+            elif hasattr(other, a.name):
+                new_gene.dynamic_attributes[a] = other.dynamic_attributes[a]
             else:
                 new_gene.dynamic_attributes[name] = other.dynamic_attributes[name]
         return new_gene
@@ -133,20 +139,32 @@ class ConnectionGene(BaseGene):
         BoolAttribute('enabled'),
     ]
 
-    def __init__(self, key):
-        assert isinstance(key, tuple), f"ConnectionGene key must be a tuple, not {key!r}"
-        BaseGene.__init__(self, key)
+    def __init__(self, key:Tuple[int,int], src_out_idx:int=0, dst_in_idx:int=0, param_name:str=None):
+        super().__init__(key)
         self.enabled = True
         self.innovation = 0
 
+        # new metadata
+        self.src_out_idx = src_out_idx
+        self.dst_in_idx = dst_in_idx
+        self.param_name = param_name
+
     def copy(self):
-        new_conn = ConnectionGene(self.key)
+        new_conn = ConnectionGene(
+            self.key,
+            src_out_idx=self.src_out_idx,
+            dst_in_idx=self.dst_in_idx,
+            param_name=self.param_name
+        )
         new_conn.enabled = self.enabled
         new_conn.innovation = self.innovation
         return new_conn
 
     def __str__(self):
-        return (f"TSConnectionGene(in_node={self.in_node}, out_node={self.out_node}, enabled={self.enabled}, innovation={self.innovation})")
+        return (f"ConnectionGene(in={self.in_node}[out{self.src_out_idx}], "
+                f"out={self.out_node}[in{self.dst_in_idx}], "
+                f"enabled={self.enabled}, innov={self.innovation}, "
+                f"param={self.param_name})")
 
     def distance(self, other, config):
         d = 0.0
