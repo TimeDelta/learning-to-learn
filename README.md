@@ -151,7 +151,35 @@ According to [43](#references), blurred boundary continual learning is when the 
 
 ## Proposed Solution
 ### MVP
+#### Multi-Objective Fitness (Pareto Optimization)
+
+A central innovation is the use of **Pareto-based multi-objective optimization** for evaluating and selecting candidate networks. Each network (or "individual") in the population is evaluated on multiple objectives rather than a single metric. One set of objectives reflect task-specific performance and another reflects computational cost. Instead of combining these objectives into a single weighted fitness score, the algorithm employs **Pareto ranking** via non-dominated sorting: an individual is considered fitter if it is *Pareto-superior*-that is, better in at least one objective without being worse in any other-compared to others in the population ([53](#references)).
+
+Using Pareto-based selection yields a diverse **Pareto front** of solutions, each representing a different balance of objectives (for example, one network might be extremely simple but moderately accurate, while another is more complex but achieves higher accuracy). This approach has several advantages for evolving learning systems:
+
+* **Robust, Generalizable Solutions:** Multi-objective evolution tends to produce more robust models than optimizing a single metric. The algorithm doesn't commit to one arbitrary trade-off; instead, it preserves a spectrum of high-performing solutions. Researchers can then analyze this Pareto front for insights into how different architectures trade off performance vs. complexity ([53](#references)).
+* **Favoring Minimal Architectures:** By explicitly treating computational cost as an objective to minimize, the evolution **naturally favors minimal efficient networks** that align with the Minimum Description principle-the best solution is the simplest one that explains the data ([55](#references)). The smallest networks that still perform well can be seen as **minimum description estimates (MDEs)** of the task. These MDEs are not just efficient; they are also scientifically interpretable, as they highlight the core components necessary to implement a given function or behavior.
+* **No Manual Tuning of Trade-offs:** Pareto ranking removes the need to hand-tune weights between objectives (such as how much to penalize complexity). Instead of a single "optimal" network according to a weighted sum, set of Pareto-optimal networks is obtained that captures different compromises. This is especially useful in research contexts, where one might prefer simpler models for interpretation unless complexity is absolutely required for performance ([53](#references)).
+
+In summary, multi-objective evolutionary selection ensures that the project optimizes not only for how well a network learns, but also for how elegant or tractable its design is. This keeps the search grounded, preventing bloated solutions and steering evolution toward general-purpose networks that are both **high-performing and low-complexity**.
+
+#### Generative Cross-Species Crossover (Graph-VAE)
+
+Another key innovation is a Variational Autoencoder (VAE) that enables unrestricted structural recombination of neural network architectures. Traditional neuroevolution methods like NEAT use crossover within the same "species" of networks and rely on aligning genes (nodes and connections) based on historical markers to recombine two parents. Those methods struggle to recombine vastly different topologies because the correspondence between parts of two very different networks is ambiguous. The approach addresses this by **learning a continuous encoding of network graphs**, allowing any two networks-even of entirely different designs-to **mate** in a meaningful way ([54](#references)).
+
+The implemented module (called *SelfCompressingFitnessRegularizedDAGVAE*, in `search_space_compression.py`) acts as a **generative recombination mechanism** or a "cross-species mating system" for networks:
+
+* **Graph Encoding and Decoding:** The VAE is trained to take arbitrary computation graphs and encode them into a continuous latent vector space. It can then decode a latent vector back into a network graph. This provides a common representation for all networks, regardless of their topology ([54](#references)).
+* **Fitness-Regularized Compression:** The VAE's training is not just a standard graph autoencoding. It is **regularized with fitness prediction**: part of the VAE's objective is to predict the network's performance and complexity from the latent encoding. This means the VAE is encouraged to organize the latent space such that important features (those that correlate with high fitness) are captured in the representation. Dimensions of the latent vector that do not contribute to explaining variation in performance tend to be pruned out automatically (using techniques like Automatic Relevance Determination). The result is a compressed, fitness-informed search space: a smooth landscape where distances reflect meaningful differences in network capability.
+* **Cross-Species Mating via Latent Interpolation:** Once networks are encoded in this latent space, **any two networks** can be recombined by interpolating or randomly mixing their latent vectors and then decoding the result. In other words, the VAE enables **cross-species crossover**-two parent networks from entirely different niches or architectures can produce an offspring network. This generative crossover bypasses the historical gene-matching problem that NEAT faced without needing to explicitly align nodes or connections between parents.
+* **Sharing Innovations Across Lineages:** This mechanism effectively breaks down barriers between separate evolutionary lineages. Useful innovations that arise in one species can be transferred to very different architectures. Because a portion of each generation's offspring are generated via latent-space recombination, **new architectures can emerge that combine traits from wildly different ancestors**. This helps inject novel structural patterns that pure mutation or traditional crossover (limited to similar parents) might never produce.
+* **Expanded Exploration with Guided Search:** The VAE-driven crossover significantly **expands the exploration** of the search space while still being guided towards promising regions (due to the fitness-informed latent space). It serves as a kind of **surrogate model** that directs evolution: by sampling in latent space, it effectively samples networks that are expected to be high-performing or at least valid. This compresses the combinatorially vast search space of all possible networks into a more tractable form. The net effect is **increased diversity** of candidate solutions and the ability to discover innovative network motifs that conventional genetic operators might miss ([54](#references)).
+
+Importantly, the evolutionary algorithm **combines** this Graph-VAE crossover with more traditional NEAT-style mating within species. In practice, this means there are two crossover pathways: (1) standard crossover between similar individuals (preserving fine-tuned structures within a species), and (2) occasional **graph-VAE generated offspring** that mix across species. This balance ensures both **exploitation and exploration**: the population can refine known good solutions while still injecting radically new variations.
+
+### Final State
 - Discrete time
+  - Continuous Time - **Is it worth it? How can the modulatory effects be incorporated into the differential equations and the solver?**
 - Borrowing from spiking neural networks, we include a firing policy for every node that determines whether or not it should fire given it’s activation value and any internal state the policy maintains
   - Firing policy flexibility (always fire, threshold, decay, random, etc) allows a dimension for tradeoff between spatial (memory-based) and temporal processing
     - See section “1. Neural variability shapes learning, but is often inflexible” in [37](#references) for justification of including random firing policy. In short, it is because behavioral variability during learning is a key part of exploring the reward space.
@@ -174,12 +202,6 @@ According to [43](#references), blurred boundary continual learning is when the 
     - Change input / output node mapping to data / meaning
       - Number of necessary IO nodes is different per task
       - Allows for tradeoff between time and memory costs in scalability of input / output sizes (like a saccade)
-- Use an evolutionary algorithm (variant of NEAT) to find the final starting point for the learning algorithm / model combination
-  - Incorporate time cost and memory cost into the fitness function
-    - e.g. for each task, a\*score + b/normalized_mem_cost + c/normalized_time_cost, where a+b+c=1 w/ d weight on area under this curve when plotted over each training iteration and e weight given to the value over the test set, where d+e=1 and take the "macro" mean (equal weight to every task).
-      - Scoring metric is defined separately for each task.
-      - This adds competing evolutionary pressures. One to generalize to unseen data (test set fitness) and another to quickly learn or memorize (area under training curve) with the ability to change each factor’s relative importance
-    - This also adds pressure to compress the behavioral dynamics across time and memory
   - Start with multiple initial populations (1 per part of the optimization process: losses, model arch, credit assignment, optimizer, etc.)
     - Each species would start from an implementation of existing algorithms ([details](#initial-populations))
       - Can generate computation graphs from open source code using PyTorch's TorchScript
@@ -189,7 +211,6 @@ According to [43](#references), blurred boundary continual learning is when the 
     - Fitness for each member is then aggregated across evaluated combinations
     - Look for gene combinations common to high performing individuals in species to find useful things to propagate across species
     - Use a boolean on each new species that prevents it from full collapse for the first X generations (minimum population of Y) to ensure time for innovation
-  - Surrogate-Assisted Evolution (Guided Search): To accelerate the search through this combinatorially increasing space, a Self-Compressing Directed Acyclic Graph Variational Autoencoder (SCDAGVAE) is integrated into the evolutionary loop that uses the continuous latent representation to predict well performing DAGs based on all those seen so far and their associated fitnesses. The SCDAGVAE is regularized by the MSE of the predictive model that estimates fitness from the latent code. This allows performing guided offspring generation by optimizing the metrics over the latent space then decoding. Specifically, each generation, half of the offspring are produced by standard genetic operations (mutation/crossover on the individuals’ graphs), and the other half are generated by latent space optimization. The use of both guided and unguided offspring balances exploitation and exploration. By guiding evolution with a model that learns the landscape of the search space, better solutions can be found with fewer evaluations.
 - To allow for reinforcement, supervised and unsupervised learning in the same network, there will be at least five special input nodes (likely more). One will represent reward for reinforcement learning. For each output node, include an extra input node for that node’s loss (minimum of one node). The remaining three in the minimum set are to signify which of these learning types should be used.
 - Set aside a held out data set (equal distribution across every task) to ensure generalization of final learner
 - Basic reinforcement learning tasks necessary for a cognitive map of task space [38](#references)
@@ -216,17 +237,10 @@ According to [43](#references), blurred boundary continual learning is when the 
     - Dimensions of each data type
   - Document embedding of task description in natural language
     - Might be better to allow it to "define its own embedding" by using the dynamic input mapping
-
-### Final State
-- Continuous Time - **Is it worth it? How can the modulatory effects be incorporated into the differential equations and the solver?**
 - Models are able to determine their own training set of a given size (task only, not example) but are not allowed to choose any of the tasks in the evaluation metric for the current generation or any of the locked tasks
   - Task choice should be based on task embedding (ask the model to spit out a task embedding it’s looking for and find most similar task, give random example)
   - Forcing different tasks in the test set will put extra pressure on the model to determine how to best generalize and be sample efficient
   - Will require adding an additional input node to say what task to choose next as well as multiple output nodes to determine task embedding
-
-### Choosing Base Evolutionary Algorithm
-- NEAT [4](#references)
-  - Remove the bias toward smaller structures since it is supplanted by the use of the inverse normalized time and memory costs in the fitness function.
 
 ### Initial Populations
 #### Model Architectures
@@ -379,6 +393,8 @@ According to [43](#references), blurred boundary continual learning is when the 
   - Like RNA inside exosomes not neuromodulation
 - Augment the input data of an example every successive time it is used in order to help prevent memorization - would need to find a modality / task / etc - independent method that won’t change the semantic meaning of the input data or would have to specialize the augmentation per modality or task
 
+---
+
 ## References
 1. [An Empirical Review of Automated Machine Learning](https://www.mdpi.com/2073-431X/10/1/11#sec3-computers-10-00011)
 2. [AutoML: A survey of the state-of-the-art](https://arxiv.org/pdf/1908.00709.pdf?arxiv.org)
@@ -432,3 +448,6 @@ According to [43](#references), blurred boundary continual learning is when the 
 50. [Brain-inspired learning in artificial neural networks: a review](https://arxiv.org/pdf/2305.11252.pdf)
 51. [There's Plenty of Room Right Here: Biological Systems as Evolved, Overloaded, Multi-scale Machines](https://arxiv.org/abs/2212.10675)
 52. [Universal Mechanical Polycomputation in Granular Matter](https://arxiv.org/pdf/2305.17872.pdf)
+53. [A Fast and Elitist Multiobjective Genetic Algorithm: NSGA-II](https://sci2s.ugr.es/sites/default/files/files/Teaching/OtherPostGraduateCourses/Metaheuristicas/Deb_NSGAII.pdf)
+54. [GraphVAE: Towards Generation of Small Graphs Using Variational Autoencoders](https://arxiv.org/pdf/1802.03480.pdf)
+55. [Modeling by shortest data description](https://doi.org/10.1016/0005-1098(78)90005-5)
