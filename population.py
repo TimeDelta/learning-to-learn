@@ -1,17 +1,17 @@
-from neat.population import Population
-import torch
-import torch.nn.functional as F
-from torch_geometric.data import Data, Batch
-from torch_geometric.loader import DataLoader
-
 import random
 import time
 import tracemalloc
 from typing import List
 from warnings import warn
 
+import torch
+import torch.nn.functional as F
+from neat.population import Population
+from torch_geometric.data import Batch, Data
+from torch_geometric.loader import DataLoader
+
+from genes import NODE_TYPE_OPTIONS, NODE_TYPE_TO_INDEX
 from genome import OptimizerGenome
-from genes import NODE_TYPE_TO_INDEX, NODE_TYPE_OPTIONS
 from graph_builder import *
 from metrics import *
 from models import *
@@ -30,26 +30,17 @@ class GuidedPopulation(Population):
         fitness_dim = 4
         self.shared_attr_vocab = SharedAttributeVocab([], 5)
         attr_encoder = NodeAttributeDeepSetEncoder(
-            self.shared_attr_vocab,
-            encoder_hdim=10,
-            aggregator_hdim=20,
-            out_dim=50)
+            self.shared_attr_vocab, encoder_hdim=10, aggregator_hdim=20, out_dim=50
+        )
         graph_encoder = GraphEncoder(
-            len(NODE_TYPE_OPTIONS),
-            attr_encoder,
-            latent_dim=graph_latent_dim,
-            hidden_dims=[32, 32]
+            len(NODE_TYPE_OPTIONS), attr_encoder, latent_dim=graph_latent_dim, hidden_dims=[32, 32]
         )
         task_encoder = TasksEncoder(
-            hidden_dim=16,
-            latent_dim=task_latent_dim,
-            type_embedding_dim=max(len(TASK_FEATURE_DIMS)//2, 1)
+            hidden_dim=16, latent_dim=task_latent_dim, type_embedding_dim=max(len(TASK_FEATURE_DIMS) // 2, 1)
         )
         decoder = GraphDecoder(len(NODE_TYPE_OPTIONS), graph_latent_dim, self.shared_attr_vocab)
         predictor = FitnessPredictor(
-            latent_dim=graph_latent_dim+task_latent_dim,
-            hidden_dim=64,
-            fitness_dim=fitness_dim
+            latent_dim=graph_latent_dim + task_latent_dim, hidden_dim=64, fitness_dim=fitness_dim
         )
 
         self.guide = SelfCompressingFitnessRegularizedDAGVAE(graph_encoder, task_encoder, decoder, predictor)
@@ -86,21 +77,18 @@ class GuidedPopulation(Population):
             edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
         else:
             edge_index = torch.empty((2, 0), dtype=torch.long)
-        genome.graph_dict = {
-            'node_types': node_types,
-            'edge_index': edge_index,
-            'node_attributes': node_attributes
-        }
+        genome.graph_dict = {"node_types": node_types, "edge_index": edge_index, "node_attributes": node_attributes}
         return Data(node_types=node_types, edge_index=edge_index, node_attributes=node_attributes)
 
-    def generate_guided_offspring(self,
+    def generate_guided_offspring(
+        self,
         task_type: str,
         task_features: List[np.ndarray],
         starting_genomes: List[OptimizerGenome],
         config,
-        n_offspring: int  = 10,
+        n_offspring: int = 10,
         latent_steps: int = 50,
-        latent_lr: float  = 1e-2
+        latent_lr: float = 1e-2,
     ) -> List[OptimizerGenome]:
         """
         For a fixed (task_type, task_features), optimize `z_g` in latent space to maximize
@@ -109,7 +97,9 @@ class GuidedPopulation(Population):
         """
         # 1) Get the task embedding (mu_t, lv_t) and a fixed z_t
         task_features = [np.concatenate(task_features, axis=0)]
-        mu_t, lv_t = self.guide.tasks_encoder(torch.tensor([TASK_TYPE_TO_INDEX[task_type]], dtype=torch.long), task_features)
+        mu_t, lv_t = self.guide.tasks_encoder(
+            torch.tensor([TASK_TYPE_TO_INDEX[task_type]], dtype=torch.long), task_features
+        )
         z_t = self.guide.reparameterize(mu_t, lv_t, self.guide.tasks_latent_mask).detach()
         # expand to match the number of offspring
         z_t = z_t.expand(n_offspring, -1).clone()
@@ -122,18 +112,15 @@ class GuidedPopulation(Population):
         top_genomes = sorted_genomes[:num_encode]
         data_list = []
         for g in top_genomes:
-            data_list.append(Data(
-                node_types = g.graph_dict['node_types'].clone().detach().long(),
-                edge_index = g.graph_dict['edge_index'].clone().detach().long(),
-                node_attributes = g.graph_dict['node_attributes'],
-            ))
+            data_list.append(
+                Data(
+                    node_types=g.graph_dict["node_types"].clone().detach().long(),
+                    edge_index=g.graph_dict["edge_index"].clone().detach().long(),
+                    node_attributes=g.graph_dict["node_attributes"],
+                )
+            )
         batch = Batch.from_data_list(data_list)
-        mu_g, lv_g = self.guide.graph_encoder(
-            batch.node_types,
-            batch.edge_index,
-            batch.node_attributes,
-            batch.batch
-        )
+        mu_g, lv_g = self.guide.graph_encoder(batch.node_types, batch.edge_index, batch.node_attributes, batch.batch)
         z_g_encoded = self.guide.reparameterize(mu_g, lv_g, self.guide.graph_latent_mask)
         z_g_encoded = z_g_encoded.clone().detach().requires_grad_(True)
         num_random = n_offspring - num_encode
@@ -147,7 +134,7 @@ class GuidedPopulation(Population):
         opt = torch.optim.Adam([z_g], lr=latent_lr)
         for _ in range(latent_steps):
             pred = self.guide.fitness_predictor(z_g, z_t)
-            loss = - pred.sum(dim=1).mean()
+            loss = -pred.sum(dim=1).mean()
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -184,8 +171,8 @@ class GuidedPopulation(Population):
             task = TASK_TYPE_TO_CLASS[task_type].random_init()
 
             # 1) Evaluate real fitness
-            print(f'Evaluating genomes on {task.name()}')
-            self.eval_genomes(list(self.population.items()), self.config, task, steps=2*generation)
+            print(f"Evaluating genomes on {task.name()}")
+            self.eval_genomes(list(self.population.items()), self.config, task, steps=2 * generation)
 
             # 2) Train surrogate on all evaluated genomes
             graphs, fits = [], []
@@ -203,7 +190,9 @@ class GuidedPopulation(Population):
 
             # 3) Build next‐gen population by species
             new_pop = {}
-            std_offspring = self.reproduction.reproduce(self.config, self.species, self.config.pop_size, self.generation, task)
+            std_offspring = self.reproduction.reproduce(
+                self.config, self.species, self.config.pop_size, self.generation, task
+            )
 
             # 4) Replace population & re‐speciate
             self.population = new_pop
@@ -246,20 +235,24 @@ class GuidedPopulation(Population):
         for genome_id, genome in genomes:
             model_copy = type(model)(task.train_data.num_input_features)
             model_copy.load_state_dict(model.state_dict())
-            print(f'  Evaluating {genome_id} ({genome.optimizer_path})')
-            area_under_metrics, validation_metrics, time_cost, mem_cost = self.evaluate_optimizer(genome.optimizer, model_copy, task, steps)
-            validation_metrics_str = '{' + ';'.join([f'{m.name}: {v}' for m,v in validation_metrics.items()]) + '}'
-            print(f'    Area Under Task Metrics: {area_under_metrics}',
-                  f'    Validation Metrics: {validation_metrics_str}',
-                  f'    Time Cost: {time_cost}',
-                  f'    Memory Cost: {mem_cost}')
+            print(f"  Evaluating {genome_id} ({genome.optimizer_path})")
+            area_under_metrics, validation_metrics, time_cost, mem_cost = self.evaluate_optimizer(
+                genome.optimizer, model_copy, task, steps
+            )
+            validation_metrics_str = "{" + ";".join([f"{m.name}: {v}" for m, v in validation_metrics.items()]) + "}"
+            print(
+                f"    Area Under Task Metrics: {area_under_metrics}",
+                f"    Validation Metrics: {validation_metrics_str}",
+                f"    Time Cost: {time_cost}",
+                f"    Memory Cost: {mem_cost}",
+            )
             validation_metrics[AreaUnderTaskMetrics] = area_under_metrics
             validation_metrics[TimeCost] = time_cost
             validation_metrics[MemoryCost] = mem_cost
             raw_metrics[genome_id] = validation_metrics
 
         # 3. Pareto front ranking
-        print('  Calculating Pareto Fronts')
+        print("  Calculating Pareto Fronts")
         fronts = nondominated_sort(raw_metrics)
 
         # 4. Compute global min/max per metric
@@ -277,7 +270,7 @@ class GuidedPopulation(Population):
                         norm = 1.0
                     else:
                         v = raw_metrics[genome_id][m]
-                        if m.objective == 'max':
+                        if m.objective == "max":
                             norm = (v - lo) / (hi - lo)
                         else:
                             norm = (hi - v) / (hi - lo)
@@ -285,7 +278,7 @@ class GuidedPopulation(Population):
                 composite = sum(scores) / len(scores)
                 # Fitness: higher for earlier fronts, break ties by composite
                 genome_map[genome_id].fitness = (len(fronts) - front_idx + 1) + composite
-                print(f'    {genome_id}: {genome_map[genome_id].fitness}')
+                print(f"    {genome_id}: {genome_map[genome_id].fitness}")
                 genome_map[genome_id].fitnesses = raw_metrics[genome_id]
         return genomes
 

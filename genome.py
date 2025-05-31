@@ -4,15 +4,15 @@ from itertools import count
 from random import choice, random, shuffle
 from typing import Dict, List, Tuple
 
-from computation_graphs.functions.activation import *
-from computation_graphs.functions.aggregation import *
 from neat.aggregations import AggregationFunctionSet
 from neat.config import ConfigParameter, write_pretty_params
-from neat.graphs import creates_cycle
-from neat.graphs import required_for_output
+from neat.graphs import creates_cycle, required_for_output
 
-from attributes import BoolAttribute, StringAttribute, FloatAttribute, IntAttribute
-from genes import NodeGene, ConnectionGene
+from attributes import BoolAttribute, FloatAttribute, IntAttribute, StringAttribute
+from computation_graphs.functions.activation import *
+from computation_graphs.functions.aggregation import *
+from genes import ConnectionGene, NodeGene
+
 
 class OptimizerGenomeConfig(object):
     """
@@ -24,29 +24,29 @@ class OptimizerGenomeConfig(object):
         self.aggregation_function_defs = AggregationFunctionSet()
 
         self._params = [
-            ConfigParameter('compatibility_disjoint_coefficient', float),
-            ConfigParameter('compatibility_weight_coefficient', float),
-            ConfigParameter('attribute_add_prob', float),
-            ConfigParameter('attribute_delete_prob', float),
-            ConfigParameter('conn_add_prob', float),
-            ConfigParameter('conn_delete_prob', float),
-            ConfigParameter('node_add_prob', float),
-            ConfigParameter('node_delete_prob', float),
-            ConfigParameter('single_structural_mutation', bool, 'false'),
-            ConfigParameter('structural_mutation_surer', str, 'default'),
+            ConfigParameter("compatibility_disjoint_coefficient", float),
+            ConfigParameter("compatibility_weight_coefficient", float),
+            ConfigParameter("attribute_add_prob", float),
+            ConfigParameter("attribute_delete_prob", float),
+            ConfigParameter("conn_add_prob", float),
+            ConfigParameter("conn_delete_prob", float),
+            ConfigParameter("node_add_prob", float),
+            ConfigParameter("node_delete_prob", float),
+            ConfigParameter("single_structural_mutation", bool, "false"),
+            ConfigParameter("structural_mutation_surer", str, "default"),
         ]
 
         self.num_inputs = 3
         self.num_outputs = 1
 
-        self.node_gene_type = params['node_gene_type']
+        self.node_gene_type = params["node_gene_type"]
         self._params += self.node_gene_type.get_config_params()
-        self.connection_gene_type = params['connection_gene_type']
+        self.connection_gene_type = params["connection_gene_type"]
         self._params += self.connection_gene_type.get_config_params()
 
         for p in self._params:
             value = p.interpret(params)
-            print(f'setting {p.name} to {value}')
+            print(f"setting {p.name} to {value}")
             setattr(self, p.name, value)
 
         # By convention, input pins have negative keys, and the output
@@ -56,12 +56,12 @@ class OptimizerGenomeConfig(object):
 
         self.connection_fraction = None
 
-        if self.structural_mutation_surer.lower() in ['1', 'yes', 'true', 'on']:
-            self.structural_mutation_surer = 'true'
-        elif self.structural_mutation_surer.lower() in ['0', 'no', 'false', 'off']:
-            self.structural_mutation_surer = 'false'
-        elif self.structural_mutation_surer.lower() == 'default':
-            self.structural_mutation_surer = 'default'
+        if self.structural_mutation_surer.lower() in ["1", "yes", "true", "on"]:
+            self.structural_mutation_surer = "true"
+        elif self.structural_mutation_surer.lower() in ["0", "no", "false", "off"]:
+            self.structural_mutation_surer = "false"
+        elif self.structural_mutation_surer.lower() == "default":
+            self.structural_mutation_surer = "default"
         else:
             error_string = f"Invalid structural_mutation_surer {self.structural_mutation_surer!r}"
             raise RuntimeError(error_string)
@@ -91,11 +91,11 @@ class OptimizerGenomeConfig(object):
         return new_id
 
     def check_structural_mutation_surer(self):
-        if self.structural_mutation_surer == 'true':
+        if self.structural_mutation_surer == "true":
             return True
-        elif self.structural_mutation_surer == 'false':
+        elif self.structural_mutation_surer == "false":
             return False
-        elif self.structural_mutation_surer == 'default':
+        elif self.structural_mutation_surer == "default":
             return self.single_structural_mutation
         else:
             error_string = f"Invalid structural_mutation_surer {self.structural_mutation_surer!r}"
@@ -126,8 +126,8 @@ class OptimizerGenome(object):
 
     @classmethod
     def parse_config(cls, param_dict):
-        param_dict['node_gene_type'] = NodeGene
-        param_dict['connection_gene_type'] = ConnectionGene
+        param_dict["node_gene_type"] = NodeGene
+        param_dict["connection_gene_type"] = ConnectionGene
         return OptimizerGenomeConfig(param_dict)
 
     @classmethod
@@ -139,7 +139,7 @@ class OptimizerGenome(object):
 
         # (gene_key, gene) pairs for gene sets
         self.nodes: Dict[int, NodeGene] = {}
-        self.connections: Dict[int, int] = {} # [from, to]
+        self.connections: Dict[int, int] = {}  # [from, to]
         self.next_node_id = 0
 
         self.fitness = None
@@ -155,7 +155,7 @@ class OptimizerGenome(object):
 
         # Deepcopy everything except 'optimizer'
         for k, v in self.__dict__.items():
-            if k == 'optimizer':
+            if k == "optimizer":
                 setattr(new, k, torch.jit.load(self.optimizer_path))
             else:
                 setattr(new, k, copy.deepcopy(v, memo))
@@ -169,7 +169,7 @@ class OptimizerGenome(object):
             self.nodes[node_key] = self.create_node(config, node_key)
 
     def configure_crossover(self, genome1, genome2, config):
-        """ Configure a new genome by crossover from two parent genomes. """
+        """Configure a new genome by crossover from two parent genomes."""
         if genome1.fitness > genome2.fitness:
             parent1, parent2 = genome1, genome2
         else:
@@ -200,21 +200,22 @@ class OptimizerGenome(object):
                 self.nodes[key] = ng1.crossover(ng2)
 
     def mutate(self, config):
-        """ Mutates this genome. """
+        """Mutates this genome."""
 
         if config.single_structural_mutation:
-            div = max(1, (config.node_add_prob + config.node_delete_prob +
-                          config.conn_add_prob + config.conn_delete_prob))
+            div = max(
+                1, (config.node_add_prob + config.node_delete_prob + config.conn_add_prob + config.conn_delete_prob)
+            )
             r = random()
             if r < (config.node_add_prob / div):
                 self.mutate_add_node(config)
             elif r < ((config.node_add_prob + config.node_delete_prob) / div):
                 self.mutate_delete_node(config)
-            elif r < ((config.node_add_prob + config.node_delete_prob +
-                       config.conn_add_prob) / div):
+            elif r < ((config.node_add_prob + config.node_delete_prob + config.conn_add_prob) / div):
                 self.mutate_add_connection(config)
-            elif r < ((config.node_add_prob + config.node_delete_prob +
-                       config.conn_add_prob + config.conn_delete_prob) / div):
+            elif r < (
+                (config.node_add_prob + config.node_delete_prob + config.conn_add_prob + config.conn_delete_prob) / div
+            ):
                 self.mutate_delete_connection()
         else:
             if random() < config.node_add_prob:
@@ -350,9 +351,7 @@ class OptimizerGenome(object):
                     node_distance += n1.distance(n2, config)
 
             max_nodes = max(len(self.nodes), len(other.nodes))
-            node_distance = (node_distance +
-                             (config.compatibility_disjoint_coefficient *
-                              disjoint_nodes)) / max_nodes
+            node_distance = (node_distance + (config.compatibility_disjoint_coefficient * disjoint_nodes)) / max_nodes
 
         # Compute connection gene differences.
         connection_distance = 0.0
@@ -371,9 +370,9 @@ class OptimizerGenome(object):
                     connection_distance += c1.distance(c2, config)
 
             max_conn = max(len(self.connections), len(other.connections))
-            connection_distance = (connection_distance +
-                                   (config.compatibility_disjoint_coefficient *
-                                    disjoint_connections)) / max_conn
+            connection_distance = (
+                connection_distance + (config.compatibility_disjoint_coefficient * disjoint_connections)
+            ) / max_conn
 
         distance = node_distance + connection_distance
         return distance
@@ -418,13 +417,13 @@ class OptimizerGenome(object):
 
     def add_node(self, node_type: str, activation, aggregation) -> NodeGene:
         if activation is None and aggregation is None:
-            print('WARNING: node added without any operation')
+            print("WARNING: node added without any operation")
         node = NodeGene(self.next_node_id, node_type, activation, aggregation)
         self.nodes[self.next_node_id] = node
         self.next_node_id += 1
         return node
 
-    def crossover(self, other: 'Genome') -> 'Genome':
+    def crossover(self, other: "Genome") -> "Genome":
         # TODO find better crossover method than this code from the superclass
         if genome1.fitness > genome2.fitness:
             parent1, parent2 = genome1, genome2
@@ -457,6 +456,7 @@ class OptimizerGenome(object):
 
     def __str__(self):
         return f"Genome(nodes={self.nodes}, connections={self.connections})"
+
 
 def get_pruned_genes(node_genes, connection_genes, input_keys, output_keys):
     used_nodes = required_for_output(input_keys, output_keys, connection_genes)

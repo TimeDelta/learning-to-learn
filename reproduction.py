@@ -1,10 +1,10 @@
-import numpy as np
-
 import math
 import random
 
+import numpy as np
 from neat.config import *
 from neat.reproduction import DefaultReproduction
+
 
 class GuidedReproduction(DefaultReproduction):
     """
@@ -13,11 +13,14 @@ class GuidedReproduction(DefaultReproduction):
 
     @classmethod
     def parse_config(cls, param_dict):
-        return DefaultClassConfig(param_dict, [
-            ConfigParameter('elitism', int, 0),
-            ConfigParameter('survival_threshold', float, 0.2),
-            ConfigParameter('min_species_size', int, 1),
-        ])
+        return DefaultClassConfig(
+            param_dict,
+            [
+                ConfigParameter("elitism", int, 0),
+                ConfigParameter("survival_threshold", float, 0.2),
+                ConfigParameter("min_species_size", int, 1),
+            ],
+        )
 
     def __init__(self, config, reporters, stagnation):
         super().__init__(config, reporters, stagnation)
@@ -58,7 +61,7 @@ class GuidedReproduction(DefaultReproduction):
             species.adjusted_fitness = (msf - min_fitness) / fitness_range
 
         adjusted_fitnesses = [s.adjusted_fitness for s in remaining_species]
-        avg_adjusted_fitness = np.mean(adjusted_fitnesses, axis=0) # type: float
+        avg_adjusted_fitness = np.mean(adjusted_fitnesses, axis=0)  # type: float
         self.reporters.info("Average adjusted fitness: {:.3f}".format(avg_adjusted_fitness))
 
         # Compute the number of new members for each species in the new generation.
@@ -83,7 +86,9 @@ class GuidedReproduction(DefaultReproduction):
 
             # 1) guided children
             if spawn // 2 > 0:
-                guided = self.guide_fn(task.name(), task.features, list(s.members.values()), self.reproduction_config, spawn // 2)
+                guided = self.guide_fn(
+                    task.name(), task.features, list(s.members.values()), self.reproduction_config, spawn // 2
+                )
                 for kid in guided:
                     new_population[kid.key] = kid
 

@@ -1,7 +1,9 @@
+from typing import Dict, List, Tuple
+
 import torch
 import torch.nn as nn
 from torch.nn.parameter import Parameter
-from typing import Dict, List, Tuple
+
 
 class AdamBackprop(nn.Module):
     moment1: Dict[str, torch.Tensor] = torch.jit.Attribute({}, Dict[str, torch.Tensor])
@@ -17,7 +19,9 @@ class AdamBackprop(nn.Module):
         self.moment1: Dict[str, torch.Tensor] = {}
         self.moment2: Dict[str, torch.Tensor] = {}
 
-    def forward(self, loss: torch.Tensor, prev_loss: torch.Tensor, named_parameters: List[Tuple[str, Parameter]]) -> Dict[str, torch.Tensor]:
+    def forward(
+        self, loss: torch.Tensor, prev_loss: torch.Tensor, named_parameters: List[Tuple[str, Parameter]]
+    ) -> Dict[str, torch.Tensor]:
         param_list = [param for _, param in named_parameters]
         # create_graph=False for efficiency
         grads = torch.autograd.grad([loss], param_list, create_graph=False, allow_unused=True)
@@ -41,10 +45,12 @@ class AdamBackprop(nn.Module):
             new_moment1 = self.beta1 * moment1 + one_minus_beta1 * grad
             new_moment2 = self.beta2 * moment2 + one_minus_beta2 * (grad * grad)
 
-            bias_corrected_moment1 = new_moment1 / (1 - self.beta1 ** self.step)
-            bias_corrected_moment2 = new_moment2 / (1 - self.beta2 ** self.step)
+            bias_corrected_moment1 = new_moment1 / (1 - self.beta1**self.step)
+            bias_corrected_moment2 = new_moment2 / (1 - self.beta2**self.step)
 
-            new_param = param - self.step_size * bias_corrected_moment1 / (torch.sqrt(bias_corrected_moment2) + self.eps)
+            new_param = param - self.step_size * bias_corrected_moment1 / (
+                torch.sqrt(bias_corrected_moment2) + self.eps
+            )
             new_params[name] = new_param
 
             self.moment1[name] = new_moment1
@@ -52,7 +58,8 @@ class AdamBackprop(nn.Module):
 
         return new_params
 
+
 if __name__ == "__main__":
     optimizer = torch.jit.script(AdamBackprop())
-    torch.jit.save(optimizer, __file__.replace('.py', '.pt'))
+    torch.jit.save(optimizer, __file__.replace(".py", ".pt"))
     print(optimizer.graph)

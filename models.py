@@ -1,6 +1,7 @@
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
+
 
 class ManyLossMinimaModel(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int = 20, output_dim: int = 1):

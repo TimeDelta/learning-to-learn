@@ -1,7 +1,9 @@
+from typing import Dict, List, Tuple
+
 import torch
 import torch.nn as nn
 from torch.nn.parameter import Parameter
-from typing import Dict, List, Tuple
+
 
 class AdaBeliefBackprop(nn.Module):
     moment1: Dict[str, torch.Tensor] = torch.jit.Attribute({}, Dict[str, torch.Tensor])
@@ -17,7 +19,9 @@ class AdaBeliefBackprop(nn.Module):
         self.moment1: Dict[str, torch.Tensor] = {}
         self.moment2: Dict[str, torch.Tensor] = {}
 
-    def forward(self, loss: torch.Tensor, prev_loss: torch.Tensor, named_parameters: List[Tuple[str, Parameter]]) -> Dict[str, torch.Tensor]:
+    def forward(
+        self, loss: torch.Tensor, prev_loss: torch.Tensor, named_parameters: List[Tuple[str, Parameter]]
+    ) -> Dict[str, torch.Tensor]:
         self.step += 1
         params = [param for _, param in named_parameters]
         grads = torch.autograd.grad([loss], params, create_graph=False, allow_unused=True)
@@ -44,8 +48,8 @@ class AdaBeliefBackprop(nn.Module):
             s = self.beta2 * s + (1 - self.beta2) * (diff * diff)
 
             # Bias-correct moments
-            m_hat = m / (1 - self.beta1 ** self.step)
-            s_hat = s / (1 - self.beta2 ** self.step)
+            m_hat = m / (1 - self.beta1**self.step)
+            s_hat = s / (1 - self.beta2**self.step)
 
             # AdaBelief update
             new_params[name] = param - self.step_size * (m_hat / (torch.sqrt(s_hat) + self.eps))
@@ -55,7 +59,8 @@ class AdaBeliefBackprop(nn.Module):
 
         return new_params
 
+
 if __name__ == "__main__":
     optimizer = torch.jit.script(AdaBeliefBackprop())
-    torch.jit.save(optimizer, __file__.replace('.py', '.pt'))
+    torch.jit.save(optimizer, __file__.replace(".py", ".pt"))
     print(optimizer.graph)

@@ -1,11 +1,11 @@
 import copy
 import math
-import neat
+import os
 import re
+
+import neat
 import torch
 import torch.nn as nn
-
-import os
 
 from computation_graphs.functions.activation import *
 from computation_graphs.functions.aggregation import *
@@ -13,13 +13,14 @@ from genes import *
 from population import *
 from reproduction import *
 
+
 def create_initial_genome(config, optimizer):
     """
     Creates an initial genome that mirrors the structure of the provided TorchScript optimizer computation graph.
     """
     genome = config.genome_type(0)
 
-    node_mapping = {} # from TorchScript nodes to genome node keys
+    node_mapping = {}  # from TorchScript nodes to genome node keys
     next_node_id = 0
     for node in optimizer.graph.nodes():
         new_node_gene = NodeGene(next_node_id, node)
@@ -43,12 +44,16 @@ def create_initial_genome(config, optimizer):
                 conn.innovation = innovation
                 innovation += 1
                 connections[key] = conn
-            elif ', %loss.1 : Tensor, %prev_loss : Tensor, %named_parameters.1 : (str, Tensor)[] = prim::Param()' not in str(producer):
-                print(f'WARNING: missing mapping for input node [{producer}]')
+            elif (
+                ", %loss.1 : Tensor, %prev_loss : Tensor, %named_parameters.1 : (str, Tensor)[] = prim::Param()"
+                not in str(producer)
+            ):
+                print(f"WARNING: missing mapping for input node [{producer}]")
 
     genome.connections = connections
     genome.optimizer = optimizer
     return genome
+
 
 def override_initial_population(population, config):
     """
@@ -57,10 +62,10 @@ def override_initial_population(population, config):
     new_population = {}
     optimizers = []
     optimizer_paths = []
-    for fname in os.listdir('computation_graphs/optimizers/'):
-        if fname.endswith('.pt'):
-            optimizers.append(torch.jit.load(f'computation_graphs/optimizers/{fname}'))
-            optimizer_paths.append(f'computation_graphs/optimizers/{fname}')
+    for fname in os.listdir("computation_graphs/optimizers/"):
+        if fname.endswith(".pt"):
+            optimizers.append(torch.jit.load(f"computation_graphs/optimizers/{fname}"))
+            optimizer_paths.append(f"computation_graphs/optimizers/{fname}")
     i = 0
     for key in population.population.keys():
         new_genome = create_initial_genome(config, optimizers[i % len(optimizers)])
@@ -72,14 +77,12 @@ def override_initial_population(population, config):
     population.shared_attr_vocab.add_names(ATTRIBUTE_NAMES)
     population.species.speciate(config, population.population, population.generation)
 
+
 if __name__ == "__main__":
     from genome import OptimizerGenome
+
     config = neat.Config(
-        OptimizerGenome,
-        GuidedReproduction,
-        neat.DefaultSpeciesSet,
-        neat.DefaultStagnation,
-        'neat-config'
+        OptimizerGenome, GuidedReproduction, neat.DefaultSpeciesSet, neat.DefaultStagnation, "neat-config"
     )
     population = GuidedPopulation(config)
 
@@ -91,4 +94,4 @@ if __name__ == "__main__":
 
     num_generations = 1000
     winner = population.run(num_generations)
-    print('\nBest genome:\n{!s}'.format(winner))
+    print("\nBest genome:\n{!s}".format(winner))

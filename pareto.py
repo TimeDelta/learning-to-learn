@@ -5,12 +5,13 @@ from typing import Dict, List
 
 from metrics import *
 
-def dominates(genome_metrics:Dict[int, Dict[Metric, float]], p:int, q:int) -> bool:
+
+def dominates(genome_metrics: Dict[int, Dict[Metric, float]], p: int, q: int) -> bool:
     """Return True if p dominates q under given objectives."""
     strictly_better = False
     for m, pv in genome_metrics[p].items():
         qv = genome_metrics[q][m]
-        if m.objective == 'max':
+        if m.objective == "max":
             if pv < qv:
                 return False
             if pv > qv:
@@ -22,7 +23,8 @@ def dominates(genome_metrics:Dict[int, Dict[Metric, float]], p:int, q:int) -> bo
                 strictly_better = True
     return strictly_better
 
-def nondominated_sort(genome_metrics:Dict[int, Dict[Metric, float]]) -> List[List[int]]:
+
+def nondominated_sort(genome_metrics: Dict[int, Dict[Metric, float]]) -> List[List[int]]:
     """
     Fast non-dominated sorting.
     Returns:

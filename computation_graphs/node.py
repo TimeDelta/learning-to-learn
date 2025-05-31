@@ -1,6 +1,7 @@
 import torch
 import torch.jit
 
+
 @torch.jit.script
 class Node:
     def __init__(self, gene):

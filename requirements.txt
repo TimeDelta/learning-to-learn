@@ -5,3 +5,6 @@ torch_geometric
 fbm
 astropy
 pyentrp
+scipy
+pre-commit
+black
