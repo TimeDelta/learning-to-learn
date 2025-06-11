@@ -78,17 +78,9 @@ class OptimizerGenomeConfig(object):
         write_pretty_params(f, self, self._params)
 
     def get_new_node_key(self, node_dict):
-        if self.node_indexer is None:
-            if node_dict:
-                self.node_indexer = count(max(list(node_dict)) + 1)
-            else:
-                self.node_indexer = count(max(list(node_dict)) + 1)
-
-        new_id = next(self.node_indexer)
-
-        assert new_id not in node_dict
-
-        return new_id
+        if node_dict:
+            return max(node_dict) + 1
+        return 0
 
     def check_structural_mutation_surer(self):
         if self.structural_mutation_surer == "true":
@@ -398,7 +390,9 @@ class OptimizerGenome(object):
 
     @staticmethod
     def create_node(config, node_id):
-        return NodeGene(node_id)
+        node = NodeGene(node_id)
+        node.init_attributes(config)
+        return node
 
     @staticmethod
     def create_connection(config, input_id, output_id):

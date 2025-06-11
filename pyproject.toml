@@ -2,7 +2,7 @@
 line-length = 120
 
 # target Python 3.9+ only
-target-version = ["py39"]
+target-version = ["py310"]
 
 [tool.isort]
 profile = "black"

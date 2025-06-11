@@ -1,5 +1,5 @@
 neat-python @ git+https://github.com/CodeReclaimers/neat-python@37bc8bb73fd6153a115001c2646f9f02bac3ad81
-numpy
+numpy<2
 torch
 torch_geometric
 fbm

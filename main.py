@@ -24,6 +24,7 @@ def create_initial_genome(config, optimizer):
     next_node_id = 0
     for node in optimizer.graph.nodes():
         new_node_gene = NodeGene(next_node_id, node)
+        new_node_gene.init_attributes(config.genome_config)
         if new_node_gene:
             genome.nodes[next_node_id] = new_node_gene
             node_mapping[node] = next_node_id

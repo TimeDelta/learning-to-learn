@@ -1,4 +1,4 @@
-from random import choice, gauss, random, uniform
+from random import choice, gauss, randint, random, uniform
 from warnings import warn
 
 import neat
@@ -86,10 +86,14 @@ class FloatAttribute(neat.attributes.FloatAttribute):
 
 class IntAttribute(neat.attributes.IntegerAttribute):
     def clamp(self, value, config):
-        return int(super().clamp(value, config))
+        min_v = getattr(config, self.min_value_name, -1000)
+        max_v = getattr(config, self.max_value_name, 1000)
+        return int(max(min(value, max_v), min_v))
 
     def init_value(self, config):
-        return int(super().init_value(config))
+        min_v = getattr(config, self.min_value_name, 0)
+        max_v = getattr(config, self.max_value_name, 10)
+        return randint(min_v, max_v)
 
     def __str__(self):
         return f"{self.__class__.__name__}({self.name})"
@@ -145,19 +149,30 @@ class BoolAttribute(neat.attributes.BoolAttribute):
 class StringAttribute(neat.attributes.StringAttribute):
     _config_items = {"default": [str, "random"], "options": [list, None], "mutate_rate": [float, 0.03]}
 
+    def __init__(self, name: str, options=None, **default_dict):
+        if options is not None:
+            default_dict["options"] = options
+        super().__init__(name, **default_dict)
+        self.options = options or []
+
     def init_value(self, config):
-        return choice(getattr(config, self.options_name))
+        options = getattr(config, self.options_name, getattr(self, "options", []))
+        default = getattr(config, self.default_name, "random")
+        if str(default).lower() in ("none", "random"):
+            if options:
+                return choice(options)
+            return ""
+        return default
 
     def mutate_value(self, value, config):
-        if hasattr(config, self.mutate_rate_name):
-            mutate_rate = getattr(config, self.mutate_rate_name)
-        else:
-            mutate_rate = 0.025
+        mutate_rate = getattr(config, self.mutate_rate_name, 0.025)
 
         if mutate_rate > 0:
-            r = random()
-            if r < mutate_rate:
-                return choice(self.options)
+            if random() < mutate_rate:
+                options = getattr(config, self.options_name, getattr(self, "options", []))
+                if options:
+                    return choice(options)
+                return value
 
         return value
 
