@@ -1,6 +1,5 @@
 import math
 
-import antropy
 import numpy as np
 from astropy.stats import bayesian_blocks
 from pyentrp import entropy

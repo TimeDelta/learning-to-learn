@@ -1,6 +1,5 @@
 from typing import List
 
-import matplotlib.pyplot as plt
 import numpy as np
 from fbm import fbm
 
@@ -44,6 +43,8 @@ def generate_fbm_sequence(
 
 
 if __name__ == "__main__":
+    import matplotlib.pyplot as plt
+
     assert generate_fbm_sequence(
         means=[2.3, 5], stdevs=[2, 14], hurst_target=0.3, fbm_length=np.pi, num_features=2, num_states=100
     ).shape == (100, 2)
