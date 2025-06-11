@@ -361,7 +361,8 @@ class GraphDecoder(nn.Module):
                 hidden_node = self.node_rnn(torch.zeros(hidden_node.shape[0], 0, device=device), hidden_node)
 
                 # clamp for precision errors
-                p_stop = (1 - torch.sigmoid(self.stop_head(hidden_node))).clamp(0.0, 1.0)
+                p_stop = 1 - torch.sigmoid(self.stop_head(hidden_node))
+                p_stop = torch.nan_to_num(p_stop, nan=1.0).clamp(0.0, 1.0)
                 if torch.bernoulli(p_stop).item() == 0:
                     break
                 new_node = self.node_head(hidden_node).squeeze(0)

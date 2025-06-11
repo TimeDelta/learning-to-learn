@@ -40,7 +40,7 @@ ATTRIBUTE_NAMES = set()
 
 class NodeGene(BaseGene):
     _gene_attributes = [
-        StringAttribute("node_type", options=",".join(NODE_TYPE_OPTIONS)),
+        StringAttribute("node_type", options=NODE_TYPE_OPTIONS),
         FloatAttribute("attribute_add_prob"),
         FloatAttribute("attribute_delete_prob"),
     ]
@@ -59,7 +59,7 @@ class NodeGene(BaseGene):
                     attribute = FloatAttribute(attribute_name)
                     self.dynamic_attributes[attribute] = node.f(attribute_name)
                 elif attribute_type == "s":
-                    attribute = StringAttribute(attribute_name, options=",".join(ATTRIBUTE_NAMES))
+                    attribute = StringAttribute(attribute_name, options=list(ATTRIBUTE_NAMES))
                     self.dynamic_attributes[attribute] = node.s(attribute_name)
                 else:
                     warn(f"Unknown attribute type for node [{node}]: {attribute_type}")
@@ -88,7 +88,7 @@ class NodeGene(BaseGene):
             elif r <= 0.75:
                 attr = FloatAttribute(generate_random_string(5))
             else:
-                attr = StringAttribute(generate_random_string(5), options=",".join(ATTRIBUTE_NAMES))
+                attr = StringAttribute(generate_random_string(5), options=list(ATTRIBUTE_NAMES))
             print(attr)
             self.add_attribute(attr, config)
 
@@ -124,13 +124,15 @@ class NodeGene(BaseGene):
         # Note: we use "a if random() > 0.5 else b" instead of choice((a, b))
         # here because `choice` is substantially slower.
         new_gene = self.__class__(self.key)
-        for a in self.dynamic_attributes:
-            if a not in other.dynamic_attributes.keys() or random.random() > 0.5:
-                new_gene.dynamic_attributes[a] = self.dynamic_attributes[a]
-            elif hasattr(other, a.name):
-                new_gene.dynamic_attributes[a] = other.dynamic_attributes[a]
+        all_attrs = set(self.dynamic_attributes) | set(other.dynamic_attributes)
+        for attr in all_attrs:
+            if attr in self.dynamic_attributes and attr in other.dynamic_attributes:
+                parent = self if random.random() > 0.5 else other
+                new_gene.dynamic_attributes[attr] = parent.dynamic_attributes[attr]
+            elif attr in self.dynamic_attributes:
+                new_gene.dynamic_attributes[attr] = self.dynamic_attributes[attr]
             else:
-                new_gene.dynamic_attributes[name] = other.dynamic_attributes[name]
+                new_gene.dynamic_attributes[attr] = other.dynamic_attributes[attr]
         return new_gene
 
     def __str__(self):

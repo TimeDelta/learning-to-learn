@@ -10,7 +10,7 @@ class NesterovSGDBackprop(nn.Module):
     velocity: Dict[str, torch.Tensor] = torch.jit.Attribute({}, Dict[str, torch.Tensor])
 
     def __init__(self, step_size: float = 0.1, momentum: float = 0.9):
-        super(NesterovSGD, self).__init__()
+        super(NesterovSGDBackprop, self).__init__()
         self.step_size = step_size
         self.momentum = momentum
         self.velocity: Dict[str, torch.Tensor] = {}
