@@ -189,13 +189,23 @@ class GuidedPopulation(Population):
                 self.trainer.train(warmup_epochs=10, batch_size=len(graphs))
 
             # 3) Build next‐gen population by species
-            new_pop = {}
-            std_offspring = self.reproduction.reproduce(
+            self.population = self.reproduction.reproduce(
                 self.config, self.species, self.config.pop_size, self.generation, task
             )
 
-            # 4) Replace population & re‐speciate
-            self.population = new_pop
+            # 4) Handle possible extinction
+            if not self.species.species:
+                self.reporters.complete_extinction()
+                if self.config.reset_on_extinction:
+                    self.population = self.reproduction.create_new(
+                        self.config.genome_type,
+                        self.config.genome_config,
+                        self.config.pop_size,
+                    )
+                else:
+                    raise CompleteExtinctionException()
+
+            # 5) Re‐speciate and finalize generation
             self.species.speciate(self.config, self.population, self.generation)
             self.reporters.end_generation(self.config, self.population, self.species)
 
@@ -206,16 +216,6 @@ class GuidedPopulation(Population):
                     best = max(self.population.values(), key=lambda g: g.fitness)
                     self.reporters.found_solution(self.config, self.generation, best)
                     return best
-
-            # extinction
-            if not self.species.species:
-                self.reporters.complete_extinction()
-                if self.config.reset_on_extinction:
-                    self.population = self.reproduction.create_new(
-                        self.config.genome_type, self.config.genome_config, self.config.pop_size
-                    )
-                else:
-                    raise CompleteExtinctionException()
 
             self.generation += 1
 
