@@ -375,6 +375,7 @@ class GraphDecoder(nn.Module):
                 for i in range(t):
                     hidden_edge = self.edge_rnn(edge_in, hidden_edge)
                     p_edge = torch.sigmoid(self.edge_head(hidden_edge)).view(-1)
+                    p_edge = torch.nan_to_num(p_edge, nan=0.0).clamp(0.0, 1.0)
                     if torch.bernoulli(p_edge).item() == 1:
                         edges.append([i, t])
                     edge_in = p_edge.unsqueeze(0)
