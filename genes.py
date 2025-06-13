@@ -124,6 +124,7 @@ class NodeGene(BaseGene):
         # Note: we use "a if random() > 0.5 else b" instead of choice((a, b))
         # here because `choice` is substantially slower.
         new_gene = self.__class__(self.key)
+        new_gene.node_type = self.node_type if random.random() > 0.5 else other.node_type
         all_attrs = set(self.dynamic_attributes) | set(other.dynamic_attributes)
         for attr in all_attrs:
             if attr in self.dynamic_attributes and attr in other.dynamic_attributes:
@@ -133,6 +134,12 @@ class NodeGene(BaseGene):
                 new_gene.dynamic_attributes[attr] = self.dynamic_attributes[attr]
             else:
                 new_gene.dynamic_attributes[attr] = other.dynamic_attributes[attr]
+        return new_gene
+
+    def copy(self):
+        new_gene = self.__class__(self.key)
+        new_gene.node_type = self.node_type
+        new_gene.dynamic_attributes = self.dynamic_attributes
         return new_gene
 
     def __str__(self):

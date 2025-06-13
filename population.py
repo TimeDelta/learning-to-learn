@@ -51,8 +51,7 @@ class GuidedPopulation(Population):
         self.reproduction.guide_fn = self.generate_guided_offspring
 
     def genome_to_data(self, genome: OptimizerGenome):
-        if genome.graph_dict:
-            return Data(*genome.graph_dict)
+        # always rebuild graph_dict so that new attributes are captured
         # sort by node id so positions line up
         node_ids = sorted(genome.nodes.keys())
         node_types = []
@@ -62,6 +61,7 @@ class GuidedPopulation(Population):
             idx = NODE_TYPE_TO_INDEX.get(node.node_type)
             if idx is None:
                 raise KeyError(f"Unknown node_type {node.node_type!r}")
+            self.shared_attr_vocab.add_names([a.name for a in node.dynamic_attributes.keys()])
             node_types.append(idx)
             node_attributes.append(node.dynamic_attributes)
         node_types = torch.tensor(node_types, dtype=torch.long)
@@ -170,11 +170,19 @@ class GuidedPopulation(Population):
             task_type = random.choice(list(TASK_TYPE_TO_CLASS.keys()))
             task = TASK_TYPE_TO_CLASS[task_type].random_init()
 
-            # 1) Evaluate real fitness
+            # Evaluate real fitness
             print(f"Evaluating genomes on {task.name()}")
             self.eval_genomes(list(self.population.items()), self.config, task, steps=2 * generation)
 
-            # 2) Train surrogate on all evaluated genomes
+            # Termination check
+            if not self.config.no_fitness_termination:
+                fv = self.fitness_criterion(g.fitness for g in self.population.values())
+                if fv >= self.config.fitness_threshold:
+                    best = max(self.population.values(), key=lambda g: g.fitness)
+                    self.reporters.found_solution(self.config, self.generation, best)
+                    return best
+
+            # Train surrogate on all evaluated genomes
             graphs, fits = [], []
             for gid, genome in self.population.items():
                 graphs.append(self.genome_to_data(genome))
@@ -188,12 +196,12 @@ class GuidedPopulation(Population):
             else:
                 self.trainer.train(warmup_epochs=10, batch_size=len(graphs))
 
-            # 3) Build next‐gen population by species
+            # Build next‐gen population by species
             self.population = self.reproduction.reproduce(
                 self.config, self.species, self.config.pop_size, self.generation, task
             )
 
-            # 4) Handle possible extinction
+            # Handle possible extinction
             if not self.species.species:
                 self.reporters.complete_extinction()
                 if self.config.reset_on_extinction:
@@ -205,17 +213,9 @@ class GuidedPopulation(Population):
                 else:
                     raise CompleteExtinctionException()
 
-            # 5) Re‐speciate and finalize generation
+            # Re‐speciate and finalize generation
             self.species.speciate(self.config, self.population, self.generation)
             self.reporters.end_generation(self.config, self.population, self.species)
-
-            # termination check
-            if not self.config.no_fitness_termination:
-                fv = self.fitness_criterion(g.fitness for g in self.population.values())
-                if fv >= self.config.fitness_threshold:
-                    best = max(self.population.values(), key=lambda g: g.fitness)
-                    self.reporters.found_solution(self.config, self.generation, best)
-                    return best
 
             self.generation += 1
 
@@ -302,7 +302,7 @@ class GuidedPopulation(Population):
             new_params = optimizer(metrics_values, prev_metrics_values, model.named_parameters())
             model.load_state_dict(new_params)
             prev_metrics_values = task.evaluate_metrics(model, task.train_data).requires_grad_()
-            area_under_metrics += np.sum(metrics_values.detach().data.numpy())
+            area_under_metrics += float(metrics_values.detach().sum())
         stop = time.perf_counter()
         _, peak_memory = tracemalloc.get_traced_memory()
         tracemalloc.stop()
