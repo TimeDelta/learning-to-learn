@@ -1,10 +1,13 @@
+import os
 import random
+import time
+import tracemalloc
 
 import numpy as np
 import torch
 from torch_geometric.data import Data
 
-from attributes import FloatAttribute, IntAttribute, StringAttribute
+from attributes import BoolAttribute, FloatAttribute, IntAttribute, StringAttribute
 from search_space_compression import (
     AsyncGraphEncoder,
     FitnessPredictor,
@@ -16,49 +19,90 @@ from search_space_compression import (
     SharedAttributeVocab,
     TasksEncoder,
 )
-from tasks import TASK_FEATURE_DIMS, TASK_TYPE_TO_INDEX
-from utility import generate_random_string
+from tasks import TASK_TYPE_TO_CLASS
+from models import ManyLossMinimaModel
+from metrics import MSELoss
+from genes import NODE_TYPE_TO_INDEX
 
 
-def generate_random_dag(num_nodes, num_node_types, edge_prob=0.3):
-    types = torch.randint(0, num_node_types, (num_nodes,), dtype=torch.long)
+# default until dataset generation sets real number of fitness dimensions
+fitness_dim = 1
+
+optimizer_paths = [
+    os.path.join("computation_graphs/optimizers", f)
+    for f in os.listdir("computation_graphs/optimizers")
+    if f.endswith(".pt")
+]
+
+
+def optimizer_to_data(opt):
+    node_map = {}
+    node_types = []
+    node_attrs = []
+    for idx, node in enumerate(opt.graph.nodes()):
+        node_map[node] = idx
+        node_types.append(NODE_TYPE_TO_INDEX.get(node.kind(), NODE_TYPE_TO_INDEX["hidden"]))
+        attrs = {}
+        for name in node.attributeNames():
+            kind = node.kindOf(name)
+            if kind == "i":
+                attrs[IntAttribute(name)] = node.i(name)
+            elif kind == "f":
+                attrs[FloatAttribute(name)] = node.f(name)
+            elif kind == "s":
+                attrs[StringAttribute(name)] = node.s(name)
+        node_attrs.append(attrs)
+
     edges = []
-    for i in range(num_nodes):
-        for j in range(i + 1, num_nodes):
-            if random.random() < edge_prob:
-                edges.append([i, j])
-    edge_index = (
-        torch.tensor(edges, dtype=torch.long).t().contiguous() if edges else torch.empty((2, 0), dtype=torch.long)
-    )
-    dyn_attrs = []
-    for _ in range(num_nodes):
-        attributes = {}
-        for _ in range(random.randint(0, 3)):
-            if random.random() <= 0.5:
-                attributes[IntAttribute(random.choice(attr_name_vocab))] = random.randint(0, 10)
-            if random.random() <= 0.5:
-                attributes[FloatAttribute(random.choice(attr_name_vocab))] = random.random() * 5.0
-            if random.random() <= 0.5:
-                attributes[StringAttribute(random.choice(attr_name_vocab))] = random.choice(attr_name_vocab)
-        dyn_attrs.append(attributes)
-    return Data(node_types=types, edge_index=edge_index, node_attributes=dyn_attrs)
+    for node in opt.graph.nodes():
+        dst = node_map[node]
+        for inp in node.inputs():
+            src = inp.node()
+            if src in node_map:
+                edges.append([node_map[src], dst])
+    if edges:
+        edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
+    else:
+        edge_index = torch.empty((2, 0), dtype=torch.long)
+    node_types = torch.tensor(node_types, dtype=torch.long)
+    return Data(node_types=node_types, edge_index=edge_index, node_attributes=node_attrs)
 
 
-def generate_data(num_samples, num_node_types):
+def evaluate_optimizer(optimizer, model, task, steps=5):
+    tracemalloc.start()
+    start = time.perf_counter()
+    prev_metrics_values = torch.tensor([0.0] * len(task.metrics))
+    for _ in range(steps):
+        metrics_values = task.evaluate_metrics(model, task.train_data).requires_grad_()
+        new_params = optimizer(metrics_values, prev_metrics_values, model.named_parameters())
+        model.load_state_dict(new_params)
+        prev_metrics_values = task.evaluate_metrics(model, task.train_data).requires_grad_()
+    stop = time.perf_counter()
+    _, peak_memory = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    time_cost = stop - start
+    validation_metrics = task.evaluate_metrics(model, task.valid_data).detach().data.numpy()
+    validation_metrics = {m: float(validation_metrics[i]) for i, m in enumerate(task.metrics)}
+    validation_metrics[MSELoss()] = validation_metrics.get(MSELoss(), 0.0)
+    return validation_metrics, time_cost, peak_memory
+
+
+def generate_data(num_samples):
     graphs, fitnesses = [], []
-    task_type = random.choice(list(TASK_FEATURE_DIMS.keys()))
-    for _ in range(num_samples):
-        graph = generate_random_dag(random.randint(3, 6), num_node_types, edge_prob=0.4)
+    attr_names = set()
+    task_type = random.choice(list(TASK_TYPE_TO_CLASS.keys()))
+    task = TASK_TYPE_TO_CLASS[task_type].random_init(num_samples=50, silent=True)
+    for i in range(num_samples):
+        opt = torch.jit.load(optimizer_paths[i % len(optimizer_paths)])
+        graph = optimizer_to_data(opt)
         graphs.append(graph)
-        fitnesses.append({Metric(str(i), "min"): graph.edge_index.size(1) for i in range(fitness_dim)})
-    task_features = torch.randn((TASK_FEATURE_DIMS[task_type],))
-    return graphs, fitnesses, task_type, task_features
-
-
-class Metric:
-    def __init__(self, name, objective):
-        self.name = name
-        self.objective = objective
+        for attrs in graph.node_attributes:
+            for attr in attrs:
+                attr_names.add(attr.name)
+        fitness_dict, _, _ = evaluate_optimizer(opt, ManyLossMinimaModel(task.train_data.num_input_features), task)
+        fitnesses.append(fitness_dict)
+    task_features = torch.tensor(np.concatenate(task.features, axis=0), dtype=torch.float32)
+    return graphs, fitnesses, task_type, task_features, sorted(attr_names)
 
 
 def train_model(encoder_cls, train_graphs, random_seed):
@@ -84,10 +128,9 @@ def train_model(encoder_cls, train_graphs, random_seed):
 
 
 if __name__ == "__main__":
-    num_node_types = 3
+    num_node_types = len(NODE_TYPE_TO_INDEX)
     graph_latent_dim = 16
     task_latent_dim = 8
-    fitness_dim = 1
 
     # lists for both metrics
     res_attention_final = []
@@ -97,10 +140,10 @@ if __name__ == "__main__":
 
     for i in range(100):
         random_seed = random.randint(0, 99999999)
-        attr_name_vocab = [generate_random_string(5) for _ in range(20)]
+        data = generate_data(10)
+        attr_name_vocab = data[4]
         shared_attr_vocab = SharedAttributeVocab(attr_name_vocab, 5)
-
-        data = generate_data(10, num_node_types)
+        fitness_dim = len(data[1][0])
 
         final_att, auc_att = train_model(GraphEncoder, data, random_seed)
         final_async, auc_async = train_model(AsyncGraphEncoder, data, random_seed)
