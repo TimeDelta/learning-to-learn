@@ -55,6 +55,42 @@ class DAGAttention(MessagePassing):
         return F.relu(aggr_out)
 
 
+class AsyncDAGLayer(nn.Module):
+    """Simple asynchronous message passing layer following a topological order."""
+
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.lin = nn.Linear(in_channels, out_channels)
+
+    def forward(self, x, edge_index):
+        x = self.lin(x)
+        num_nodes = x.size(0)
+        device = x.device
+        indeg = torch.zeros(num_nodes, dtype=torch.long, device=device)
+        indeg.scatter_add_(0, edge_index[1], torch.ones(edge_index.size(1), dtype=torch.long, device=device))
+        preds = [[] for _ in range(num_nodes)]
+        for s, d in edge_index.t().tolist():
+            preds[d].append(s)
+        order = [n for n in range(num_nodes) if indeg[n] == 0]
+        i = 0
+        while i < len(order):
+            n = order[i]
+            mask = edge_index[0] == n
+            for dest in edge_index[1][mask].tolist():
+                indeg[dest] -= 1
+                if indeg[dest] == 0:
+                    order.append(dest)
+            i += 1
+        h = torch.zeros_like(x)
+        for n in order:
+            if preds[n]:
+                agg = h[preds[n]].mean(dim=0)
+                h[n] = F.relu(x[n] + agg)
+            else:
+                h[n] = F.relu(x[n])
+        return h
+
+
 class TasksEncoder(nn.Module):
     def __init__(self, hidden_dim: int, latent_dim: int, type_embedding_dim: int):
         super().__init__()
@@ -251,7 +287,24 @@ class GraphEncoder(nn.Module):
         self.latent_dim = len(kept_idx)
 
 
+class AsyncGraphEncoder(GraphEncoder):
+    """Graph encoder using AsyncDAGLayer instead of attention."""
+
+    def __init__(
+        self, num_node_types: int, attr_encoder: NodeAttributeDeepSetEncoder, latent_dim: int, hidden_dims: List[int]
+    ):
+        super().__init__(num_node_types, attr_encoder, latent_dim, hidden_dims=[])
+        self.convs = nn.ModuleList()
+        prev_dim = attr_encoder.out_dim * 2
+        for h in hidden_dims:
+            self.convs.append(AsyncDAGLayer(prev_dim, h))
+            prev_dim = h
+        self.lin_mu = nn.Linear(prev_dim, latent_dim)
+        self.lin_logvar = nn.Linear(prev_dim, latent_dim)
+
+
 class GraphDeconvNet(MessagePassing):
+
     """
     A Graph Deconvolutional Network (GDN) layer that acts as the
     transpose/inverse of a GCNConv.  It takes an input signal X of
