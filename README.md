@@ -1,9 +1,6 @@
 # Learning to Learn: Evolving Generalized Self-Organizing Recurrent Spiking Computation Graphs
 
 ## Contents
-- [Disclaimer](#disclaimer)
-- [Contributing](#contributing)
-  - [Guidelines](#guidelines)
 - [Main Goals](#main-goals)
 - [Why multiple learning paradigms?](#why-multiple-learning-paradigms)
 - [Inspiration](#inspiration)
@@ -51,10 +48,10 @@
 
 ## Inspiration
 - Mitigating human influence in the learning paradigm and model architecture enough to support the other goals likely requires the use of an evolutionary approach
-  - Unfortunately, whether the approach works for our purposes is also highly dependent on how it is implemented and what degrees of freedom it allows.
+  - Unfortunately, whether the approach works for our purposes is also highly dependent on how it is implemented and what parameter types in what ratios it allows.
 - Key fact: Biological neurons are able to modify their genetic expression (methylation and acetylation) based on the accumulation of environmental cues (usually over the course of minutes to hours) like when a specific neurotransmitter binds to a receptor in the cell wall (this can happen every time cells involved in a synapse communicate)
   - See [46](#references) and [47](#references)
-  - In other words, they have many more degrees of freedom and a larger variety of types of DoF that they can utilize for learning than what we currently simulate
+  - In other words, they have many more parameters and a larger variety of parameter types that they can utilize for learning than what we currently simulate
 - Guiding Principle: Assuming a system can self-improve, increasing the diversity of computational bases on which the system can rely is likely to increase the probability that the system will be able to reach a better value for itself along a given dimension (efficiency, accuracy, etc.) by increasing the variety of options in the search space, which allows more possible combinations of tradeoffs at the cost of a combinatorial increase in search space size (which will be mitigated later).
 - The underlying computational mediums of the human brain and modern computers are different enough that we know there will be differences in the software that is optimal along some dimensions but we aren't sure exactly what or where those differences and dimensions will be plus predicting them is made even more difficult by the fact that we don't fully understand the brain and by the fact that modern digital computer hardware architecture is still changing and for certain uses, might even be supplanted by the use of quantum computing or neuromorphic hardware, which require new programming paradigms. 
 
@@ -70,7 +67,7 @@
 ### Neural Architecture Search
 - Limitations of current methods
   - Limited adaptability: The final solution is static (even ones with continued online learning have a static learning paradigm)
-  - Limited degrees of freedom: Most focus on topology and/or weights
+  - Most focus only on topology and/or weights
      - “Such experimental trials convinced us that to solve the [Neural Architecture Search] dilemma, the connectionist paradigm alone is not adequate.” [1](#references)
   - Weight sharing speeds up the search by reducing the size of the search space but "there is evidence that [weight sharing] inhibits the search for optimal architectures (Yu et al., 2020)" though this would only apply under some circumstances. [5](#references)
   - Can take a while to find solution
@@ -80,7 +77,7 @@
 - There are important advantages to being able to utilize the temporal dimension for encoding information
   - Allows easy local update rules for training such as Spike-timing-dependent plasticity (STDP), which “is the primary candidate mechanism for the storage of information in autoassociative networks” [12](#references) in the brain
   - When used in conjunction with neuromorphic hardware, they can provide a large reduction to energy consumption by switching to an event-driven model of computation
-  - Including time as an explicit degree of freedom in the model allows it to more closely approximate the actual dynamics of the world.
+  - Including time as an explicit parameter in the model allows it to more closely approximate the actual dynamics of the world.
   - "the ability to process noisy and dynamic data" [50](#references)
   - "more robust and fault-tolerant computing" [50](#references)
 - “Spiking Neural Networks have revealed themselves as one of the most successful approaches to model the behavior and learning potential of the brain, and exploit them to undertake practical online learning tasks” [6](#references)
