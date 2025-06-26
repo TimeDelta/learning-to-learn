@@ -165,7 +165,7 @@ def train_model(encoder_cls, full_dataset, random_seed, val_ratio=0.2):
 
     train_losses = []
     val_losses = []
-    loss_history = trainer.train(epochs=100, batch_size=4, warmup_epochs=10, verbose=True)
+    loss_history = trainer.train(epochs=100, batch_size=4, warmup_epochs=100, verbose=True)
     train_losses.append(loss_history[-1].sum().item())
     val_losses = evaluate_fitness_loss(model, val_graphs, val_fitnesses, task_type, task_features)
 
