@@ -6,8 +6,12 @@ import tracemalloc
 import numpy as np
 import torch
 from torch_geometric.data import Data
+from torch_geometric.loader import DataLoader
 
 from attributes import BoolAttribute, FloatAttribute, IntAttribute, StringAttribute
+from genes import NODE_TYPE_TO_INDEX
+from metrics import MSELoss
+from models import ManyLossMinimaModel
 from search_space_compression import (
     AsyncGraphEncoder,
     FitnessPredictor,
@@ -19,11 +23,7 @@ from search_space_compression import (
     SharedAttributeVocab,
     TasksEncoder,
 )
-from tasks import TASK_TYPE_TO_CLASS
-from models import ManyLossMinimaModel
-from metrics import MSELoss
-from genes import NODE_TYPE_TO_INDEX
-
+from tasks import TASK_TYPE_TO_CLASS, TASK_TYPE_TO_INDEX
 
 # default until dataset generation sets real number of fitness dimensions
 fitness_dim = 1
@@ -105,9 +105,54 @@ def generate_data(num_samples):
     return graphs, fitnesses, task_type, task_features, sorted(attr_names)
 
 
-def train_model(encoder_cls, train_graphs, random_seed):
+def evaluate_fitness_loss(model, graphs, fitnesses, task_type, task_features, batch_size=4):
+    """Return average MSE loss over a dataset."""
+    dataset = []
+    for graph, fitness_dict in zip(graphs, fitnesses):
+        data = graph.clone()
+        fitness = [f[1] for f in sorted(fitness_dict.items(), key=lambda item: item[0].name)]
+        data.y = torch.tensor(fitness, dtype=torch.float).unsqueeze(0)
+        data.task_type = torch.tensor([TASK_TYPE_TO_INDEX[task_type]], dtype=torch.long)
+        if isinstance(task_features, torch.Tensor):
+            data.task_features = task_features.detach().cpu().tolist()
+        else:
+            data.task_features = list(task_features)
+        dataset.append(data)
+
+    loader = DataLoader(dataset, batch_size=batch_size)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.eval()
+    losses = []
+    with torch.no_grad():
+        for batch in loader:
+            batch = batch.to(device)
+            _, pred, *_ = model(
+                batch.node_types,
+                batch.edge_index,
+                batch.node_attributes,
+                batch.batch,
+                batch.task_type,
+                batch.task_features,
+            )
+            loss = torch.nn.functional.mse_loss(pred, batch.y.to(device))
+            losses.append(loss.item())
+    return float(np.mean(losses))
+
+
+def train_model(encoder_cls, full_dataset, random_seed, val_ratio=0.2):
+    graphs, fitnesses, task_type, task_features = full_dataset
+    combined = list(zip(graphs, fitnesses))
+    random.seed(random_seed)
+    random.shuffle(combined)
+    val_size = max(1, int(len(combined) * val_ratio))
+    val_pairs = combined[:val_size]
+    train_pairs = combined[val_size:]
+    train_graphs, train_fitnesses = zip(*train_pairs)
+    val_graphs, val_fitnesses = zip(*val_pairs)
+
     random.seed(random_seed)
     torch.manual_seed(random_seed)
+
     attr_encoder = NodeAttributeDeepSetEncoder(shared_attr_vocab, 10, 20, 50)
     graph_encoder = encoder_cls(num_node_types, attr_encoder, graph_latent_dim, hidden_dims=[16])
     task_encoder = TasksEncoder(hidden_dim=16, latent_dim=task_latent_dim, type_embedding_dim=8)
@@ -116,15 +161,19 @@ def train_model(encoder_cls, train_graphs, random_seed):
     model = SelfCompressingFitnessRegularizedDAGVAE(graph_encoder, task_encoder, decoder, predictor)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     trainer = OnlineTrainer(model, optimizer)
-    trainer.add_data(*train_graphs)
-    history = trainer.train(epochs=10, batch_size=4, warmup_epochs=1, verbose=False)
+    trainer.add_data(train_graphs, train_fitnesses, task_type, task_features)
 
-    # compute per-epoch summed losses
-    loss_seq = [h.sum().item() for h in history]
-    final_loss = loss_seq[-1]
-    # compute area under curve (AUC) over epochs
-    auc = np.trapz(loss_seq, dx=1)
-    return final_loss, auc
+    train_losses = []
+    val_losses = []
+    loss_history = trainer.train(epochs=100, batch_size=4, warmup_epochs=10, verbose=True)
+    train_losses.append(loss_history[-1].sum().item())
+    val_losses = evaluate_fitness_loss(model, val_graphs, val_fitnesses, task_type, task_features)
+
+    final_loss = train_losses[-1]
+    auc = np.trapz(train_losses, dx=1)
+    val_final = val_losses[-1]
+    val_auc = np.trapz(val_losses, dx=1)
+    return final_loss, auc, val_final, val_auc
 
 
 if __name__ == "__main__":
@@ -135,29 +184,45 @@ if __name__ == "__main__":
     # lists for both metrics
     res_attention_final = []
     res_attention_auc = []
+    res_attention_val = []
+    res_attention_val_auc = []
     res_async_final = []
     res_async_auc = []
+    res_async_val = []
+    res_async_val_auc = []
 
     for i in range(100):
         random_seed = random.randint(0, 99999999)
-        data = generate_data(10)
+        data = generate_data(1000)
         attr_name_vocab = data[4]
         shared_attr_vocab = SharedAttributeVocab(attr_name_vocab, 5)
         fitness_dim = len(data[1][0])
 
-        final_att, auc_att = train_model(GraphEncoder, data, random_seed)
-        final_async, auc_async = train_model(AsyncGraphEncoder, data, random_seed)
+        final_att, auc_att, val_att, val_auc_att = train_model(GraphEncoder, data[:4], random_seed)
+        final_async, auc_async, val_async, val_auc_async = train_model(AsyncGraphEncoder, data[:4], random_seed)
 
         res_attention_final.append(final_att)
         res_attention_auc.append(auc_att)
+        res_attention_val.append(val_att)
+        res_attention_val_auc.append(val_auc_att)
         res_async_final.append(final_async)
         res_async_auc.append(auc_async)
+        res_async_val.append(val_async)
+        res_async_val_auc.append(val_auc_async)
 
-        print(f"  attention encoder → final loss: {final_att:.4f}, AUC loss: {auc_att:.4f}")
-        print(f"  async encoder     → final loss: {final_async:.4f}, AUC loss: {auc_async:.4f}")
+        print(
+            f"  attention encoder → train loss: {final_att:.4f}, val loss: {val_att:.4f}, AUC loss: {auc_att:.4f}, val AUC: {val_auc_att:.4f}"
+        )
+        print(
+            f"  async encoder     → train loss: {final_async:.4f}, val loss: {val_async:.4f}, AUC loss: {auc_async:.4f}, val AUC: {val_auc_async:.4f}"
+        )
 
     print("\nSummary:")
-    print(f"Mean final loss (attention encoder): {np.mean(res_attention_final):.4f}")
+    print(f"Mean train loss (attention encoder): {np.mean(res_attention_final):.4f}")
+    print(f"Mean val loss   (attention encoder): {np.mean(res_attention_val):.4f}")
     print(f"Mean AUC loss   (attention encoder): {np.mean(res_attention_auc):.4f}")
-    print(f"Mean final loss (async encoder):    {np.mean(res_async_final):.4f}")
+    print(f"Mean val AUC    (attention encoder): {np.mean(res_attention_val_auc):.4f}")
+    print(f"Mean train loss (async encoder):    {np.mean(res_async_final):.4f}")
+    print(f"Mean val loss   (async encoder):    {np.mean(res_async_val):.4f}")
     print(f"Mean AUC loss   (async encoder):    {np.mean(res_async_auc):.4f}")
+    print(f"Mean val AUC    (async encoder):    {np.mean(res_async_val_auc):.4f}")

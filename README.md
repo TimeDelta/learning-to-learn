@@ -48,7 +48,7 @@
 
 ## Inspiration
 - Mitigating human influence in the learning paradigm and model architecture enough to support the other goals likely requires the use of an evolutionary approach
-  - Unfortunately, whether the approach works for our purposes is also highly dependent on how it is implemented and what parameter types in what ratios it allows.
+  - Unfortunately, whether the approach works for such purposes is also highly dependent on how it is implemented and what parameter types in what ratios it allows.
 - Key fact: Biological neurons are able to modify their genetic expression (methylation and acetylation) based on the accumulation of environmental cues (usually over the course of minutes to hours) like when a specific neurotransmitter binds to a receptor in the cell wall (this can happen every time cells involved in a synapse communicate)
   - See [46](#references) and [47](#references)
   - In other words, they have many more parameters and a larger variety of parameter types that they can utilize for learning than what we currently simulate
