@@ -9,3 +9,4 @@ scipy
 pre-commit
 black
 scikit-learn
+mlflow
