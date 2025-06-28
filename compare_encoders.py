@@ -165,17 +165,13 @@ def train_model(encoder_cls, full_dataset, random_seed, val_ratio=0.2):
     trainer = OnlineTrainer(model, optimizer)
     trainer.add_data(train_graphs, train_fitnesses, task_type, task_features)
 
-    train_losses = []
-    val_losses = []
-    loss_history = trainer.train(epochs=100, batch_size=4, warmup_epochs=100, verbose=True)
-    train_losses.append(loss_history[-1].sum().item())
-    val_losses = evaluate_fitness_loss(model, val_graphs, val_fitnesses, task_type, task_features)
+    loss_history = trainer.train(epochs=10, batch_size=4, warmup_epochs=10, verbose=True)
+    train_losses = [lh.sum().item() for lh in loss_history]
+    val_loss = evaluate_fitness_loss(model, val_graphs, val_fitnesses, task_type, task_features)
 
     final_loss = train_losses[-1]
     auc = np.trapz(train_losses, dx=1)
-    val_final = val_losses[-1]
-    val_auc = np.trapz(val_losses, dx=1)
-    return final_loss, auc, val_final, val_auc
+    return final_loss, auc, val_loss
 
 
 if __name__ == "__main__":
@@ -207,44 +203,38 @@ if __name__ == "__main__":
         globals()["shared_attr_vocab"] = SharedAttributeVocab(attr_name_vocab, 5)
         globals()["fitness_dim"] = len(data[1][0])
 
-        final_att, auc_att, val_att, val_auc_att = train_model(GraphEncoder, data[:4], random_seed)
+        final_att, auc_att, val_att = train_model(GraphEncoder, data[:4], random_seed)
         with mlflow.start_run(run_name=f"GraphEncoder_{i}"):
             mlflow.log_params({"encoder": "GraphEncoder", "seed": random_seed, "num_samples": args.num_samples})
             mlflow.log_metrics(
                 {
                     "train_final_loss": final_att,
                     "train_auc": auc_att,
-                    "val_final_loss": val_att,
-                    "val_auc": val_auc_att,
+                    "val_loss": val_att,
                 }
             )
 
-        final_async, auc_async, val_async, val_auc_async = train_model(AsyncGraphEncoder, data[:4], random_seed)
+        final_async, auc_async, val_async = train_model(AsyncGraphEncoder, data[:4], random_seed)
         with mlflow.start_run(run_name=f"AsyncGraphEncoder_{i}"):
             mlflow.log_params({"encoder": "AsyncGraphEncoder", "seed": random_seed, "num_samples": args.num_samples})
             mlflow.log_metrics(
                 {
                     "train_final_loss": final_async,
                     "train_auc": auc_async,
-                    "val_final_loss": val_async,
-                    "val_auc": val_auc_async,
+                    "val_loss": val_async,
                 }
             )
 
         res_attention_final.append(final_att)
         res_attention_auc.append(auc_att)
         res_attention_val.append(val_att)
-        res_attention_val_auc.append(val_auc_att)
         res_async_final.append(final_async)
         res_async_auc.append(auc_async)
         res_async_val.append(val_async)
-        res_async_val_auc.append(val_auc_async)
 
+        print(f"  attention encoder → train loss: {final_att:.4f}, val loss: {val_att:.4f}, AUC loss: {auc_att:.4f}")
         print(
-            f"  attention encoder → train loss: {final_att:.4f}, val loss: {val_att:.4f}, AUC loss: {auc_att:.4f}, val AUC: {val_auc_att:.4f}"
-        )
-        print(
-            f"  async encoder     → train loss: {final_async:.4f}, val loss: {val_async:.4f}, AUC loss: {auc_async:.4f}, val AUC: {val_auc_async:.4f}"
+            f"  async encoder     → train loss: {final_async:.4f}, val loss: {val_async:.4f}, AUC loss: {auc_async:.4f}"
         )
 
     print("\nSummary:")
