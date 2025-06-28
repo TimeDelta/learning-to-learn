@@ -178,7 +178,7 @@ def train_model(encoder_cls, full_dataset, random_seed, val_ratio=0.2):
     return final_loss, auc, val_final, val_auc
 
 
-def main():
+if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Compare graph encoders")
     parser.add_argument("--num-runs", type=int, default=1, help="number of runs")
     parser.add_argument("--num-samples", type=int, default=1000, help="number of optimizers to sample")
@@ -256,7 +256,3 @@ def main():
     print(f"Mean val loss   (async encoder):    {np.mean(res_async_val):.4f}")
     print(f"Mean AUC loss   (async encoder):    {np.mean(res_async_auc):.4f}")
     print(f"Mean val AUC    (async encoder):    {np.mean(res_async_val_auc):.4f}")
-
-
-if __name__ == "__main__":
-    main()
