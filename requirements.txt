@@ -10,3 +10,5 @@ pre-commit
 black
 scikit-learn
 mlflow
+pytest
+pytest-cov
