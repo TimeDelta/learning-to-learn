@@ -4,6 +4,8 @@ from itertools import count
 from random import choice, random, shuffle
 from typing import Dict, List, Tuple
 
+import torch
+
 from neat.aggregations import AggregationFunctionSet
 from neat.config import ConfigParameter, write_pretty_params
 from neat.graphs import creates_cycle, required_for_output
@@ -11,7 +13,7 @@ from neat.graphs import creates_cycle, required_for_output
 from attributes import BoolAttribute, FloatAttribute, IntAttribute, StringAttribute
 from computation_graphs.functions.activation import *
 from computation_graphs.functions.aggregation import *
-from genes import ConnectionGene, NodeGene
+from genes import ConnectionGene, NodeGene, NODE_TYPE_TO_INDEX
 
 
 class OptimizerGenomeConfig(object):
@@ -190,6 +192,8 @@ class OptimizerGenome(object):
             else:
                 # Homologous gene: combine genes from both parents.
                 self.nodes[key] = ng1.crossover(ng2)
+
+
 
     def mutate(self, config):
         """Mutates this genome."""
@@ -408,6 +412,42 @@ class OptimizerGenome(object):
         new_genome.nodes = used_node_genes
         new_genome.connections = used_connection_genes
         return new_genome
+
+    def compile_optimizer(self, genome_config):
+        """Compile this genome into a TorchScript optimizer."""
+        from graph_builder import rebuild_and_script
+
+        if self.graph_dict is None:
+            node_ids = sorted(self.nodes.keys())
+            node_types = []
+            node_attributes = []
+            for nid in node_ids:
+                node = self.nodes[nid]
+                idx = NODE_TYPE_TO_INDEX.get(node.node_type)
+                if idx is None:
+                    raise KeyError(f"Unknown node_type {node.node_type!r}")
+                node_types.append(idx)
+                node_attributes.append(node.dynamic_attributes)
+            node_types = torch.tensor(node_types, dtype=torch.long)
+
+            edges = []
+            for (src, dst), conn in self.connections.items():
+                if conn.enabled and src in node_ids and dst in node_ids:
+                    local_src = node_ids.index(src)
+                    local_dst = node_ids.index(dst)
+                    edges.append([local_src, local_dst])
+            if edges:
+                edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
+            else:
+                edge_index = torch.empty((2, 0), dtype=torch.long)
+            self.graph_dict = {
+                "node_types": node_types,
+                "edge_index": edge_index,
+                "node_attributes": node_attributes,
+            }
+
+        self.optimizer = rebuild_and_script(self.graph_dict, genome_config, key=self.key)
+        self.optimizer_path = None
 
     def add_node(self, node_type: str, activation, aggregation) -> NodeGene:
         if activation is None and aggregation is None:

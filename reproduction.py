@@ -103,6 +103,8 @@ class GuidedReproduction(DefaultReproduction):
                     child = config.genome_type(cid)
                     child.configure_crossover(p1, p2, config.genome_config)
                     child.mutate(config.genome_config)
+                    if hasattr(child, "compile_optimizer"):
+                        child.compile_optimizer(config.genome_config)
                     new_population[cid] = child
                     self.ancestors[cid] = (p1_id, p2_id)
 
