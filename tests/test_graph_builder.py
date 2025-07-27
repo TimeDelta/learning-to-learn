@@ -40,4 +40,13 @@ def test_graph_builder_rebuilds_pt(pt_path):
     config = make_config()
     rebuilt = rebuild_and_script(graph_dict, config.genome_config, key=0)
 
-    assert original == rebuilt
+    assert isinstance(rebuilt, torch.jit.ScriptModule)
+
+    expected_edges = set(map(tuple, data.edge_index.t().tolist()))
+    assert set(rebuilt.edges) == expected_edges
+
+    assert rebuilt.input_keys == config.genome_config.input_keys
+    assert rebuilt.output_keys == config.genome_config.output_keys
+
+    assert len(list(rebuilt.parameters())) == len(expected_edges)
+    assert len(rebuilt.node_types) == len(data.node_types)
