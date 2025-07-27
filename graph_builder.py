@@ -7,7 +7,6 @@ import torch
 import torch._C
 import torch.nn as nn
 from torch._C import Graph, Node
-from torch.jit import ScriptModule
 
 from genes import NodeGene
 from genome import OptimizerGenome
@@ -122,37 +121,54 @@ def build_forward_graph(
     return graph
 
 
-class DynamicOptimizerModule(ScriptModule):
-    def __init__(self, genome, input_keys, output_keys):
-        super(DynamicOptimizerModule, self).__init__()
-        nn.Module.__init__(self)
-        ScriptModule.__init__(self)
+class DynamicOptimizerModule(nn.Module):
+    """Simple PyTorch module implementing one round of message passing."""
 
-        # register one Parameter per enabled connection
+    def __init__(self, genome, input_keys, output_keys, graph_dict=None):
+        super().__init__()
+        self.num_nodes = len(genome.nodes)
+        self.edges: List[Tuple[int, int]] = []
+        self.weights = nn.ParameterList()
+        self.node_types: List[str] = []
         for (src, dst), conn in genome.connections.items():
             if conn.enabled:
+                self.edges.append((src, dst))
                 w = getattr(conn, "weight", 1.0)
-                self.register_parameter(f"w_{src}_{dst}", torch.nn.Parameter(torch.tensor(w)))
+                self.weights.append(nn.Parameter(torch.tensor(w)))
+        for nid in range(self.num_nodes):
+            ng = genome.nodes[nid]
+            self.node_types.append(ng.node_type)
 
-        # now build and attach the forward graph
-        graph = build_forward_graph(
-            num_nodes=len(genome.nodes),
-            edges=list(genome.connections.keys()),
-            input_keys=input_keys,
-            output_keys=output_keys,
-        )
+        self.input_keys = input_keys
+        self.output_keys = output_keys
+        self.graph_dict = graph_dict
 
-        # hook it into this ScriptModule
-        create_fn = getattr(
-            torch._C,
-            "_jit_create_method_from_graph",
-            getattr(
-                torch._C,
-                "_create_method_from_graph",
-                getattr(torch._C, "_jit_create_function_from_graph", getattr(torch._C, "_create_function_from_graph")),
-            ),
-        )
-        create_fn("forward", graph)
+    def forward(
+        self,
+        loss: torch.Tensor,
+        prev_loss: torch.Tensor,
+        named_params: List[Tuple[str, torch.Tensor]],
+    ) -> Dict[str, torch.Tensor]:
+        params = [p for _, p in named_params]
+        all_inputs = [loss, prev_loss] + params
+        features = torch.stack(all_inputs, 0)
+
+        out_feats = [torch.zeros_like(loss) for _ in range(self.num_nodes)]
+        for idx, w in enumerate(self.weights):
+            src, dst = self.edges[idx]
+            out_feats[dst] = out_feats[dst] + features[src] * w
+
+        all_outputs = list(out_feats)
+        all_outputs[0] = loss
+        all_outputs[1] = prev_loss
+        for i, p in enumerate(params):
+            if 2 + i < len(all_outputs):
+                all_outputs[2 + i] = p
+
+        outputs = {}
+        for ok in self.output_keys:
+            outputs[str(ok)] = all_outputs[ok]
+        return outputs
 
 
 def rebuild_and_script(graph_dict, config, key) -> DynamicOptimizerModule:
@@ -180,7 +196,10 @@ def rebuild_and_script(graph_dict, config, key) -> DynamicOptimizerModule:
         cg.enabled = True
         genome.connections[(src, dst)] = cg
 
-    # --- make a fresh ScriptModule and give it weight params ---
+    # --- build a Python module and script it ---
     if genome.connections:
-        return DynamicOptimizerModule(genome, config.input_keys, config.output_keys)
+        module = DynamicOptimizerModule(
+            genome, config.input_keys, config.output_keys, graph_dict
+        )
+        return torch.jit.script(module)
     return None
