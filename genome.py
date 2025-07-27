@@ -4,6 +4,8 @@ from itertools import count
 from random import choice, random, shuffle
 from typing import Dict, List, Tuple
 
+import torch
+
 from neat.aggregations import AggregationFunctionSet
 from neat.config import ConfigParameter, write_pretty_params
 from neat.graphs import creates_cycle, required_for_output
@@ -190,6 +192,8 @@ class OptimizerGenome(object):
             else:
                 # Homologous gene: combine genes from both parents.
                 self.nodes[key] = ng1.crossover(ng2)
+
+
 
     def mutate(self, config):
         """Mutates this genome."""
@@ -408,6 +412,19 @@ class OptimizerGenome(object):
         new_genome.nodes = used_node_genes
         new_genome.connections = used_connection_genes
         return new_genome
+
+    def compile_optimizer(self, genome_config):
+        """Compile this genome into a TorchScript optimizer."""
+        from graph_builder import DynamicOptimizerModule
+
+        if not self.connections:
+            self.optimizer = None
+        else:
+            module = DynamicOptimizerModule(
+                self, genome_config.input_keys, genome_config.output_keys, self.graph_dict
+            )
+            self.optimizer = torch.jit.script(module)
+        self.optimizer_path = None
 
     def add_node(self, node_type: str, activation, aggregation) -> NodeGene:
         if activation is None and aggregation is None:
