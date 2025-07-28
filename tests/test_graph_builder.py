@@ -50,3 +50,12 @@ def test_graph_builder_rebuilds_pt(pt_path):
 
     assert len(list(rebuilt.parameters())) == len(expected_edges)
     assert len(rebuilt.node_types) == len(data.node_types)
+
+    # Verify that the rebuilt computation graph is identical to the original
+    if str(rebuilt.graph) != str(original.graph):
+        print("Original graph:\n", original.graph)
+        print("Rebuilt graph:\n", rebuilt.graph)
+    assert str(rebuilt.graph) == str(original.graph), (
+        "\nOriginal graph:\n" + str(original.graph) +
+        "\nRebuilt graph:\n" + str(rebuilt.graph)
+    )
