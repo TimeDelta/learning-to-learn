@@ -29,21 +29,52 @@ def make_config():
 
 
 def get_node_signature(node):
+    """Return a simplified structural signature for a JIT node."""
     # simple signature includes kind (operator name), types of inputs, and output type
-    # TODO: for robust comparison, also need to compare attributes and potentially canonicalize constant values
     input_kinds = [inp.node().kind() for inp in node.inputs()]
 
+    # Collect attributes for a more robust comparison.  For constant values we
+    # canonicalise the attribute by converting to a python value where possible.
     attributes = {}
-    if node.kind() == "prim::Constant":
-        if node.hasAttribute("value"):
-            attributes["value"] = node.t("value")
-        elif node.hasAttribute("i"):
-            attributes["value"] = node.i("i")
-        elif node.hasAttribute("f"):
-            attributes["value"] = node.f("f")
-    # TODO: finish
+    for name in node.attributeNames():
+        kind = node.kindOf(name)
+        if kind == "i":
+            attributes[name] = node.i(name)
+        elif kind == "f":
+            attributes[name] = node.f(name)
+        elif kind == "s":
+            attributes[name] = node.s(name)
+        elif kind == "t":
+            val = node.t(name)
+            # convert small tensors to list to make comparison deterministic
+            attributes[name] = val.tolist() if val.numel() <= 20 else (
+                str(val.dtype), tuple(val.size())
+            )
+        elif kind == "is":
+            attributes[name] = tuple(node.is_(name))
+        elif kind == "fs":
+            attributes[name] = tuple(node.fs(name))
+        elif kind == "ss":
+            attributes[name] = tuple(node.ss(name))
+        elif kind == "ts":
+            attributes[name] = tuple(node.ts(name))
 
-    return (node.kind(), tuple(input_kinds), node.output().type(), tuple(sorted(attributes.items())))
+    # Handle prim::Constant nodes explicitly to capture their value.
+    if node.kind() == "prim::Constant":
+        try:
+            const_val = node.output().toIValue()
+            if isinstance(const_val, torch.Tensor):
+                const_val = const_val.tolist()
+            attributes["const_value"] = const_val
+        except Exception:
+            pass
+
+    return (
+        node.kind(),
+        tuple(input_kinds),
+        str(node.output().type()),
+        tuple(sorted(attributes.items())),
+    )
 
 
 def compare_jit_graphs_structural(original: torch.jit.ScriptModule, rebuilt: torch.jit.ScriptModule) -> bool:
@@ -80,7 +111,8 @@ def compare_jit_graphs_structural(original: torch.jit.ScriptModule, rebuilt: tor
             print(f"Signatures differ at node {i}:", file=sys.stderr)
             print(f"  original.graph Node Kind: {original_node.kind()}", file=sys.stderr)
             print(f"  rebuilt Node Kind: {rebuilt_node.kind()}", file=sys.stderr)
-            # TODO: add more detailed diffing here
+            print(f"  original signature: {signature1}", file=sys.stderr)
+            print(f"  rebuilt signature: {signature2}", file=sys.stderr)
             return False
 
         # assumes a consistent order of inputs and that corresponding inputs have corresponding nodes
@@ -90,8 +122,23 @@ def compare_jit_graphs_structural(original: torch.jit.ScriptModule, rebuilt: tor
             if original_input_val.node().kind() != rebeuilt_input_val.node().kind():
                 print(f"Input kind differs for node {i}, input {input_idx}", file=sys.stderr)
                 return False
-            # TODO: need to further compare value properties if they are constants or recursively
-            # check if the input nodes themselves are structurally equivalent up to that point
+            # For constant values, also compare the actual constant contents.
+            if original_input_val.node().kind() == "prim::Constant":
+                try:
+                    val1 = original_input_val.toIValue()
+                    val2 = rebeuilt_input_val.toIValue()
+                except Exception:
+                    val1 = val2 = object()
+                if isinstance(val1, torch.Tensor):
+                    val1 = val1.tolist()
+                if isinstance(val2, torch.Tensor):
+                    val2 = val2.tolist()
+                if val1 != val2:
+                    print(
+                        f"Constant value differs for node {i}, input {input_idx}",
+                        file=sys.stderr,
+                    )
+                    return False
 
     original_params = dict(original.named_parameters())
     rebuilt_params = dict(rebuilt.named_parameters())
