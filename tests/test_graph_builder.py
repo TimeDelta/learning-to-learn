@@ -47,9 +47,7 @@ def get_node_signature(node):
         elif kind == "t":
             val = node.t(name)
             # convert small tensors to list to make comparison deterministic
-            attributes[name] = val.tolist() if val.numel() <= 20 else (
-                str(val.dtype), tuple(val.size())
-            )
+            attributes[name] = val.tolist() if val.numel() <= 20 else (str(val.dtype), tuple(val.size()))
         elif kind == "is":
             attributes[name] = tuple(node.is_(name))
         elif kind == "fs":
@@ -104,15 +102,15 @@ def compare_jit_graphs_structural(original: torch.jit.ScriptModule, rebuilt: tor
     original_node_map = {}
     rebuilt_node_map = {}
     for i, (original_node, rebuilt_node) in enumerate(zip(original_nodes, rebuilt_nodes)):
-        signature1 = get_node_signature(original_node)
-        signature2 = get_node_signature(rebuilt_node)
+        original_signature = get_node_signature(original_node)
+        rebuilt_signature = get_node_signature(rebuilt_node)
 
-        if signature1 != signature2:
+        if original_signature != rebuilt_signature:
             print(f"Signatures differ at node {i}:", file=sys.stderr)
-            print(f"  original.graph Node Kind: {original_node.kind()}", file=sys.stderr)
+            print(f"  original Node Kind: {original_node.kind()}", file=sys.stderr)
             print(f"  rebuilt Node Kind: {rebuilt_node.kind()}", file=sys.stderr)
-            print(f"  original signature: {signature1}", file=sys.stderr)
-            print(f"  rebuilt signature: {signature2}", file=sys.stderr)
+            print(f"  original signature: {original_signature}", file=sys.stderr)
+            print(f"  rebuilt signature: {rebuilt_signature}", file=sys.stderr)
             return False
 
         # assumes a consistent order of inputs and that corresponding inputs have corresponding nodes
@@ -134,10 +132,7 @@ def compare_jit_graphs_structural(original: torch.jit.ScriptModule, rebuilt: tor
                 if isinstance(val2, torch.Tensor):
                     val2 = val2.tolist()
                 if val1 != val2:
-                    print(
-                        f"Constant value differs for node {i}, input {input_idx}",
-                        file=sys.stderr,
-                    )
+                    print(f"Constant value differs for node {i}, input {input_idx}", file=sys.stderr)
                     return False
 
     original_params = dict(original.named_parameters())
@@ -198,4 +193,4 @@ def test_graph_builder_rebuilds_pt(pt_path):
     assert len(rebuilt.node_types) == len(data.node_types)
 
     # Verify that the rebuilt computation graph is structurally identical to the original
-    assert compare_jit_graphs_structural(rebuilt, original)
+    assert compare_jit_graphs_structural(original, rebuilt)
