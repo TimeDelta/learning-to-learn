@@ -292,7 +292,8 @@ class GuidedPopulation(Population):
           task: The task on which to evaluate the optimizer.
           steps: Number of update iterations.
         """
-        # TODO: find way to correct for time improvements that are solely due to RAM cache tiers
+        # TODO: clear all levels of RAM caches in between every run to create fair starting point
+        # for comparison
         tracemalloc.start()
         start = time.perf_counter()
         prev_metrics_values = torch.tensor([0.0] * len(task.metrics))
