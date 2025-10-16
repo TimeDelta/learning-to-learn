@@ -1,7 +1,7 @@
 import random
 import time
 import tracemalloc
-from typing import List
+from typing import Dict, List
 from warnings import warn
 
 import torch
@@ -133,7 +133,12 @@ class GuidedPopulation(Population):
         # 3) Optimize z_g via Adam ascent to maximize predictor(z_g, z_t)
         opt = torch.optim.Adam([z_g], lr=latent_lr)
         for _ in range(latent_steps):
-            pred = self.guide.fitness_predictor(z_g, z_t)
+            min_len = min(z_g.size(0), z_t.size(0))
+            if z_g.size(0) != z_t.size(0):
+                warn(
+                    f"Guide fitness predictor batch mismatch: z_g={z_g.size(0)}, z_t={z_t.size(0)}; trimming to {min_len}"
+                )
+            pred = self.guide.fitness_predictor(z_g[:min_len], z_t[:min_len])
             loss = -pred.sum(dim=1).mean()
             opt.zero_grad()
             loss.backward()
@@ -141,7 +146,7 @@ class GuidedPopulation(Population):
 
         # 4) Decode
         with torch.no_grad():
-            graphs = self.guide.decode(z_g)
+            graphs = self.guide.decode(z_g[:min_len])
         new_genomes = []
         for i, graph_dict in enumerate(graphs):
             optimizer = rebuild_and_script(graph_dict, self.config.genome_config, key=i)
@@ -298,10 +303,22 @@ class GuidedPopulation(Population):
         start = time.perf_counter()
         prev_metrics_values = torch.tensor([0.0] * len(task.metrics))
         area_under_metrics = 0.0
+
         for step in range(steps):
             metrics_values = task.evaluate_metrics(model, task.train_data).requires_grad_()
-            new_params = optimizer(metrics_values, prev_metrics_values, model.named_parameters())
-            model.load_state_dict(new_params)
+            named_params = list(model.named_parameters())
+            self._ensure_optimizer_state_shapes(optimizer, named_params)
+            try:
+                updated_state = optimizer(metrics_values, prev_metrics_values, named_params)
+            except RuntimeError as err:
+                if "size of tensor" in str(err) and "must match" in str(err):
+                    warn("Optimizer state mismatch detected; resetting state buffers and retrying")
+                    self._reset_optimizer_state(optimizer, named_params)
+                    updated_state = optimizer(metrics_values, prev_metrics_values, named_params)
+                else:
+                    raise
+            state_dict = self._normalize_state_dict(updated_state, named_params)
+            model.load_state_dict(state_dict)
             prev_metrics_values = task.evaluate_metrics(model, task.train_data).requires_grad_()
             area_under_metrics += float(metrics_values.detach().sum())
         stop = time.perf_counter()
@@ -311,3 +328,110 @@ class GuidedPopulation(Population):
         validation_metrics = task.evaluate_metrics(model, task.valid_data).detach().data.numpy()
         validation_metrics = {m: float(validation_metrics[i]) for i, m in enumerate(task.metrics)}
         return area_under_metrics, validation_metrics, time_cost, peak_memory
+
+    @staticmethod
+    def _ensure_optimizer_state_shapes(optimizer, named_params):
+        """Reset or resize any persistent optimizer state tensors to match parameter shapes."""
+        # TorchScript modules expose state dictionaries as attributes when annotated.
+        state_attrs = GuidedPopulation._optimizer_state_attributes(optimizer)
+        if not state_attrs:
+            return
+
+        for attr in state_attrs:
+            try:
+                state_dict = dict(getattr(optimizer, attr))
+            except Exception:
+                continue
+
+            if not state_dict:
+                continue
+
+            normalized = GuidedPopulation._normalize_state_dict(state_dict, named_params)
+            updated_state: Dict[str, torch.Tensor] = {}
+            for name, param in named_params:
+                zero = torch.zeros_like(param)
+                cur_val = normalized.get(name)
+                if isinstance(cur_val, torch.Tensor) and tuple(cur_val.shape) == tuple(param.shape):
+                    val = cur_val.detach().clone()
+                else:
+                    val = zero
+                updated_state[name] = val.detach()
+
+            try:
+                setattr(optimizer, attr, updated_state)
+            except Exception:
+                continue
+
+    @staticmethod
+    def _normalize_state_dict(state_dict_like, named_params):
+        try:
+            state_dict = dict(state_dict_like)
+        except Exception:
+            raise RuntimeError("Optimizer did not return a mapping of parameter tensors")
+
+        if not named_params:
+            return {}
+
+        mapped: Dict[str, torch.Tensor] = {}
+        used_keys = set()
+
+        for idx, (name, param) in enumerate(named_params):
+            candidates = [name, str(name), str(idx), idx]
+            value = None
+            for cand in candidates:
+                if cand in state_dict:
+                    value = state_dict[cand]
+                    used_keys.add(cand)
+                    break
+
+            if isinstance(value, torch.Tensor) and tuple(value.shape) == tuple(param.shape):
+                value = value.detach().clone()
+            else:
+                value = param.detach().clone()
+
+            mapped[name] = value
+
+        # For any state entries that directly match other parameter names not already filled.
+        for key, value in state_dict.items():
+            if key in used_keys:
+                continue
+            if not isinstance(key, str) or key in mapped:
+                continue
+            if isinstance(value, torch.Tensor):
+                mapped[key] = value.detach().clone()
+
+        return mapped
+
+    @staticmethod
+    def _optimizer_state_attributes(optimizer):
+        attrs = []
+        for attr in dir(optimizer):
+            if attr.startswith("_"):
+                continue
+            try:
+                value = getattr(optimizer, attr)
+            except Exception:
+                continue
+            try:
+                mapping = dict(value)
+            except Exception:
+                continue
+            if mapping:
+                if not all(isinstance(k, str) for k in mapping.keys()):
+                    continue
+                if not all(isinstance(v, torch.Tensor) for v in mapping.values() if v is not None):
+                    continue
+            attrs.append(attr)
+        return attrs
+
+    @staticmethod
+    def _reset_optimizer_state(optimizer, named_params):
+        state_attrs = GuidedPopulation._optimizer_state_attributes(optimizer)
+        if not state_attrs:
+            return
+        for attr in state_attrs:
+            zero_state: Dict[str, torch.Tensor] = {}
+            try:
+                setattr(optimizer, attr, zero_state)
+            except Exception:
+                continue

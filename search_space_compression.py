@@ -157,8 +157,10 @@ class SharedAttributeVocab(nn.Module):
     def add_names(self, new_names: List[str]):
         names_to_add = [name for name in new_names if name not in self.name_to_index]
 
+        if not names_to_add:
+            return
+
         starting_index = len(self.name_to_index)
-        num_new_names = len(names_to_add)
 
         for offset, name in enumerate(names_to_add):
             new_idx = starting_index + offset
@@ -168,9 +170,25 @@ class SharedAttributeVocab(nn.Module):
         # expand the embedding matrix with He‐style initialization for the new rows
         old_weight = self.embedding.weight.data
         fan_in = old_weight.size(1)
-        new_rows = torch.randn(len(names_to_add), fan_in) * math.sqrt(2 / fan_in)
+        device = old_weight.device
+        new_rows = torch.randn(len(names_to_add), fan_in, device=device) * math.sqrt(2 / fan_in)
         new_weight = torch.cat([old_weight, new_rows], dim=0)
         self.embedding = nn.Embedding.from_pretrained(new_weight, freeze=False)
+
+    def ensure_index(self, name: str) -> int:
+        if name not in self.name_to_index:
+            self.add_names([name])
+        idx = self.name_to_index[name]
+        if idx >= self.embedding.num_embeddings:
+            # expand just enough rows to accommodate idx
+            missing = idx - self.embedding.num_embeddings + 1
+            old_weight = self.embedding.weight.data
+            fan_in = old_weight.size(1)
+            device = old_weight.device
+            new_rows = torch.randn(missing, fan_in, device=device) * math.sqrt(2 / fan_in)
+            new_weight = torch.cat([old_weight, new_rows], dim=0)
+            self.embedding = nn.Embedding.from_pretrained(new_weight, freeze=False)
+        return idx
 
 
 class NodeAttributeDeepSetEncoder(nn.Module):
@@ -218,7 +236,8 @@ class NodeAttributeDeepSetEncoder(nn.Module):
 
         phis = []
         for attr, value in sorted(attr_dict.items(), key=lambda i: i[0].name):  # consistent ordering
-            name_index = torch.tensor(self.shared_attr_vocab.name_to_index[attr.name], dtype=torch.long)
+            name_idx = self.shared_attr_vocab.ensure_index(attr.name)
+            name_index = torch.tensor(name_idx, dtype=torch.long, device=self.shared_attr_vocab.embedding.weight.device)
             value = self.get_value_tensor(value)
             phis.append(self.attr_encoder(torch.cat([self.shared_attr_vocab.embedding(name_index), value], dim=0)))
         return self.aggregator(torch.stack(phis, dim=0).sum(dim=0))
@@ -465,14 +484,22 @@ class GraphDecoder(nn.Module):
                     if name_index == self.shared_attr_vocab.name_to_index["<EOS>"]:
                         break
                     elif name_index == self.shared_attr_vocab.name_to_index["<UNK>"]:
-                        name_index = len(self.shared_attr_vocab.name_to_index)
                         name = generate_random_string(8)
-                        self.shared_attr_vocab.name_to_index[name] = name_index
-                        self.shared_attr_vocab.index_to_name[name_index] = name
+                        name_index = self.shared_attr_vocab.ensure_index(name)
                     else:
-                        name = self.shared_attr_vocab.index_to_name[name_index]
+                        name = self.shared_attr_vocab.index_to_name.get(name_index)
+                        if name is None:
+                            name = generate_random_string(8)
+                            name_index = self.shared_attr_vocab.ensure_index(name)
+                        else:
+                            name_index = self.shared_attr_vocab.ensure_index(name)
 
-                    attr_dims = max(1, int(math.ceil(F.softplus(self.attr_dims_head(embedding)).item())))
+                    raw_dim = self.attr_dims_head(embedding).squeeze()
+                    raw_dim = torch.nan_to_num(raw_dim, nan=0.0, posinf=20.0, neginf=-20.0)
+                    dim_val = F.softplus(raw_dim)
+                    dim_val = torch.nan_to_num(dim_val, nan=1.0, posinf=float(self.max_attributes_per_node), neginf=1.0)
+                    attr_dims = int(torch.clamp(dim_val, min=1.0, max=float(self.max_attributes_per_node)).item())
+                    attr_dims = max(1, min(attr_dims, self.max_attributes_per_node))
                     values = []
                     value_hidden = embedding.unsqueeze(0).unsqueeze(1)
                     value_input = torch.zeros(1, 1, 1, device=device)
@@ -590,6 +617,22 @@ class SelfCompressingFitnessRegularizedDAGVAE(nn.Module):
         mu_g, lv_g, mu_t, lv_t = self.encode(node_types, edge_index, node_attributes, batch, task_type, task_features)
         graph_latent = self.reparameterize(mu_g, lv_g, self.graph_latent_mask)
         task_latent = self.reparameterize(mu_t, lv_t, self.tasks_latent_mask)
+        if graph_latent.size(0) != task_latent.size(0):
+            min_len = min(graph_latent.size(0), task_latent.size(0))
+            if graph_latent.size(0) != min_len:
+                warn(
+                    f"Graph latent batch ({graph_latent.size(0)}) larger than task latent ({task_latent.size(0)}); trimming"
+                )
+            if task_latent.size(0) != min_len:
+                warn(
+                    f"Task latent batch ({task_latent.size(0)}) larger than graph latent ({graph_latent.size(0)}); trimming"
+                )
+            graph_latent = graph_latent[:min_len]
+            task_latent = task_latent[:min_len]
+            mu_g = mu_g[:min_len]
+            lv_g = lv_g[:min_len]
+            mu_t = mu_t[:min_len]
+            lv_t = lv_t[:min_len]
         decoded_graphs = self.decode(graph_latent)
         fitness_pred = self.fitness_predictor(graph_latent, task_latent)
         return decoded_graphs, fitness_pred, graph_latent, task_latent, mu_g, lv_g, mu_t, lv_t
@@ -717,6 +760,15 @@ class OnlineTrainer:
                     batch.task_type,
                     batch.task_features,
                 )
+                if fitness_pred.size(0) != batch.y.size(0):
+                    min_len = min(fitness_pred.size(0), batch.y.size(0))
+                    warn(
+                        f"Mismatch between fitness_pred ({fitness_pred.size(0)}) and targets ({batch.y.size(0)}); trimming"
+                    )
+                    fitness_pred = fitness_pred[:min_len]
+                    target_y = batch.y[:min_len]
+                else:
+                    target_y = batch.y
                 mean_var = task_latent.var(dim=0).mean().item()
                 if mean_var < 1e-3:
                     warn(
@@ -800,7 +852,7 @@ class OnlineTrainer:
                 task_kl_loss = calc_kl_div_per_dim(self.model.log_alpha_t, lv_t, mu_t).sum(dim=1).mean()
 
                 # --- 4) fitness loss ---
-                loss_fitness = F.mse_loss(fitness_pred, batch.y.to(self.device))
+                loss_fitness = F.mse_loss(fitness_pred, target_y.to(self.device))
 
                 # --- 5) total & backward ---
                 loss_terms = [

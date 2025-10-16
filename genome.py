@@ -5,7 +5,6 @@ from random import choice, random, shuffle
 from typing import Dict, List, Tuple
 
 import torch
-
 from neat.aggregations import AggregationFunctionSet
 from neat.config import ConfigParameter, write_pretty_params
 from neat.graphs import creates_cycle, required_for_output
@@ -13,7 +12,7 @@ from neat.graphs import creates_cycle, required_for_output
 from attributes import BoolAttribute, FloatAttribute, IntAttribute, StringAttribute
 from computation_graphs.functions.activation import *
 from computation_graphs.functions.aggregation import *
-from genes import ConnectionGene, NodeGene, NODE_TYPE_TO_INDEX
+from genes import NODE_TYPE_TO_INDEX, ConnectionGene, NodeGene
 
 
 class OptimizerGenomeConfig(object):
@@ -193,8 +192,6 @@ class OptimizerGenome(object):
                 # Homologous gene: combine genes from both parents.
                 self.nodes[key] = ng1.crossover(ng2)
 
-
-
     def mutate(self, config):
         """Mutates this genome."""
 
@@ -271,10 +268,15 @@ class OptimizerGenome(object):
         Attempt to add a new connection, the only restriction being that the output
         node cannot be one of the network input pins.
         """
-        possible_outputs = list(self.nodes)
-        out_node = choice(possible_outputs)
+        possible_outputs = [n for n in self.nodes if n not in config.input_keys]
+        if not possible_outputs:
+            return
 
-        possible_inputs = possible_outputs + config.input_keys
+        possible_inputs = list(self.nodes) + config.input_keys
+        if not possible_inputs:
+            return
+
+        out_node = choice(possible_outputs)
         in_node = choice(possible_inputs)
 
         # Don't duplicate connections.
