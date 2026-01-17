@@ -90,7 +90,10 @@ class GuidedReproduction(DefaultReproduction):
                     task.name(), task.features, list(s.members.values()), self.reproduction_config, spawn // 2
                 )
                 for kid in guided:
-                    new_population[kid.key] = kid
+                    gid = next(self.genome_indexer)
+                    kid.key = gid
+                    new_population[gid] = kid
+                    self.ancestors[gid] = (None, None)
 
             # 2) standard NEAT crossover + mutation
             if spawn - spawn // 2 > 0:

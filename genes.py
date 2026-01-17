@@ -148,6 +148,7 @@ class NodeGene(BaseGene):
 
 class ConnectionGene(BaseGene):
     _gene_attributes = [
+        FloatAttribute("weight"),
         BoolAttribute("enabled"),
     ]
 
@@ -181,8 +182,11 @@ class ConnectionGene(BaseGene):
         d = 0.0
         if self.key[0] != other.key[0]:
             d += 1
-        if self.key[1] != other.key[0]:
+        if self.key[1] != other.key[1]:
             d += 1
         if self.enabled != other.enabled:
             d += 1
-        return d * config.compatibility_weight_coefficient
+        weight_self = getattr(self, "weight", 0.0)
+        weight_other = getattr(other, "weight", 0.0)
+        weight_diff = abs(weight_self - weight_other)
+        return d * config.compatibility_weight_coefficient + weight_diff

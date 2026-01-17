@@ -1,6 +1,7 @@
 import random
 import time
 import tracemalloc
+import weakref
 from typing import Dict, List
 from warnings import warn
 
@@ -22,6 +23,8 @@ from tasks import *
 
 
 class GuidedPopulation(Population):
+    _optimizer_state_attr_cache: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
     def __init__(self, config):
         super().__init__(config)
         graph_latent_dim = 16
@@ -220,6 +223,7 @@ class GuidedPopulation(Population):
 
             # Re‐speciate and finalize generation
             self.species.speciate(self.config, self.population, self.generation)
+            self._adjust_compatibility_threshold(len(self.species.species))
             self.reporters.end_generation(self.config, self.population, self.species)
 
             self.generation += 1
@@ -307,13 +311,13 @@ class GuidedPopulation(Population):
         for step in range(steps):
             metrics_values = task.evaluate_metrics(model, task.train_data).requires_grad_()
             named_params = list(model.named_parameters())
-            self._ensure_optimizer_state_shapes(optimizer, named_params)
             try:
                 updated_state = optimizer(metrics_values, prev_metrics_values, named_params)
             except RuntimeError as err:
                 if "size of tensor" in str(err) and "must match" in str(err):
                     warn("Optimizer state mismatch detected; resetting state buffers and retrying")
                     self._reset_optimizer_state(optimizer, named_params)
+                    self._ensure_optimizer_state_shapes(optimizer, named_params)
                     updated_state = optimizer(metrics_values, prev_metrics_values, named_params)
                 else:
                     raise
@@ -328,6 +332,20 @@ class GuidedPopulation(Population):
         validation_metrics = task.evaluate_metrics(model, task.valid_data).detach().data.numpy()
         validation_metrics = {m: float(validation_metrics[i]) for i, m in enumerate(task.metrics)}
         return area_under_metrics, validation_metrics, time_cost, peak_memory
+
+    def _adjust_compatibility_threshold(self, species_count):
+        # Dynamically adapt compatibility threshold to encourage multiple species.
+        target = max(2, self.config.pop_size // 10)
+        threshold = self.config.species_set_config.compatibility_threshold
+        if species_count < target:
+            threshold = max(0.1, threshold * 0.9)
+            self.reporters.info(f"Reduced compatibility threshold to {threshold:.3f} to encourage speciation")
+        elif species_count > target * 1.5:
+            threshold *= 1.05
+            self.reporters.info(
+                f"Increased compatibility threshold to {threshold:.3f} to control species proliferation"
+            )
+        self.config.species_set_config.compatibility_threshold = threshold
 
     @staticmethod
     def _ensure_optimizer_state_shapes(optimizer, named_params):
@@ -404,6 +422,14 @@ class GuidedPopulation(Population):
 
     @staticmethod
     def _optimizer_state_attributes(optimizer):
+        cache = GuidedPopulation._optimizer_state_attr_cache
+        try:
+            cached = cache.get(optimizer)
+        except TypeError:
+            cached = None
+        if cached is not None:
+            return cached
+
         attrs = []
         for attr in dir(optimizer):
             if attr.startswith("_"):
@@ -422,6 +448,11 @@ class GuidedPopulation(Population):
                 if not all(isinstance(v, torch.Tensor) for v in mapping.values() if v is not None):
                     continue
             attrs.append(attr)
+        try:
+            cache[optimizer] = attrs
+        except TypeError:
+            # TorchScript objects may not support weak references; skip caching in that case.
+            pass
         return attrs
 
     @staticmethod
