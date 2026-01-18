@@ -148,7 +148,6 @@ class NodeGene(BaseGene):
 
 class ConnectionGene(BaseGene):
     _gene_attributes = [
-        FloatAttribute("weight"),
         BoolAttribute("enabled"),
     ]
 
