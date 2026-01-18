@@ -33,6 +33,14 @@ Using Pareto-based selection yields a diverse **Pareto front** of solutions, eac
 
 In summary, multi-objective evolutionary selection ensures that the project optimizes not only for how well a network learns, but also for how elegant or tractable its design is. This keeps the search grounded, preventing bloated solutions and steering evolution toward general-purpose networks that are both **high-performing and low-complexity**.
 
+### Stabilizing Graph Attribute Decoding
+
+To avoid decoder stalls from attr-name loops that never received a termination signal, teacher forcing is used for those sequences:
+
+- The shared attribute vocabulary assigns explicit `<SOS>`/`<EOS>` tokens and exposes helpers that serialize each node’s dynamic attributes into deterministic name sequences. These targets supervise the attr-name GRU whenever ground-truth graphs exist.
+- The graph decoder optionally consumes those targets, drives the GRU with embedded ground-truth tokens, and accumulates a per-step cross-entropy loss.
+- The trainer groups batched node attributes, builds the token targets, passes them through the guide model, and blends the decoder’s cross-entropy into the feature reconstruction term.
+
 ### Generative Cross-Species Crossover (Graph-VAE)
 
 Another key innovation is a Variational Autoencoder (VAE) that enables unrestricted structural recombination of neural network architectures. Traditional neuroevolution methods like NEAT use crossover within the same "species" of networks and rely on aligning genes (nodes and connections) based on historical markers to recombine two parents. Those methods struggle to recombine vastly different topologies because the correspondence between parts of two very different networks is ambiguous. The approach addresses this by **learning a continuous encoding of network graphs**, allowing any two networks-even of entirely different designs-to **mate** in a meaningful way ([54](#references)).
