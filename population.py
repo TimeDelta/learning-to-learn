@@ -121,7 +121,13 @@ class GuidedPopulation(Population):
                 )
             )
         batch = Batch.from_data_list(data_list)
-        mu_g, lv_g = self.guide.graph_encoder(batch.node_types, batch.edge_index, batch.node_attributes, batch.batch)
+        mu_g, lv_g = self.guide.graph_encoder(
+            batch.node_types,
+            batch.edge_index,
+            batch.node_attributes,
+            batch.batch,
+            num_graphs=batch.num_graphs,
+        )
         z_g_encoded = self.guide.reparameterize(mu_g, lv_g, self.guide.graph_latent_mask)
         z_g_encoded = z_g_encoded.clone().detach().requires_grad_(True)
         num_random = n_offspring - num_encode
@@ -173,7 +179,7 @@ class GuidedPopulation(Population):
         for i, graph_dict in enumerate(graphs):
             optimizer = rebuild_and_script(graph_dict, self.config.genome_config, key=i)
             if optimizer:
-                genome = OptimizerGenome(i)
+                genome = genome_from_graph_dict(graph_dict, self.config.genome_config, key=i)
                 genome.optimizer = optimizer
                 genome.graph_dict = graph_dict
                 new_genomes.append(genome)

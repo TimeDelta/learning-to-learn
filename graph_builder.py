@@ -5,7 +5,7 @@ import torch._C
 import torch.nn as nn
 from torch._C import Graph, Node
 
-from genes import NodeGene
+from genes import NODE_TYPE_OPTIONS, NodeGene
 from genome import OptimizerGenome
 
 
@@ -250,30 +250,57 @@ class DynamicOptimizerModule(nn.Module):
         return outputs
 
 
+def genome_from_graph_dict(graph_dict, genome_config, key=None) -> OptimizerGenome:
+    """Instantiate an OptimizerGenome's nodes/connections from a decoded graph dict."""
+    genome = OptimizerGenome(key)
+    genome.nodes = {}
+    node_types_val = graph_dict.get("node_types")
+    if node_types_val is None:
+        raise ValueError("graph_dict missing node_types")
+    if isinstance(node_types_val, torch.Tensor):
+        node_type_indices = node_types_val.clone().detach().view(-1).tolist()
+    else:
+        node_type_indices = list(node_types_val)
+    node_attrs_seq = graph_dict.get("node_attributes", [])
+    for nid, type_idx in enumerate(node_type_indices):
+        ng = NodeGene(nid, None)
+        attr_dict = node_attrs_seq[nid] if nid < len(node_attrs_seq) else {}
+        node_type_name = attr_dict.get("node_type")
+        if node_type_name is None:
+            try:
+                node_type_name = NODE_TYPE_OPTIONS[int(type_idx)]
+            except (ValueError, TypeError, IndexError):
+                node_type_name = "hidden"
+        ng.node_type = node_type_name
+        ng.dynamic_attributes = dict(attr_dict)
+        genome.nodes[nid] = ng
+    genome.next_node_id = len(genome.nodes)
+
+    genome.connections = {}
+    edge_index_val = graph_dict.get("edge_index")
+    if edge_index_val is not None:
+        if isinstance(edge_index_val, torch.Tensor):
+            edge_tensor = edge_index_val.clone().detach().long()
+        else:
+            edge_tensor = torch.as_tensor(edge_index_val, dtype=torch.long)
+        if edge_tensor.dim() == 1:
+            edge_tensor = edge_tensor.view(2, -1)
+        if edge_tensor.numel() > 0:
+            for src, dst in edge_tensor.t().tolist():
+                cg = genome.create_connection(genome_config, src, dst)
+                cg.enabled = True
+                genome.connections[(src, dst)] = cg
+
+    return genome
+
+
 def rebuild_and_script(graph_dict, config, key) -> DynamicOptimizerModule:
     """
     1) Rebuild the genome nodes+connections (as before)
     2) Create ScriptModule, attach `w_src_dst` Parameters
     3) Generate the IR with `build_forward_graph` and hook it up
     """
-    # --- rebuild genome structure ---
-    genome = OptimizerGenome(key)
-
-    # nodes
-    node_types = graph_dict["node_types"].tolist()
-    node_attrs = graph_dict["node_attributes"]
-    for nid, _ in enumerate(node_types):
-        ng = NodeGene(nid, None)
-        ng.node_type = node_attrs[nid].get("node_type")
-        ng.dynamic_attributes = dict(node_attrs[nid])
-        genome.nodes[nid] = ng
-    genome.next_node_id = len(node_types)
-
-    # connections
-    for src, dst in graph_dict["edge_index"].t().tolist():
-        cg = genome.create_connection(config, src, dst)
-        cg.enabled = True
-        genome.connections[(src, dst)] = cg
+    genome = genome_from_graph_dict(graph_dict, config, key)
 
     # --- build a Python module and script it ---
     module = DynamicOptimizerModule(genome, config.input_keys, config.output_keys, graph_dict)

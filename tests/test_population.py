@@ -4,6 +4,7 @@ import sys
 import neat
 import numpy as np
 import torch
+from torch_geometric.data import Batch, Data
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
@@ -14,7 +15,10 @@ from models import ManyLossMinimaModel
 from population import GuidedPopulation
 from reproduction import GuidedReproduction
 from search_space_compression import (
+    GraphEncoder,
+    NodeAttributeDeepSetEncoder,
     OnlineTrainer,
+    SharedAttributeVocab,
     TaskConditionedFitnessPredictor,
     flatten_task_features,
 )
@@ -201,6 +205,36 @@ def test_trainer_normalizes_task_feature_shapes():
     data.task_features = torch.randn(72)  # emulate legacy 1-D storage
     pop.trainer._normalize_task_feature_shapes()
     assert data.task_features.dim() == 2
+
+
+def test_graph_encoder_pads_trailing_empty_graphs():
+    shared_vocab = SharedAttributeVocab([], embedding_dim=4)
+    attr_encoder = NodeAttributeDeepSetEncoder(shared_vocab, encoder_hdim=4, aggregator_hdim=4, out_dim=4)
+    encoder = GraphEncoder(len(NODE_TYPE_TO_INDEX), attr_encoder, latent_dim=2, hidden_dims=[4])
+
+    populated = Data(
+        node_types=torch.tensor([NODE_TYPE_TO_INDEX["aten::add"]], dtype=torch.long),
+        edge_index=torch.empty((2, 0), dtype=torch.long),
+        node_attributes=[{IntAttribute("foo"): 1}],
+    )
+    empty = Data(
+        node_types=torch.empty(0, dtype=torch.long),
+        edge_index=torch.empty((2, 0), dtype=torch.long),
+        node_attributes=[],
+    )
+
+    batch = Batch.from_data_list([populated, empty])
+    mu, lv = encoder(
+        batch.node_types,
+        batch.edge_index,
+        batch.node_attributes,
+        batch.batch,
+        num_graphs=batch.num_graphs,
+    )
+
+    assert batch.num_graphs == 2
+    assert mu.shape[0] == batch.num_graphs
+    assert lv.shape[0] == batch.num_graphs
 
 
 def test_evaluate_optimizer_resizes_state_before_execution():

@@ -379,7 +379,7 @@ class GraphEncoder(nn.Module):
     def shared_attr_vocab(self):
         return self.attr_encoder.shared_attr_vocab
 
-    def forward(self, node_types, edge_index, node_attributes, batch):
+    def forward(self, node_types, edge_index, node_attributes, batch, num_graphs: Optional[int] = None):
         type_embedding = self.node_type_embedding(node_types)
         num_nodes = len(node_types)
         attr_embedding = torch.zeros((num_nodes, self.attr_encoder.out_dim), device=type_embedding.device)
@@ -408,7 +408,21 @@ class GraphEncoder(nn.Module):
         x = torch.cat([type_embedding, attr_embedding], dim=-1)
         for conv in self.convs:
             x = conv(x, edge_index)
-        x = global_mean_pool(x, batch)
+
+        if num_nodes == 0:
+            pooled = x.new_zeros((0, x.size(-1)))
+        else:
+            pooled = global_mean_pool(x, batch)
+
+        if num_graphs is not None:
+            expected = int(num_graphs)
+            current = pooled.size(0)
+            if current < expected:
+                pad = pooled.new_zeros((expected - current, pooled.size(1)))
+                pooled = torch.cat([pooled, pad], dim=0)
+            elif current > expected:
+                pooled = pooled[:expected]
+        x = pooled
         mu = self.lin_mu(x)
         logvar = self.lin_logvar(x)
         return mu, logvar
@@ -972,8 +986,8 @@ class SelfCompressingFitnessRegularizedDAGVAE(nn.Module):
     def max_value_dim(self):
         return self.graph_encoder.max_value_dim
 
-    def encode(self, node_types, edge_index, node_attributes, batch, task_type, task_features):
-        mu_g, lv_g = self.graph_encoder(node_types, edge_index, node_attributes, batch)
+    def encode(self, node_types, edge_index, node_attributes, batch, task_type, task_features, num_graphs=None):
+        mu_g, lv_g = self.graph_encoder(node_types, edge_index, node_attributes, batch, num_graphs=num_graphs)
         mu_t, lv_t = self.tasks_encoder(task_type, task_features)
         return mu_g, lv_g, mu_t, lv_t
 
@@ -995,8 +1009,17 @@ class SelfCompressingFitnessRegularizedDAGVAE(nn.Module):
         task_features,
         teacher_attr_targets: Optional[List[List[List[int]]]] = None,
         fitness_dims: Optional[torch.LongTensor] = None,
+        num_graphs: Optional[int] = None,
     ):
-        mu_g, lv_g, mu_t, lv_t = self.encode(node_types, edge_index, node_attributes, batch, task_type, task_features)
+        mu_g, lv_g, mu_t, lv_t = self.encode(
+            node_types,
+            edge_index,
+            node_attributes,
+            batch,
+            task_type,
+            task_features,
+            num_graphs=num_graphs,
+        )
         graph_latent = self.reparameterize(mu_g, lv_g, self.graph_latent_mask)
         task_latent = self.reparameterize(mu_t, lv_t, self.tasks_latent_mask)
         if graph_latent.size(0) != task_latent.size(0):
@@ -1195,6 +1218,7 @@ class OnlineTrainer:
                     batch.task_features,
                     teacher_attr_targets=teacher_attr_targets,
                     fitness_dims=batch.fitness_dim,
+                    num_graphs=batch.num_graphs,
                 )
                 target_y = batch.y
                 mean_var = task_latent.var(dim=0).mean().item()

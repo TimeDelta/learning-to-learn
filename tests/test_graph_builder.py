@@ -13,7 +13,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from compare_encoders import optimizer_to_data
 from genome import OptimizerGenome
-from graph_builder import rebuild_and_script
+from graph_builder import genome_from_graph_dict, rebuild_and_script
 from reproduction import GuidedReproduction
 
 
@@ -194,3 +194,24 @@ def test_graph_builder_rebuilds_pt(pt_path):
 
     # Verify that the rebuilt computation graph is structurally identical to the original
     assert compare_jit_graphs_structural(original, rebuilt)
+
+
+def test_genome_from_graph_dict_hydrates_structure():
+    config = make_config()
+    graph_dict = {
+        "node_types": torch.tensor([0, 1], dtype=torch.long),
+        "edge_index": torch.tensor([[0], [1]], dtype=torch.long),
+        "node_attributes": [
+            {"node_type": "aten::add", "foo": torch.tensor([1.0])},
+            {"node_type": "aten::mul"},
+        ],
+    }
+
+    genome = genome_from_graph_dict(graph_dict, config.genome_config, key=7)
+
+    assert genome.key == 7
+    assert sorted(genome.nodes.keys()) == [0, 1]
+    assert genome.nodes[0].node_type == "aten::add"
+    assert genome.nodes[1].node_type == "aten::mul"
+    assert (0, 1) in genome.connections
+    assert genome.connections[(0, 1)].enabled
