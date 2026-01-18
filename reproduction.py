@@ -86,9 +86,7 @@ class GuidedReproduction(DefaultReproduction):
 
             # 1) guided children
             if spawn // 2 > 0:
-                guided = self.guide_fn(
-                    task.name(), task.features, list(s.members.values()), self.reproduction_config, spawn // 2
-                )
+                guided = self.guide_fn(task, list(s.members.values()), self.reproduction_config, spawn // 2)
                 for kid in guided:
                     gid = next(self.genome_indexer)
                     kid.key = gid

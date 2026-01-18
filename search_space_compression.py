@@ -5,7 +5,7 @@ import logging
 import math
 import os
 import time
-from typing import Any, Dict, List, Optional, Sequence, Set
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from warnings import warn
 
 import numpy as np
@@ -24,7 +24,7 @@ from torch_geometric.utils import (
     to_dense_batch,
 )
 
-from tasks import TASK_FEATURE_DIMS, TASK_TYPE_TO_INDEX
+from tasks import TASK_FEATURE_DIMS, TASK_INDEX_TO_DIM, TASK_TYPE_TO_INDEX
 from utility import generate_random_string
 
 
@@ -42,6 +42,32 @@ if not logger.handlers:
     handler.setFormatter(logging.Formatter("[%(levelname)s] %(name)s: %(message)s"))
     logger.addHandler(handler)
 logger.setLevel(logging.INFO)
+
+
+def flatten_task_features(task_features, expected_len: Optional[int] = None) -> np.ndarray:
+    """Flatten heterogeneous task feature collections into a single 1D array with optional padding."""
+    if isinstance(task_features, torch.Tensor):
+        return task_features.detach().cpu().view(-1).numpy()
+    if isinstance(task_features, np.ndarray):
+        return task_features.reshape(-1)
+    flat_parts: List[np.ndarray] = []
+    for feat in task_features:
+        if isinstance(feat, np.ndarray):
+            flat_parts.append(feat.reshape(-1))
+        elif isinstance(feat, torch.Tensor):
+            flat_parts.append(feat.detach().cpu().view(-1).numpy())
+        else:
+            flat_parts.append(np.atleast_1d(np.asarray(feat)))
+    if not flat_parts:
+        flat = np.array([], dtype=float)
+    else:
+        flat = np.concatenate(flat_parts, axis=0)
+    if expected_len is not None:
+        if flat.size < expected_len:
+            flat = np.pad(flat, (0, expected_len - flat.size))
+        elif flat.size > expected_len:
+            flat = flat[:expected_len]
+    return flat
 
 
 class DAGAttention(MessagePassing):
@@ -824,6 +850,8 @@ class FitnessPredictor(nn.Module):
         super().__init__()
         self.fc1 = nn.Linear(latent_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, fitness_dim)
+        self.output_dim = fitness_dim
+        self.latent_dim = latent_dim
 
     def forward(self, z_graph, z_task):
         return self.fc2(F.relu(self.fc1(torch.cat([z_graph, z_task], dim=-1))))
@@ -844,6 +872,69 @@ class FitnessPredictor(nn.Module):
         self.fc1 = prune_lin(self.fc1)
 
 
+class TaskConditionedFitnessPredictor(nn.Module):
+    """Maintains one fitness head per task type with task-specific output dimensionality."""
+
+    def __init__(self, latent_dim, hidden_dim=64):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.hidden_dim = hidden_dim
+        self.heads = nn.ModuleDict()
+        self.head_dims: Dict[str, int] = {}
+
+    def _key(self, task_type_id: int) -> str:
+        return str(int(task_type_id))
+
+    def ensure_head(self, task_type_id: int, output_dim: int) -> FitnessPredictor:
+        key = self._key(task_type_id)
+        head = self.heads[key] if key in self.heads else None
+        if head is None:
+            head = FitnessPredictor(self.latent_dim, self.hidden_dim, output_dim)
+            self.heads[key] = head
+            self.head_dims[key] = output_dim
+        else:
+            if self.head_dims[key] != output_dim:
+                raise ValueError(
+                    f"Existing fitness head for task {task_type_id} expects dim {self.head_dims[key]},"
+                    f" got {output_dim}"
+                )
+        return head
+
+    def forward(self, z_graph, z_task, task_types: torch.LongTensor, fitness_dims: torch.LongTensor) -> torch.Tensor:
+        if fitness_dims is None:
+            raise ValueError("fitness_dims tensor required for task-conditioned predictor")
+        if task_types.dim() == 0:
+            task_types = task_types.unsqueeze(0)
+        if fitness_dims.dim() == 0:
+            fitness_dims = fitness_dims.unsqueeze(0)
+        batch_size = z_graph.size(0)
+        max_dim = int(fitness_dims.max().item()) if batch_size > 0 else 0
+        if max_dim == 0:
+            return z_graph.new_zeros((batch_size, 0))
+        preds = z_graph.new_zeros((batch_size, max_dim))
+        unique_tasks = torch.unique(task_types).tolist()
+        for task_id in unique_tasks:
+            idx = (task_types == task_id).nonzero(as_tuple=False).view(-1)
+            if idx.numel() == 0:
+                continue
+            output_dim = int(fitness_dims[idx[0]].item())
+            head = self.ensure_head(task_id, output_dim)
+            head_pred = head(z_graph[idx], z_task[idx])
+            preds[idx, :output_dim] = head_pred
+        return preds
+
+    def predict_task(self, task_type_id: int, output_dim: int, z_graph, z_task) -> torch.Tensor:
+        head = self.ensure_head(task_type_id, output_dim)
+        return head(z_graph, z_task)
+
+    def prune_latent_dims(self, kept_idx: torch.LongTensor):
+        for head in self.heads.values():
+            head.prune_latent_dims(kept_idx)
+
+    def head_specs(self) -> List[Tuple[int, int]]:
+        return [(int(key), dim) for key, dim in self.head_dims.items()]
+
+
 class SelfCompressingFitnessRegularizedDAGVAE(nn.Module):
     """
     DAG-VAE with ARD prior that is regularized by fitness prediction from latent and has
@@ -855,7 +946,7 @@ class SelfCompressingFitnessRegularizedDAGVAE(nn.Module):
         graph_encoder: GraphEncoder,
         tasks_encoder: TasksEncoder,
         decoder: GraphDecoder,
-        fitness_predictor: FitnessPredictor,
+        fitness_predictor: TaskConditionedFitnessPredictor,
     ):
         super().__init__()
         self.graph_encoder = graph_encoder
@@ -903,32 +994,23 @@ class SelfCompressingFitnessRegularizedDAGVAE(nn.Module):
         task_type,
         task_features,
         teacher_attr_targets: Optional[List[List[List[int]]]] = None,
+        fitness_dims: Optional[torch.LongTensor] = None,
     ):
         mu_g, lv_g, mu_t, lv_t = self.encode(node_types, edge_index, node_attributes, batch, task_type, task_features)
         graph_latent = self.reparameterize(mu_g, lv_g, self.graph_latent_mask)
         task_latent = self.reparameterize(mu_t, lv_t, self.tasks_latent_mask)
         if graph_latent.size(0) != task_latent.size(0):
-            min_len = min(graph_latent.size(0), task_latent.size(0))
-            if graph_latent.size(0) != min_len:
-                warn(
-                    f"Graph latent batch ({graph_latent.size(0)}) larger than task latent ({task_latent.size(0)}); trimming"
-                )
-            if task_latent.size(0) != min_len:
-                warn(
-                    f"Task latent batch ({task_latent.size(0)}) larger than graph latent ({graph_latent.size(0)}); trimming"
-                )
-            graph_latent = graph_latent[:min_len]
-            task_latent = task_latent[:min_len]
-            mu_g = mu_g[:min_len]
-            lv_g = lv_g[:min_len]
-            mu_t = mu_t[:min_len]
-            lv_t = lv_t[:min_len]
+            raise RuntimeError(
+                "Graph and task latent batches must match, got " f"{graph_latent.size(0)} vs {task_latent.size(0)}"
+            )
         decoded = self.decode(graph_latent, teacher_attr_targets=teacher_attr_targets)
         if isinstance(decoded, tuple):
             decoded_graphs, decoder_aux = decoded
         else:
             decoded_graphs, decoder_aux = decoded, None
-        fitness_pred = self.fitness_predictor(graph_latent, task_latent)
+        if fitness_dims is None:
+            raise RuntimeError("fitness_dims must be provided for task-conditioned fitness prediction")
+        fitness_pred = self.fitness_predictor(graph_latent, task_latent, task_type, fitness_dims)
         return decoded_graphs, fitness_pred, graph_latent, task_latent, mu_g, lv_g, mu_t, lv_t, decoder_aux
 
     def prune_latent_dims(self, num_prune=1):
@@ -984,6 +1066,14 @@ class SelfCompressingFitnessRegularizedDAGVAE(nn.Module):
 
         print("Bottlenecks resized")
 
+    def available_task_heads(self) -> List[Tuple[int, int]]:
+        return self.fitness_predictor.head_specs()
+
+    def predict_task_head(
+        self, task_type_id: int, output_dim: int, z_graph: torch.Tensor, z_task: torch.Tensor
+    ) -> torch.Tensor:
+        return self.fitness_predictor.predict_task(task_type_id, output_dim, z_graph, z_task)
+
 
 class OnlineTrainer:
     """
@@ -999,18 +1089,33 @@ class OnlineTrainer:
         self.loss_history = []
         self.initial_loss = None
         self.last_prune_epoch = 0
+        self.max_fitness_dim = 0
+        self.task_feature_bank: Dict[int, np.ndarray] = {}
+        self.task_metric_dims: Dict[int, int] = {}
 
     def add_data(self, graphs, fitnesses, task_type: str, task_features):
         for graph, fitness_dict in zip(graphs, fitnesses):
             data = graph.clone()
             # sort fitness values by key
             fitness = [f[1] for f in sorted(fitness_dict.items(), key=lambda item: item[0].name)]
-            data.y = torch.as_tensor(fitness, dtype=torch.float).unsqueeze(0)
-            data.task_type = torch.tensor([TASK_TYPE_TO_INDEX[task_type]], dtype=torch.long)
-            if isinstance(task_features, torch.Tensor):
-                data.task_features = task_features.detach().cpu().tolist()
-            else:
-                data.task_features = list(task_features)
+            task_type_id = TASK_TYPE_TO_INDEX[task_type]
+            expected_len = TASK_FEATURE_DIMS[task_type]
+            flat_features = flatten_task_features(task_features, expected_len)
+            self._remember_task_signature(task_type_id, flat_features, len(fitness))
+            flat_tensor = torch.as_tensor(flat_features, dtype=torch.float).unsqueeze(0)
+
+            fitness_tensor = torch.as_tensor(fitness, dtype=torch.float)
+            self._ensure_dataset_target_width(fitness_tensor.numel())
+            if fitness_tensor.numel() < self.max_fitness_dim:
+                pad = self.max_fitness_dim - fitness_tensor.numel()
+                fitness_tensor = torch.cat([fitness_tensor, torch.zeros(pad)], dim=-1)
+            mask = torch.zeros(self.max_fitness_dim, dtype=torch.float)
+            mask[: len(fitness)] = 1.0
+            data.y = fitness_tensor
+            data.fitness_mask = mask
+            data.fitness_dim = torch.tensor(len(fitness), dtype=torch.long)
+            data.task_type = torch.tensor(task_type_id, dtype=torch.long)
+            data.task_features = flat_tensor
             self.dataset.append(data)
 
     def train(
@@ -1027,6 +1132,7 @@ class OnlineTrainer:
         stop_epsilon=1e-3,
         verbose=True,
     ):
+        self._normalize_task_feature_shapes()
         loader = DataLoader(self.dataset, batch_size=batch_size, shuffle=True)
         dataset_size = len(self.dataset)
         total_batches = len(loader)
@@ -1088,16 +1194,9 @@ class OnlineTrainer:
                     batch.task_type,
                     batch.task_features,
                     teacher_attr_targets=teacher_attr_targets,
+                    fitness_dims=batch.fitness_dim,
                 )
-                if fitness_pred.size(0) != batch.y.size(0):
-                    min_len = min(fitness_pred.size(0), batch.y.size(0))
-                    warn(
-                        f"Mismatch between fitness_pred ({fitness_pred.size(0)}) and targets ({batch.y.size(0)}); trimming"
-                    )
-                    fitness_pred = fitness_pred[:min_len]
-                    target_y = batch.y[:min_len]
-                else:
-                    target_y = batch.y
+                target_y = batch.y
                 mean_var = task_latent.var(dim=0).mean().item()
                 if mean_var < 1e-3:
                     warn(
@@ -1185,7 +1284,12 @@ class OnlineTrainer:
                 task_kl_loss = calc_kl_div_per_dim(self.model.log_alpha_t, lv_t, mu_t).sum(dim=1).mean()
 
                 # --- 4) fitness loss ---
-                loss_fitness = F.mse_loss(fitness_pred, target_y.to(self.device))
+                mask = batch.fitness_mask.to(self.device)
+                target = target_y.to(self.device)
+                pred = self._align_pred_to_mask(fitness_pred, mask)
+                diff = (pred - target) * mask
+                denom = mask.sum().clamp_min(1.0)
+                loss_fitness = diff.pow(2).sum() / denom
 
                 # --- 5) total & backward ---
                 loss_terms = [
@@ -1257,6 +1361,50 @@ class OnlineTrainer:
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
         print("Optimizer Reinitialized")
 
+    def _ensure_dataset_target_width(self, new_width: int):
+        if new_width <= self.max_fitness_dim:
+            return
+        pad = new_width - self.max_fitness_dim
+        for data in self.dataset:
+            data.y = torch.cat([data.y, torch.zeros(pad)], dim=-1)
+            data.fitness_mask = torch.cat([data.fitness_mask, torch.zeros(pad)], dim=-1)
+        self.max_fitness_dim = new_width
+
+    def _remember_task_signature(self, task_type_id: int, flat_features: np.ndarray, fitness_dim: int):
+        self.task_feature_bank[task_type_id] = flat_features
+        self.task_metric_dims[task_type_id] = fitness_dim
+
+    def remember_task_signature(self, task_type: str, task_features, fitness_dim: int):
+        task_type_id = TASK_TYPE_TO_INDEX[task_type]
+        expected_len = TASK_FEATURE_DIMS[task_type]
+        flat = flatten_task_features(task_features, expected_len)
+        self._remember_task_signature(task_type_id, flat, fitness_dim)
+
+    def get_task_features(self, task_type_id: int) -> Optional[np.ndarray]:
+        return self.task_feature_bank.get(task_type_id)
+
+    def get_task_metric_dim(self, task_type_id: int) -> Optional[int]:
+        return self.task_metric_dims.get(task_type_id)
+
+    def _normalize_task_feature_shapes(self):
+        for data in self.dataset:
+            tf = getattr(data, "task_features", None)
+            if isinstance(tf, torch.Tensor) and tf.dim() == 1:
+                data.task_features = tf.unsqueeze(0)
+
+    @staticmethod
+    def _align_pred_to_mask(pred: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        if pred.dim() == 1:
+            pred = pred.unsqueeze(1)
+        if mask.dim() == 1:
+            mask = mask.unsqueeze(0)
+        if pred.size(1) < mask.size(1):
+            pad = mask.size(1) - pred.size(1)
+            pred = torch.cat([pred, pred.new_zeros(pred.size(0), pad)], dim=1)
+        elif pred.size(1) > mask.size(1):
+            pred = pred[:, : mask.size(1)]
+        return pred
+
 
 if __name__ == "__main__":
     from attributes import *
@@ -1274,7 +1422,7 @@ if __name__ == "__main__":
     graph_encoder = GraphEncoder(num_node_types, attr_encoder, graph_latent_dim, hidden_dims=[32, 32])
     task_encoder = TasksEncoder(hidden_dim=16, latent_dim=task_latent_dim, type_embedding_dim=8)
     decoder = GraphDecoder(num_node_types, graph_latent_dim, shared_attr_vocab)
-    predictor = FitnessPredictor(latent_dim=graph_latent_dim + task_latent_dim, hidden_dim=64, fitness_dim=fitness_dim)
+    predictor = TaskConditionedFitnessPredictor(latent_dim=graph_latent_dim + task_latent_dim, hidden_dim=64)
     model = SelfCompressingFitnessRegularizedDAGVAE(graph_encoder, task_encoder, decoder, predictor)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 

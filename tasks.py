@@ -201,3 +201,5 @@ TASK_FEATURE_DIMS = {
     n: 4 * len(c.random_init(num_samples=4, silent=True).feature_functions) for n, c in TASK_TYPE_TO_CLASS.items()
 }
 TASK_TYPE_TO_INDEX = {k: i for i, k in enumerate(TASK_FEATURE_DIMS.keys())}
+TASK_INDEX_TO_TYPE = {i: k for k, i in TASK_TYPE_TO_INDEX.items()}
+TASK_INDEX_TO_DIM = {TASK_TYPE_TO_INDEX[name]: dim for name, dim in TASK_FEATURE_DIMS.items()}

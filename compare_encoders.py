@@ -113,7 +113,7 @@ def evaluate_fitness_loss(model, graphs, fitnesses, task_type, task_features, ba
     for graph, fitness_dict in zip(graphs, fitnesses):
         data = graph.clone()
         fitness = [f[1] for f in sorted(fitness_dict.items(), key=lambda item: item[0].name)]
-        data.y = torch.tensor(fitness, dtype=torch.float).unsqueeze(0)
+        data.y = torch.tensor(fitness, dtype=torch.float)
         data.task_type = torch.tensor([TASK_TYPE_TO_INDEX[task_type]], dtype=torch.long)
         if isinstance(task_features, torch.Tensor):
             data.task_features = task_features.detach().cpu().tolist()

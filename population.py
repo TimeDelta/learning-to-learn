@@ -1,4 +1,5 @@
 import random
+import re
 import time
 import tracemalloc
 import weakref
@@ -30,7 +31,6 @@ class GuidedPopulation(Population):
         graph_latent_dim = 16
         task_latent_dim = 10
         num_node_types = 10
-        fitness_dim = 4
         self.shared_attr_vocab = SharedAttributeVocab([], 5)
         attr_encoder = NodeAttributeDeepSetEncoder(
             self.shared_attr_vocab, encoder_hdim=10, aggregator_hdim=20, out_dim=50
@@ -42,9 +42,7 @@ class GuidedPopulation(Population):
             hidden_dim=16, latent_dim=task_latent_dim, type_embedding_dim=max(len(TASK_FEATURE_DIMS) // 2, 1)
         )
         decoder = GraphDecoder(len(NODE_TYPE_OPTIONS), graph_latent_dim, self.shared_attr_vocab)
-        predictor = FitnessPredictor(
-            latent_dim=graph_latent_dim + task_latent_dim, hidden_dim=64, fitness_dim=fitness_dim
-        )
+        predictor = TaskConditionedFitnessPredictor(latent_dim=graph_latent_dim + task_latent_dim, hidden_dim=64)
 
         self.guide = SelfCompressingFitnessRegularizedDAGVAE(graph_encoder, task_encoder, decoder, predictor)
         self.optimizer = torch.optim.Adam(self.guide.parameters(), lr=0.001)
@@ -85,8 +83,7 @@ class GuidedPopulation(Population):
 
     def generate_guided_offspring(
         self,
-        task_type: str,
-        task_features: List[np.ndarray],
+        task,
         starting_genomes: List[OptimizerGenome],
         config,
         n_offspring: int = 10,
@@ -98,13 +95,14 @@ class GuidedPopulation(Population):
         the surrogate predictor, decode each optimized z_g back into a DAG, then
         convert those DAGs into new NEAT genomes.
         """
-        # 1) Get the task embedding (mu_t, lv_t) and a fixed z_t
-        task_features = [np.concatenate(task_features, axis=0)]
-        mu_t, lv_t = self.guide.tasks_encoder(
-            torch.tensor([TASK_TYPE_TO_INDEX[task_type]], dtype=torch.long), task_features
-        )
+        task_type = task.name()
+        task_type_id = TASK_TYPE_TO_INDEX[task_type]
+        metric_dim = len(task.metrics)
+        self.trainer.remember_task_signature(task_type, task.features, metric_dim)
+        expected_len = TASK_FEATURE_DIMS[task_type]
+        flat_features = flatten_task_features(task.features, expected_len)
+        mu_t, lv_t = self.guide.tasks_encoder(torch.tensor([task_type_id], dtype=torch.long), [flat_features])
         z_t = self.guide.reparameterize(mu_t, lv_t, self.guide.tasks_latent_mask).detach()
-        # expand to match the number of offspring
         z_t = z_t.expand(n_offspring, -1).clone()
 
         # 2) Initialize random graph latents and set requires_grad=True
@@ -133,23 +131,44 @@ class GuidedPopulation(Population):
         else:
             z_g = z_g_encoded
 
-        # 3) Optimize z_g via Adam ascent to maximize predictor(z_g, z_t)
+        total_latents = z_g.size(0)
+        if total_latents == 0:
+            return []
+
+        head_specs = self.guide.available_task_heads()
+        if not head_specs:
+            head_specs = [(task_type_id, metric_dim)]
+        elif task_type_id not in {tid for tid, _ in head_specs}:
+            head_specs.append((task_type_id, metric_dim))
+
+        head_latents = []
+        for head_task_id, head_dim in head_specs:
+            features = self.trainer.get_task_features(head_task_id)
+            if features is None:
+                if head_task_id == task_type_id:
+                    features = flat_features
+                else:
+                    continue
+            mu_t_head, lv_t_head = self.guide.tasks_encoder(torch.tensor([head_task_id], dtype=torch.long), [features])
+            z_t_head = self.guide.reparameterize(mu_t_head, lv_t_head, self.guide.tasks_latent_mask).detach()
+            head_latents.append((head_task_id, head_dim, z_t_head.expand(total_latents, -1).clone()))
+
+        if not head_latents:
+            head_latents.append((task_type_id, metric_dim, z_t))
+
         opt = torch.optim.Adam([z_g], lr=latent_lr)
         for _ in range(latent_steps):
-            min_len = min(z_g.size(0), z_t.size(0))
-            if z_g.size(0) != z_t.size(0):
-                warn(
-                    f"Guide fitness predictor batch mismatch: z_g={z_g.size(0)}, z_t={z_t.size(0)}; trimming to {min_len}"
-                )
-            pred = self.guide.fitness_predictor(z_g[:min_len], z_t[:min_len])
-            loss = -pred.sum(dim=1).mean()
+            loss = 0.0
+            for head_task_id, head_dim, z_t_head in head_latents:
+                pred = self.guide.predict_task_head(head_task_id, head_dim, z_g, z_t_head)
+                loss = loss - pred.sum(dim=1).mean()
             opt.zero_grad()
             loss.backward()
             opt.step()
 
         # 4) Decode
         with torch.no_grad():
-            graphs = self.guide.decode(z_g[:min_len])
+            graphs = self.guide.decode(z_g)
         new_genomes = []
         for i, graph_dict in enumerate(graphs):
             optimizer = rebuild_and_script(graph_dict, self.config.genome_config, key=i)
@@ -311,6 +330,12 @@ class GuidedPopulation(Population):
         for step in range(steps):
             metrics_values = task.evaluate_metrics(model, task.train_data).requires_grad_()
             named_params = list(model.named_parameters())
+            # When the underlying task changes between generations the model's
+            # parameter shapes can shrink or grow. TorchScript optimizers keep
+            # persistent state (e.g., Adam moments) keyed by parameter name, so
+            # proactively make sure those buffers match the current shapes
+            # before executing the optimizer to avoid shape-mismatch errors.
+            self._ensure_optimizer_state_shapes(optimizer, named_params)
             try:
                 updated_state = optimizer(metrics_values, prev_metrics_values, named_params)
             except RuntimeError as err:
@@ -430,9 +455,16 @@ class GuidedPopulation(Population):
         if cached is not None:
             return cached
 
-        attrs = []
-        for attr in dir(optimizer):
-            if attr.startswith("_"):
+        attrs: List[str] = []
+
+        candidate_attrs = set()
+        candidate_attrs.update(dir(optimizer))
+        code = getattr(optimizer, "code", None)
+        if isinstance(code, str):
+            candidate_attrs.update(re.findall(r"self\.([A-Za-z0-9_]+)", code))
+
+        for attr in candidate_attrs:
+            if not isinstance(attr, str) or attr.startswith("_"):
                 continue
             try:
                 value = getattr(optimizer, attr)
@@ -442,12 +474,21 @@ class GuidedPopulation(Population):
                 mapping = dict(value)
             except Exception:
                 continue
+            valid_mapping = False
             if mapping:
-                if not all(isinstance(k, str) for k in mapping.keys()):
+                if all(isinstance(k, str) for k in mapping.keys()) and all(
+                    isinstance(v, torch.Tensor) for v in mapping.values() if v is not None
+                ):
+                    valid_mapping = True
+                else:
                     continue
-                if not all(isinstance(v, torch.Tensor) for v in mapping.values() if v is not None):
-                    continue
-            attrs.append(attr)
+            else:
+                # Accept empty dict-like attributes (TorchScript Dict[str, Tensor]) so we can
+                # populate them later even before they've stored any state.
+                if isinstance(value, dict):
+                    valid_mapping = True
+            if valid_mapping:
+                attrs.append(attr)
         try:
             cache[optimizer] = attrs
         except TypeError:
