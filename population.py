@@ -62,7 +62,8 @@ class GuidedPopulation(Population):
             idx = NODE_TYPE_TO_INDEX.get(node.node_type)
             if idx is None:
                 raise KeyError(f"Unknown node_type {node.node_type!r}")
-            self.shared_attr_vocab.add_names([a.name for a in node.dynamic_attributes.keys()])
+            attr_names = [attribute_key_to_name(a) for a in node.dynamic_attributes.keys()]
+            self.shared_attr_vocab.add_names(attr_names)
             node_types.append(idx)
             node_attributes.append(node.dynamic_attributes)
         node_types = torch.tensor(node_types, dtype=torch.long)

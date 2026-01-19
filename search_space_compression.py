@@ -340,8 +340,11 @@ class NodeAttributeDeepSetEncoder(nn.Module):
             return torch.zeros(self.aggregator[-1].out_features)
 
         phis = []
-        for attr, value in sorted(attr_dict.items(), key=lambda i: i[0].name):  # consistent ordering
-            name_idx = self.shared_attr_vocab.ensure_index(attr.name)
+        for attr, value in sorted(
+            attr_dict.items(), key=lambda item: attribute_key_to_name(item[0])
+        ):  # consistent ordering
+            attr_name = attribute_key_to_name(attr)
+            name_idx = self.shared_attr_vocab.ensure_index(attr_name)
             name_index = torch.tensor(name_idx, dtype=torch.long, device=self.shared_attr_vocab.embedding.weight.device)
             value = self.get_value_tensor(value)
             phis.append(self.attr_encoder(torch.cat([self.shared_attr_vocab.embedding(name_index), value], dim=0)))
@@ -569,6 +572,19 @@ class GraphDecoder(nn.Module):
             attr_teacher_tokens = 0
             if teacher_attr_targets is not None:
                 attr_teacher_loss = latent.new_tensor(0.0)
+                # ensure decoder caps accommodate teacher supervision
+                max_teacher_nodes = 0
+                max_teacher_attrs = 0
+                for graph_targets in teacher_attr_targets:
+                    max_teacher_nodes = max(max_teacher_nodes, len(graph_targets))
+                    for node_seq in graph_targets:
+                        if node_seq:
+                            # sequences include EOS token; actual attribute count is len - 1
+                            max_teacher_attrs = max(max_teacher_attrs, max(len(node_seq) - 1, 0))
+                if max_teacher_nodes > self.max_nodes:
+                    self.max_nodes = max_teacher_nodes
+                if max_teacher_attrs > self.max_attributes_per_node:
+                    self.max_attributes_per_node = max_teacher_attrs
 
             def make_name_input(token_idx: int) -> torch.Tensor:
                 token_tensor = torch.tensor([token_idx], dtype=torch.long, device=device)
@@ -581,10 +597,16 @@ class GraphDecoder(nn.Module):
                         decode_stats = {
                             "graph_index": l,
                             "node_start": time.perf_counter(),
+                            "node_loop_exit": None,
+                            "node_stop_samples": [],
+                            "attr_events": [],
                         }
                     graph_teacher_targets = None
+                    target_node_count = None
                     if teacher_attr_targets is not None and l < len(teacher_attr_targets):
                         graph_teacher_targets = teacher_attr_targets[l]
+                        if graph_teacher_targets is not None:
+                            target_node_count = len(graph_teacher_targets)
                 try:
                     latent_norm = float(latent[l].detach().norm().item())
                 except Exception:
@@ -602,12 +624,20 @@ class GraphDecoder(nn.Module):
                         node_loop_iters += 1
                         if t > self.max_nodes:
                             warn("max nodes reached")
+                            if DEBUG_DECODER and decode_stats is not None:
+                                decode_stats["node_loop_exit"] = decode_stats["node_loop_exit"] or "max_nodes_pre"
+                            break
+                        if target_node_count is not None and t >= target_node_count:
+                            if DEBUG_DECODER and decode_stats is not None:
+                                decode_stats["node_loop_exit"] = decode_stats["node_loop_exit"] or "teacher_nodes"
                             break
                         hidden_node = self.node_rnn(torch.zeros(hidden_node.shape[0], 0, device=device), hidden_node)
 
                         # clamp for precision errors
                         p_stop = 1 - torch.sigmoid(self.stop_head(hidden_node))
                         p_stop = torch.nan_to_num(p_stop, nan=1.0).clamp(0.0, 1.0)
+                        if DEBUG_DECODER and decode_stats is not None:
+                            decode_stats["node_stop_samples"].append(float(p_stop.item()))
                         if torch.bernoulli(p_stop).item() == 0:
                             if t == 0:
                                 # ensure at least one node
@@ -616,6 +646,8 @@ class GraphDecoder(nn.Module):
                                 break
                         if t > self.max_nodes:
                             warn("max nodes reached")
+                            if DEBUG_DECODER and decode_stats is not None:
+                                decode_stats["node_loop_exit"] = decode_stats["node_loop_exit"] or "max_nodes_post"
                             break
                         new_node = self.node_head(hidden_node).squeeze(0)
                         node_embeddings.append(new_node)
@@ -632,6 +664,10 @@ class GraphDecoder(nn.Module):
                                 edges.append([i, t])
                             edge_in = p_edge.unsqueeze(0)
                         t += 1
+                        if target_node_count is not None and t >= target_node_count:
+                            if DEBUG_DECODER and decode_stats is not None:
+                                decode_stats["node_loop_exit"] = decode_stats["node_loop_exit"] or "teacher_nodes"
+                            break
                         if DEBUG_DECODER and t % 50 == 0:
                             elapsed = time.perf_counter() - node_loop_timer
                             logger.info(
@@ -658,6 +694,20 @@ class GraphDecoder(nn.Module):
 
             if DEBUG_DECODER:
                 decode_stats["node_time"] = time.perf_counter() - decode_stats["node_start"]
+                exit_reason = decode_stats["node_loop_exit"] or "stop"
+                stop_samples = decode_stats["node_stop_samples"]
+                avg_p_stop = float(sum(stop_samples) / len(stop_samples)) if stop_samples else float("nan")
+                last_p_stop = stop_samples[-1] if stop_samples else float("nan")
+                logger.info(
+                    "Decoder graph %d node loop exit=%s nodes=%d max=%d iters=%d avg_p_stop=%.4f last_p_stop=%.4f",
+                    decode_stats["graph_index"],
+                    exit_reason,
+                    node_embeddings.size(0),
+                    self.max_nodes,
+                    node_loop_iters,
+                    avg_p_stop,
+                    last_p_stop,
+                )
                 decode_stats["attr_start"] = time.perf_counter()
                 decode_stats["node_count"] = int(node_embeddings.size(0))
                 decode_stats["edge_count"] = int(edges.size(1)) if edges.numel() > 0 else 0
@@ -680,6 +730,8 @@ class GraphDecoder(nn.Module):
                 attr_loop_iters = 0
                 used_name_indices: Set[int] = set()
                 node_teacher_targets: Optional[List[int]] = None
+                attr_exit_reason = "eos"
+                last_attr_logits: Optional[Tuple[float, float, int]] = None
                 if graph_teacher_targets is not None and node_idx < len(graph_teacher_targets):
                     node_teacher_targets = graph_teacher_targets[node_idx] or None
 
@@ -714,6 +766,7 @@ class GraphDecoder(nn.Module):
                             )
                     if name in attrs:
                         warn(name + " is already defined for currently decoding node")
+                        return False
                     attrs[name] = torch.stack(values)
                     t += 1
                     used_name_indices.add(name_index)
@@ -724,6 +777,7 @@ class GraphDecoder(nn.Module):
                             node_idx,
                             t,
                         )
+                    return True
 
                 with torch.autograd.profiler.record_function("GraphDecoder.attr_loop"):
                     if node_teacher_targets:
@@ -739,6 +793,22 @@ class GraphDecoder(nn.Module):
                                 )
                             if t > self.max_attributes_per_node:
                                 warn("max attributes per node reached")
+                                attr_exit_reason = "max_attr_teacher"
+                                if DEBUG_DECODER:
+                                    eos_logit = float("nan") if last_attr_logits is None else last_attr_logits[0]
+                                    top_logit = float("nan") if last_attr_logits is None else last_attr_logits[1]
+                                    top_idx = -1 if last_attr_logits is None else last_attr_logits[2]
+                                    teacher_len = len(node_teacher_targets) if node_teacher_targets else 0
+                                    logger.info(
+                                        "Decoder graph %d node %d attr loop hit teacher cap | attrs=%d of %d | last_eos=%.3f last_max=%.3f last_idx=%d",
+                                        decode_stats["graph_index"],
+                                        node_idx,
+                                        t,
+                                        teacher_len,
+                                        eos_logit,
+                                        top_logit,
+                                        top_idx,
+                                    )
                                 break
                             name_input = make_name_input(prev_token_idx)
                             name_out, name_hidden = self.attr_name_rnn(name_input, name_hidden)
@@ -748,6 +818,13 @@ class GraphDecoder(nn.Module):
                                 self.shared_attr_vocab.embedding.weight,
                                 project_name_logits(name_out),
                             )
+                            if DEBUG_DECODER:
+                                top_logit, top_idx = torch.max(similarity_logits, dim=0)
+                                last_attr_logits = (
+                                    float(similarity_logits[self.attr_eos_index].item()),
+                                    float(top_logit.item()),
+                                    int(top_idx.item()),
+                                )
                             eos_bias = self.attr_eos_bias_base + self.attr_eos_bias_slope * t
                             similarity_logits[self.attr_eos_index] = similarity_logits[self.attr_eos_index] + eos_bias
                             target_tensor = torch.tensor([target_idx], dtype=torch.long, device=device)
@@ -778,6 +855,20 @@ class GraphDecoder(nn.Module):
                                 )
                             if t > self.max_attributes_per_node:
                                 warn("max attributes per node reached")
+                                attr_exit_reason = "max_attr_sampling"
+                                if DEBUG_DECODER:
+                                    eos_logit = float("nan") if last_attr_logits is None else last_attr_logits[0]
+                                    top_logit = float("nan") if last_attr_logits is None else last_attr_logits[1]
+                                    top_idx = -1 if last_attr_logits is None else last_attr_logits[2]
+                                    logger.info(
+                                        "Decoder graph %d node %d attr loop hit sampling cap | attrs=%d | last_eos=%.3f last_max=%.3f last_idx=%d",
+                                        decode_stats["graph_index"],
+                                        node_idx,
+                                        t,
+                                        eos_logit,
+                                        top_logit,
+                                        top_idx,
+                                    )
                                 break
                             name_input = make_name_input(prev_token_idx)
                             name_out, name_hidden = self.attr_name_rnn(name_input, name_hidden)
@@ -787,6 +878,13 @@ class GraphDecoder(nn.Module):
                                 self.shared_attr_vocab.embedding.weight,
                                 project_name_logits(name_out),
                             )
+                            if DEBUG_DECODER:
+                                top_logit, top_idx = torch.max(similarity_logits, dim=0)
+                                last_attr_logits = (
+                                    float(similarity_logits[self.attr_eos_index].item()),
+                                    float(top_logit.item()),
+                                    int(top_idx.item()),
+                                )
                             if used_name_indices:
                                 used_idx_tensor = torch.tensor(
                                     list(used_name_indices), device=similarity_logits.device, dtype=torch.long
@@ -815,6 +913,34 @@ class GraphDecoder(nn.Module):
 
                             add_attribute(name_index, name)
                 node_attributes.append(attrs)
+                if DEBUG_DECODER:
+                    teacher_len = len(node_teacher_targets) if node_teacher_targets else 0
+                    eos_logit = float("nan") if last_attr_logits is None else last_attr_logits[0]
+                    top_logit = float("nan") if last_attr_logits is None else last_attr_logits[1]
+                    top_idx = -1 if last_attr_logits is None else last_attr_logits[2]
+                    decode_stats["attr_events"].append(
+                        {
+                            "node_idx": node_idx,
+                            "exit_reason": attr_exit_reason,
+                            "attr_count": t,
+                            "teacher_len": teacher_len,
+                            "last_eos_logit": eos_logit,
+                            "last_top_logit": top_logit,
+                            "last_top_idx": top_idx,
+                        }
+                    )
+                    if attr_exit_reason.startswith("max_attr"):
+                        logger.info(
+                            "Decoder graph %d node %d summary | exit=%s attrs=%d teacher_len=%d last_eos=%.3f last_max=%.3f last_idx=%d",
+                            decode_stats["graph_index"],
+                            node_idx,
+                            attr_exit_reason,
+                            t,
+                            teacher_len,
+                            eos_logit,
+                            top_logit,
+                            top_idx,
+                        )
                 all_graphs.append(
                     {"node_types": torch.as_tensor(node_types), "node_attributes": node_attributes, "edge_index": edges}
                 )
@@ -833,6 +959,21 @@ class GraphDecoder(nn.Module):
                         attr_time,
                         total_time,
                     )
+                    attr_cap_hits = 0
+                    teacher_cap_hits = 0
+                    for event in decode_stats["attr_events"]:
+                        if event["exit_reason"].startswith("max_attr"):
+                            attr_cap_hits += 1
+                            if event["exit_reason"].endswith("teacher"):
+                                teacher_cap_hits += 1
+                    if attr_cap_hits:
+                        logger.info(
+                            "Decoder graph %d attr cap hits=%d (teacher=%d, sampling=%d)",
+                            decode_stats["graph_index"],
+                            attr_cap_hits,
+                            teacher_cap_hits,
+                            attr_cap_hits - teacher_cap_hits,
+                        )
             if attr_teacher_loss is not None:
                 return all_graphs, {"loss": attr_teacher_loss, "tokens": attr_teacher_tokens}
             return all_graphs
@@ -1229,16 +1370,23 @@ class OnlineTrainer:
 
                 # --- 2) reconstruction losses ---
                 dense_adj = to_dense_adj(batch.edge_index, batch.batch, max_num_nodes=None)
+                num_target_graphs = dense_adj.size(0)
+                graphs_to_compare = min(len(decoded_graphs), num_target_graphs, len(target_graph_attrs))
 
-                loss_adj, loss_feat = torch.tensor(0.0), torch.tensor(0.0)
-                for i, dg in enumerate(decoded_graphs):
-                    pred_types = dg["node_types"]
+                loss_adj = torch.tensor(0.0, device=self.device)
+                loss_feat = torch.tensor(0.0, device=self.device)
+                for i in range(graphs_to_compare):
+                    dg = decoded_graphs[i]
                     pred_edges = dg["edge_index"]
                     pred_attrs = dg["node_attributes"]
-                    target_types = batch.node_types[i]
                     target_attrs = target_graph_attrs[i] if i < len(target_graph_attrs) else []
-                    num_nodes = min(len(pred_attrs), len(target_attrs))  # compare only the overlap
-                    target_edges = dense_adj[i, :num_nodes, :num_nodes]
+                    num_target_nodes = len(target_attrs)
+                    num_pred_nodes = len(pred_attrs)
+                    num_nodes = min(num_pred_nodes, num_target_nodes)
+                    if num_nodes == 0:
+                        continue
+                    adj_true = dense_adj[i, :num_target_nodes, :num_target_nodes]
+                    adj_true = adj_true[:num_nodes, :num_nodes].to(self.device)
 
                     # build binary adjacency preds/targets on 0..num_nodes-1
                     no_pred_edges = True
@@ -1247,7 +1395,6 @@ class OnlineTrainer:
                         if s < num_nodes and d < num_nodes:
                             adj_pred[s, d] = 1.0
                             no_pred_edges = False
-                    adj_true = dense_adj[i, :num_nodes, :num_nodes]
 
                     mask = torch.triu(torch.ones_like(adj_pred), diagonal=1).bool()
                     if adj_pred[mask].size(0) > 0 and adj_true[mask].size(0) > 0:
