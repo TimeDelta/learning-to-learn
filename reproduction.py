@@ -1,5 +1,6 @@
 import math
 import random
+from collections import defaultdict
 
 import numpy as np
 from neat.config import *
@@ -61,6 +62,8 @@ class GuidedReproduction(DefaultReproduction):
             msf = np.mean([m.fitness for m in species.members.values()], axis=0)
             species.adjusted_fitness = (msf - min_fitness) / fitness_range
 
+        self._log_species_metrics(remaining_species)
+
         adjusted_fitnesses = [s.adjusted_fitness for s in remaining_species]
         avg_adjusted_fitness = np.mean(adjusted_fitnesses, axis=0)  # type: float
         self.reporters.info("Average adjusted fitness: {:.3f}".format(avg_adjusted_fitness))
@@ -110,3 +113,41 @@ class GuidedReproduction(DefaultReproduction):
                     self.ancestors[cid] = (p1_id, p2_id)
 
         return new_population
+
+    def _log_species_metrics(self, species_list):
+        for species in species_list:
+            metric_values = defaultdict(list)
+            members_with_metrics = 0
+            for member in species.members.values():
+                metrics = getattr(member, "fitnesses", None)
+                if not metrics:
+                    continue
+                members_with_metrics += 1
+                for metric, value in metrics.items():
+                    metric_name = self._metric_name(metric)
+                    metric_values[metric_name].append(value)
+
+            total_members = len(species.members)
+            if not metric_values:
+                self.reporters.info(
+                    f"Species {species.key}: no per-metric fitness data available ({members_with_metrics}/{total_members} members)"
+                )
+                continue
+
+            parts = []
+            for metric_name in sorted(metric_values.keys()):
+                values = metric_values[metric_name]
+                mean_value = sum(values) / len(values)
+                parts.append(f"{metric_name}: {mean_value:.4f}")
+            joined = ", ".join(parts)
+            self.reporters.info(
+                f"Species {species.key} fitness metrics ({members_with_metrics}/{total_members} members contributing): {joined}"
+            )
+
+    @staticmethod
+    def _metric_name(metric):
+        if hasattr(metric, "name"):
+            return getattr(metric, "name")
+        if hasattr(metric, "__name__"):
+            return getattr(metric, "__name__")
+        return str(metric)
