@@ -1,3 +1,4 @@
+import logging
 import random
 from typing import Dict, Tuple
 from warnings import warn
@@ -8,6 +9,8 @@ from neat.genes import BaseGene
 
 from attributes import BoolAttribute, FloatAttribute, IntAttribute, StringAttribute
 from utility import generate_random_string
+
+logger = logging.getLogger(__name__)
 
 # modified from neat-python versions
 NODE_TYPE_OPTIONS = [  # for mutation
@@ -76,7 +79,13 @@ class NodeGene(BaseGene):
             self.output_debug_names = []
             self.scope = ""
 
-        print(f"NodeGene {node_id} kind={self.node_type}, outputs={self.num_outputs}, attrs={self.dynamic_attributes}")
+        logger.debug(
+            "NodeGene %s kind=%s, outputs=%s, attrs=%s",
+            node_id,
+            self.node_type,
+            self.num_outputs,
+            self.dynamic_attributes,
+        )
 
     def mutate(self, config):
         if random.random() < config.attribute_add_prob:
