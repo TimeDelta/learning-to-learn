@@ -110,30 +110,41 @@ class GuidedPopulation(Population):
         graph_latent_dim = self.guide.graph_encoder.latent_dim
         # encode the optimizer graphs from top half of starting_genomes then optimize, rest are cross-species
         sorted_genomes = sorted(starting_genomes, key=lambda g: g.fitness, reverse=True)
-        num_encode = n_offspring // 2
+        num_encode = min(max(n_offspring // 2, 0), len(sorted_genomes))
         top_genomes = sorted_genomes[:num_encode]
         data_list = []
         for g in top_genomes:
+            graph_dict = getattr(g, "graph_dict", None)
+            if graph_dict is None:
+                # Lazily build the cached graph if this genome has never been encoded.
+                self.genome_to_data(g)
+                graph_dict = g.graph_dict
             data_list.append(
                 Data(
-                    node_types=g.graph_dict["node_types"].clone().detach().long(),
-                    edge_index=g.graph_dict["edge_index"].clone().detach().long(),
-                    node_attributes=g.graph_dict["node_attributes"],
+                    node_types=graph_dict["node_types"].clone().detach().long(),
+                    edge_index=graph_dict["edge_index"].clone().detach().long(),
+                    node_attributes=graph_dict["node_attributes"],
                 )
             )
-        batch = Batch.from_data_list(data_list)
-        mu_g, lv_g = self.guide.graph_encoder(
-            batch.node_types,
-            batch.edge_index,
-            batch.node_attributes,
-            batch.batch,
-            num_graphs=batch.num_graphs,
-        )
-        z_g_encoded = self.guide.reparameterize(mu_g, lv_g, self.guide.graph_latent_mask)
-        z_g_encoded = z_g_encoded.clone().detach().requires_grad_(True)
-        num_random = n_offspring - num_encode
+
+        if data_list:
+            batch = Batch.from_data_list(data_list)
+            mu_g, lv_g = self.guide.graph_encoder(
+                batch.node_types,
+                batch.edge_index,
+                batch.node_attributes,
+                batch.batch,
+                num_graphs=batch.num_graphs,
+            )
+            z_g_encoded = self.guide.reparameterize(mu_g, lv_g, self.guide.graph_latent_mask)
+            z_g_encoded = z_g_encoded.clone().detach().requires_grad_(True)
+        else:
+            z_g_encoded = torch.empty(
+                (0, graph_latent_dim), device=self.guide.graph_latent_mask.device, dtype=torch.float32
+            )
+        num_random = n_offspring - z_g_encoded.size(0)
         if num_random > 0:
-            z_g_random = torch.randn((num_random, graph_latent_dim), requires_grad=True)
+            z_g_random = torch.randn((num_random, graph_latent_dim), device=z_g_encoded.device, requires_grad=True)
             z_g = torch.cat([z_g_encoded, z_g_random], dim=0).clone().detach().requires_grad_(True)
         else:
             z_g = z_g_encoded

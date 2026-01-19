@@ -118,6 +118,23 @@ def test_generate_guided_offspring():
         assert child.graph_dict is not None
 
 
+def test_generate_guided_offspring_handles_missing_elites():
+    config = make_config()
+    pop = GuidedPopulation(config)
+    pop.guide.decoder.max_nodes = 2
+    pop.guide.decoder.max_attributes_per_node = 2
+
+    task = RegressionTask.random_init(num_samples=4, silent=True)
+
+    offspring = pop.generate_guided_offspring(task, [], config, n_offspring=3, latent_steps=1)
+
+    assert isinstance(offspring, list)
+    assert len(offspring) >= 1
+    assert len(offspring) <= 3
+    for child in offspring:
+        assert isinstance(child, OptimizerGenome)
+
+
 def test_trainer_handles_variable_fitness_dims():
     config = make_config()
     pop = GuidedPopulation(config)
