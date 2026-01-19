@@ -13,6 +13,7 @@ from genes import NODE_TYPE_TO_INDEX, ConnectionGene, NodeGene
 from genome import OptimizerGenome
 from models import ManyLossMinimaModel
 from population import GuidedPopulation
+from relative_rank_stagnation import RelativeRankStagnation
 from reproduction import GuidedReproduction
 from search_space_compression import (
     GraphEncoder,
@@ -59,7 +60,7 @@ def make_config():
         OptimizerGenome,
         GuidedReproduction,
         neat.DefaultSpeciesSet,
-        neat.DefaultStagnation,
+        RelativeRankStagnation,
         config_path,
     )
 

@@ -14,6 +14,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from compare_encoders import optimizer_to_data
 from genome import OptimizerGenome
 from graph_builder import genome_from_graph_dict, rebuild_and_script
+from relative_rank_stagnation import RelativeRankStagnation
 from reproduction import GuidedReproduction
 
 
@@ -23,7 +24,7 @@ def make_config():
         OptimizerGenome,
         GuidedReproduction,
         neat.DefaultSpeciesSet,
-        neat.DefaultStagnation,
+        RelativeRankStagnation,
         config_path,
     )
 

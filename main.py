@@ -11,6 +11,7 @@ from computation_graphs.functions.activation import *
 from computation_graphs.functions.aggregation import *
 from genes import *
 from population import *
+from relative_rank_stagnation import RelativeRankStagnation
 from reproduction import *
 
 
@@ -83,7 +84,7 @@ if __name__ == "__main__":
     from genome import OptimizerGenome
 
     config = neat.Config(
-        OptimizerGenome, GuidedReproduction, neat.DefaultSpeciesSet, neat.DefaultStagnation, "neat-config"
+        OptimizerGenome, GuidedReproduction, neat.DefaultSpeciesSet, RelativeRankStagnation, "neat-config"
     )
     population = GuidedPopulation(config)
 

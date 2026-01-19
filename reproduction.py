@@ -40,12 +40,13 @@ class GuidedReproduction(DefaultReproduction):
             else:
                 all_fitnesses.extend(m.fitness for m in stagnant_species.members.values())
                 remaining_species.append(stagnant_species)
+        # Ensure the species set drops stagnated species but preserves survivors for history.
+        species.species = {s.key: s for s in remaining_species}
         # The above comment was not quite what was happening - now getting fitnesses
         # only from members of non-stagnated species.
 
         # No species left.
         if not remaining_species:
-            species.species = {}
             return {}
 
         # Find minimum/maximum fitness across the entire population, for use in
@@ -72,7 +73,6 @@ class GuidedReproduction(DefaultReproduction):
         min_species_size = max(self.reproduction_config.min_species_size, self.reproduction_config.elitism)
         spawn_amounts = self.compute_spawn(adjusted_fitnesses, previous_sizes, pop_size, min_species_size)
 
-        species.species = {}
         new_population = {}
         for spawn, s in zip(spawn_amounts, remaining_species):
             spawn = max(spawn, self.reproduction_config.elitism)

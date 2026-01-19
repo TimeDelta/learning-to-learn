@@ -2,7 +2,6 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-import types
 
 import pytest
 
@@ -31,13 +30,18 @@ class DummySpecies:
 
 
 class DummySpeciesSet:
-    def __init__(self, species):
-        self.species = {species.key: species}
+    def __init__(self, *species_list):
+        if len(species_list) == 1 and isinstance(species_list[0], (list, tuple, set)):
+            species_list = tuple(species_list[0])
+        self.species = {species.key: species for species in species_list}
 
 
 class DummyStagnation:
+    def __init__(self, stagnant_ids=None):
+        self.stagnant_ids = set(stagnant_ids or [])
+
     def update(self, species_set, generation):
-        return [(sid, s, False) for sid, s in species_set.species.items()]
+        return [(sid, s, sid in self.stagnant_ids) for sid, s in species_set.species.items()]
 
 
 class DummyReporters:
@@ -47,6 +51,9 @@ class DummyReporters:
     def info(self, *args, **kwargs):
         pass
 
+    def warning(self, *args, **kwargs):
+        pass
+
 
 class DummyConfig:
     def __init__(self, genome_type):
@@ -54,14 +61,14 @@ class DummyConfig:
         self.genome_config = object()
 
 
-def make_reproduction(elitism=1, survival_threshold=0.5):
+def make_reproduction(elitism=1, survival_threshold=0.5, reporters=None, stagnation=None):
     class RC:
         def __init__(self):
             self.elitism = elitism
             self.survival_threshold = survival_threshold
             self.min_species_size = 1
 
-    return GuidedReproduction(RC(), DummyReporters(), DummyStagnation())
+    return GuidedReproduction(RC(), reporters or DummyReporters(), stagnation or DummyStagnation())
 
 
 def test_guided_and_standard_offspring():
@@ -126,3 +133,28 @@ def test_only_elites_when_spawn_too_small():
     # only elite should remain
     assert len(pop) == 1
     assert 201 in pop
+
+
+def test_stagnated_species_removed_from_species_set():
+    stagnation = DummyStagnation()
+    repro = make_reproduction(elitism=1, stagnation=stagnation)
+    repro.compute_spawn = lambda *a, **k: [1, 1]
+    repro.guide_fn = lambda *a, **k: []
+    config = DummyConfig(DummyGenome)
+
+    class DummyTask:
+        def name(self):
+            return "dummy"
+
+        features = []
+
+    alive_species = DummySpecies(10, [DummyGenome(501, fitness=1.5)])
+    stagnant_species = DummySpecies(11, [DummyGenome(601, fitness=0.1)])
+    species_set = DummySpeciesSet(alive_species, stagnant_species)
+
+    stagnation.stagnant_ids = {stagnant_species.key}
+
+    repro.reproduce(config, species_set, 2, 0, DummyTask())
+
+    assert alive_species.key in species_set.species
+    assert stagnant_species.key not in species_set.species
