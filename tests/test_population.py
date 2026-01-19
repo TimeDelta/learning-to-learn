@@ -237,6 +237,20 @@ def test_graph_encoder_pads_trailing_empty_graphs():
     assert lv.shape[0] == batch.num_graphs
 
 
+def test_node_attribute_encoder_accepts_tensor_values():
+    shared_vocab = SharedAttributeVocab([], embedding_dim=6)
+    attr_encoder = NodeAttributeDeepSetEncoder(shared_vocab, encoder_hdim=4, aggregator_hdim=4, out_dim=3)
+
+    tensor_value = torch.arange(6.0).reshape(3, 2)
+
+    flattened = attr_encoder.get_value_tensor(tensor_value.clone())
+    assert flattened.shape[0] == attr_encoder.max_value_dim
+    assert torch.allclose(flattened[: tensor_value.numel()], tensor_value.reshape(-1))
+
+    encoded = attr_encoder({"tensor": tensor_value})
+    assert encoded.shape == (attr_encoder.out_dim,)
+
+
 def test_evaluate_optimizer_resizes_state_before_execution():
     config = make_config()
     pop = GuidedPopulation(config)

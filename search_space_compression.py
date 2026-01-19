@@ -324,11 +324,16 @@ class NodeAttributeDeepSetEncoder(nn.Module):
             value = torch.tensor([value], dtype=torch.float)
         elif isinstance(value, str):
             index = self.shared_attr_vocab.name_to_index.get(value, self.shared_attr_vocab.name_to_index["<UNK>"])
-            index = torch.tensor(index, dtype=torch.long)
+            index = torch.tensor(index, dtype=torch.long, device=self.shared_attr_vocab.embedding.weight.device)
             value = self.shared_attr_vocab.embedding(index)
+        elif isinstance(value, torch.Tensor):
+            # Flatten user provided tensors while preserving autograd info when possible.
+            if not value.is_floating_point():
+                value = value.to(torch.float)
         else:
             raise TypeError(f"Unsupported attribute value type: {type(value)}")
-        value = value.view(-1)
+        value = value.reshape(-1)
+        value = value.to(self.shared_attr_vocab.embedding.weight.device)
         if value.numel() < self.max_value_dim:
             pad_amt = self.max_value_dim - value.numel()
             return F.pad(value, (0, pad_amt), "constant", 0.0)
