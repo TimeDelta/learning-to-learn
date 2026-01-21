@@ -1298,7 +1298,7 @@ class OnlineTrainer:
         self,
         epochs=1,
         batch_size=16,
-        kl_weight=1.0,
+        kl_weight=0.1,
         fitness_weight=1.5,
         warmup_epochs=None,
         loss_threshold=0.9,
