@@ -33,6 +33,15 @@ Using Pareto-based selection yields a diverse **Pareto front** of solutions, eac
 
 In summary, multi-objective evolutionary selection ensures that the project optimizes not only for how well a network learns, but also for how elegant or tractable its design is. This keeps the search grounded, preventing bloated solutions and steering evolution toward general-purpose networks that are both **high-performing and low-complexity**.
 
+### Handling Invalid Guided Offspring
+
+The guided decoder sometimes samples latent points that produce unusable computation graphs (e.g., no edges or incompatible tensor shapes), particularly in the first few generations. To keep these failures from overwhelming the surrogate model:
+
+* Store invalid graph/metric pairs separately from the valid ones with a fixed penalty.
+* Mix only a small, generation-proportional fraction of the invalid graphs into each training epoch (capped at 20% of the valid graphs), so early generations focus on valid data while later ones still learn which latent regions to avoid
+
+This subsampling keeps the decoder from collapsing onto invalid DAGs while still providing a clear gradient signal to steer it back toward feasible graphs.
+
 ### Stabilizing Graph Attribute Decoding
 
 To avoid decoder stalls from attr-name loops that never received a termination signal, teacher forcing is used for those sequences:

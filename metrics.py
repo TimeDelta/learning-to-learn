@@ -14,7 +14,8 @@ class MSELoss(Metric):
     objective = "min"
 
     def __call__(self, output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        return nn.functional.mse_loss(output, torch.tensor(target))
+        target_tensor = torch.as_tensor(target, dtype=output.dtype, device=output.device)
+        return nn.functional.mse_loss(output, target_tensor)
 
 
 class AreaUnderTaskMetrics(Metric):

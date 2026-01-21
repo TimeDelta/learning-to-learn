@@ -30,7 +30,7 @@ class RelativeRankStagnation(DefaultStagnation):
 
     def _compute_best_member_fitness(self, species) -> float:
         if not species.members:
-            return float("-inf")
+            return -1e4
         return max(member.fitness for member in species.members.values())
 
     def _compute_dense_ranks(self, raw_scores: Dict[int, float]) -> Dict[int, int]:

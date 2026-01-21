@@ -1,8 +1,10 @@
+import copy
 import random
 import re
 import time
 import tracemalloc
 import weakref
+from pathlib import Path
 from typing import Dict, List
 from warnings import warn
 
@@ -25,6 +27,7 @@ from tasks import *
 
 class GuidedPopulation(Population):
     _optimizer_state_attr_cache: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+    INVALID_METRIC_VALUE = -1e4
 
     def __init__(self, config):
         super().__init__(config)
@@ -65,7 +68,7 @@ class GuidedPopulation(Population):
             attr_names = [attribute_key_to_name(a) for a in node.dynamic_attributes.keys()]
             self.shared_attr_vocab.add_names(attr_names)
             node_types.append(idx)
-            node_attributes.append(node.dynamic_attributes)
+            node_attributes.append(copy.deepcopy(node.dynamic_attributes))
         node_types = torch.tensor(node_types, dtype=torch.long)
 
         edges = []
@@ -79,7 +82,16 @@ class GuidedPopulation(Population):
             edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
         else:
             edge_index = torch.empty((2, 0), dtype=torch.long)
-        genome.graph_dict = {"node_types": node_types, "edge_index": edge_index, "node_attributes": node_attributes}
+        edge_index_copy = edge_index.clone() if edge_index.numel() > 0 else edge_index
+        graph_dict = {
+            "node_types": node_types.clone(),
+            "edge_index": edge_index_copy,
+            "node_attributes": copy.deepcopy(node_attributes),
+        }
+        slot_shapes = getattr(genome, "slot_shapes", None)
+        if slot_shapes is not None:
+            graph_dict["slot_shapes"] = copy.deepcopy(slot_shapes)
+        genome.graph_dict = graph_dict
         return Data(node_types=node_types, edge_index=edge_index, node_attributes=node_attributes)
 
     def generate_guided_offspring(
@@ -187,14 +199,63 @@ class GuidedPopulation(Population):
         # 4) Decode
         with torch.no_grad():
             graphs = self.guide.decode(z_g)
+
+        stats = []
         new_genomes = []
+        empty_graph_count = 0
+        debug_dir = Path("debug_guided_offspring")
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        debug_save_limit = 5
+        debug_saved = 0
+        generation_idx = getattr(self, "generation", -1)
+        duplicate_count = 0
+        seen_edge_sets = set()
+
         for i, graph_dict in enumerate(graphs):
-            optimizer = rebuild_and_script(graph_dict, self.config.genome_config, key=i)
+            genome = genome_from_graph_dict(graph_dict, self.config.genome_config, key=i)
+            num_edges = len(genome.connections)
+            num_params = sum(1 for _ in genome.connections.values())
+
+            edge_key = tuple(sorted(genome.connections.keys()))
+            if edge_key in seen_edge_sets and num_edges > 0:
+                duplicate_count += 1
+                warn("Guided offspring decoder produced a duplicate graph; skipping to preserve diversity.")
+                continue
+            seen_edge_sets.add(edge_key)
+
+            if num_edges == 0 or debug_saved < debug_save_limit:
+                debug_path = debug_dir / f"gen{generation_idx}_child{i}_edges{num_edges}.pt"
+                torch.save(graph_dict, debug_path)
+                debug_saved += 1
+
+            if num_edges == 0:
+                empty_graph_count += 1
+                warn(
+                    "Guided offspring decoder produced an empty graph (no edges); assigning penalty fitness and skipping evaluation."
+                )
+                genome.graph_dict = graph_dict
+                self._assign_penalty(genome, task, reason="empty_graph", skip_evaluation=True)
+                new_genomes.append(genome)
+                continue
+
+            optimizer = rebuild_and_script(graph_dict, self.config.genome_config, key=i, genome=genome)
             if optimizer:
-                genome = genome_from_graph_dict(graph_dict, self.config.genome_config, key=i)
                 genome.optimizer = optimizer
                 genome.graph_dict = graph_dict
                 new_genomes.append(genome)
+            stats.append((i, num_edges, num_params))
+
+        if empty_graph_count:
+            warn(f"Guided offspring decoder generated {empty_graph_count} empty graphs out of {len(graphs)}.")
+        if duplicate_count:
+            warn(
+                f"Guided offspring decoder skipped {duplicate_count} duplicate graphs out of {len(graphs)} to preserve diversity."
+            )
+
+        if stats:
+            sample = ", ".join(f"child {idx}: edges={edges}, params={params}" for idx, edges, params in stats[:10])
+            self.reporters.info(f"Guided offspring graph stats (first 10): {sample}")
+
         return new_genomes
 
     def run(self, n=None, keep_per_species=2, offspring_per_species=None):
@@ -215,9 +276,11 @@ class GuidedPopulation(Population):
             task_type = random.choice(list(TASK_TYPE_TO_CLASS.keys()))
             task = TASK_TYPE_TO_CLASS[task_type].random_init()
 
-            # Evaluate real fitness
-            print(f"Evaluating genomes on {task.name()}")
-            self.eval_genomes(list(self.population.items()), self.config, task, steps=2 * generation)
+            # Evaluate real fitness. Using too few update steps makes every optimizer look identical,
+            # so clamp to a minimum to expose behavioral differences early in the run.
+            eval_steps = max(2 * generation, 10)
+            print(f"Evaluating genomes on {task.name()} for {eval_steps} steps")
+            self.eval_genomes(list(self.population.items()), self.config, task, steps=eval_steps)
 
             # Termination check
             if not self.config.no_fitness_termination:
@@ -228,18 +291,34 @@ class GuidedPopulation(Population):
                     return best
 
             # Train surrogate on all evaluated genomes
-            graphs, fits = [], []
+            valid_graphs, valid_fits = [], []
+            invalid_graphs, invalid_fits = [], []
             for gid, genome in self.population.items():
-                graphs.append(self.genome_to_data(genome))
-                fits.append(genome.fitnesses)
-            self.trainer.add_data(graphs, fits, task_type, task.features)
+                data = self.genome_to_data(genome)
+                if getattr(genome, "invalid_graph", False):
+                    invalid_graphs.append(data)
+                    invalid_fits.append(genome.fitnesses)
+                else:
+                    valid_graphs.append(data)
+                    valid_fits.append(genome.fitnesses)
+            if valid_graphs:
+                self.trainer.add_data(valid_graphs, valid_fits, task_type, task.features)
+            if invalid_graphs:
+                self.trainer.add_data(
+                    invalid_graphs,
+                    invalid_fits,
+                    task_type,
+                    task.features,
+                    invalid_flags=[True] * len(invalid_graphs),
+                )
 
+            batch = max(1, len(self.trainer.dataset))
             if generation < gen_for_full_train_resize:
-                self.trainer.train(epochs=5, batch_size=len(graphs))
+                self.trainer.train(epochs=5, batch_size=batch, generation=self.generation)
             elif generation > gen_for_full_train_resize:
-                self.trainer.train(epochs=1, batch_size=len(graphs))
+                self.trainer.train(epochs=1, batch_size=batch, generation=self.generation)
             else:
-                self.trainer.train(warmup_epochs=10, batch_size=len(graphs))
+                self.trainer.train(warmup_epochs=10, batch_size=batch, generation=self.generation)
 
             # Build next‐gen population by species
             self.population = self.reproduction.reproduce(
@@ -275,16 +354,31 @@ class GuidedPopulation(Population):
         Evaluate each genome by using its network as a meta–optimizer.
         """
         raw_metrics: Dict[int, Dict[str, float]] = {}
+        invalid_genomes: List[int] = []
         genome_map = {gid: g for gid, g in genomes}
 
         model = ManyLossMinimaModel(task.train_data.num_input_features)
         for genome_id, genome in genomes:
+            if getattr(genome, "skip_evaluation", False):
+                self._assign_penalty(
+                    genome_map[genome_id],
+                    task,
+                    reason=getattr(genome, "invalid_reason", "empty_graph"),
+                    skip_evaluation=True,
+                )
+                invalid_genomes.append(genome_id)
+                continue
             model_copy = type(model)(task.train_data.num_input_features)
             model_copy.load_state_dict(model.state_dict())
+            # Slot shapes no longer propagated to decoder; guard removed.
             print(f"  Evaluating {genome_id} ({genome.optimizer_path})")
-            area_under_metrics, validation_metrics, time_cost, mem_cost = self.evaluate_optimizer(
-                genome.optimizer, model_copy, task, steps
-            )
+            result = self.evaluate_optimizer(genome.optimizer, model_copy, task, steps)
+            if result is None:
+                self._assign_penalty(genome_map[genome_id], task)
+                invalid_genomes.append(genome_id)
+                continue
+            setattr(genome_map[genome_id], "invalid_graph", False)
+            area_under_metrics, validation_metrics, time_cost, mem_cost = result
             validation_metrics_str = "{" + ";".join([f"{m.name}: {v}" for m, v in validation_metrics.items()]) + "}"
             print(
                 f"    Area Under Task Metrics: {area_under_metrics}",
@@ -296,6 +390,12 @@ class GuidedPopulation(Population):
             validation_metrics[TimeCost] = time_cost
             validation_metrics[MemoryCost] = mem_cost
             raw_metrics[genome_id] = validation_metrics
+
+        if not raw_metrics:
+            self.reporters.info(
+                f"All genomes invalid this generation ({len(invalid_genomes)}/{len(genome_map)}); skipping Pareto ranking"
+            )
+            return genomes
 
         # 3. Pareto front ranking
         print("  Calculating Pareto Fronts")
@@ -326,7 +426,23 @@ class GuidedPopulation(Population):
                 genome_map[genome_id].fitness = (len(fronts) - front_idx + 1) + composite
                 print(f"    {genome_id}: {genome_map[genome_id].fitness}")
                 genome_map[genome_id].fitnesses = raw_metrics[genome_id]
+        if invalid_genomes:
+            self.reporters.info(
+                f"Invalid or skipped guided offspring penalized: {len(invalid_genomes)}/{len(genome_map)}"
+            )
         return genomes
+
+    def _assign_penalty(self, genome, task, reason="invalid_graph", skip_evaluation=False):
+        validation_metrics = {m: self.INVALID_METRIC_VALUE for m in task.metrics}
+        validation_metrics[AreaUnderTaskMetrics] = self.INVALID_METRIC_VALUE
+        validation_metrics[TimeCost] = self.INVALID_METRIC_VALUE
+        validation_metrics[MemoryCost] = self.INVALID_METRIC_VALUE
+        genome.fitnesses = validation_metrics
+        setattr(genome, "invalid_graph", True)
+        if skip_evaluation:
+            genome.skip_evaluation = True
+        genome.invalid_reason = reason
+        return validation_metrics
 
     def evaluate_optimizer(self, optimizer, model, task, steps=10):
         """
@@ -338,15 +454,29 @@ class GuidedPopulation(Population):
           task: The task on which to evaluate the optimizer.
           steps: Number of update iterations.
         """
+        # Each evaluation should start from a clean optimizer state so the outcome
+        # depends only on the current task/model, not on leftovers from previous
+        # genomes that may share the same TorchScript module instance.
+        self._reset_optimizer_state(optimizer, None)
+        self._reset_optimizer_step_counters(optimizer)
         # TODO: clear all levels of RAM caches in between every run to create fair starting point
         # for comparison
         tracemalloc.start()
         start = time.perf_counter()
-        prev_metrics_values = torch.tensor([0.0] * len(task.metrics))
+        prev_metrics_values = None
         area_under_metrics = 0.0
 
+        invalid_graph = False
         for step in range(steps):
-            metrics_values = task.evaluate_metrics(model, task.train_data).requires_grad_()
+            metrics_values = task.evaluate_metrics(model, task.train_data)
+            if not torch.isfinite(metrics_values).all():
+                warn("Task metrics produced NaN/Inf; assigning penalty fitness")
+                invalid_graph = True
+                break
+            if not metrics_values.requires_grad:
+                raise RuntimeError(
+                    "Task metrics tensor must retain gradient information; ensure evaluate_metrics returns differentiable tensors."
+                )
             named_params = list(model.named_parameters())
             # When the underlying task changes between generations the model's
             # parameter shapes can shrink or grow. TorchScript optimizers keep
@@ -355,8 +485,16 @@ class GuidedPopulation(Population):
             # before executing the optimizer to avoid shape-mismatch errors.
             self._ensure_optimizer_state_shapes(optimizer, named_params)
             try:
-                updated_state = optimizer(metrics_values, prev_metrics_values, named_params)
-            except RuntimeError as err:
+                if prev_metrics_values is None:
+                    prev = torch.zeros_like(metrics_values)
+                else:
+                    prev = prev_metrics_values
+                updated_state = optimizer(metrics_values, prev, named_params)
+            except (RuntimeError, torch.jit.Error) as err:
+                if "INVALID_GRAPH_SHAPE" in str(err):
+                    warn("Guided offspring produced invalid graph (shape mismatch); assigning penalty fitness")
+                    invalid_graph = True
+                    break
                 if "size of tensor" in str(err) and "must match" in str(err):
                     warn("Optimizer state mismatch detected; resetting state buffers and retrying")
                     self._reset_optimizer_state(optimizer, named_params)
@@ -365,14 +503,24 @@ class GuidedPopulation(Population):
                 else:
                     raise
             state_dict = self._normalize_state_dict(updated_state, named_params)
+            if not GuidedPopulation._state_dict_is_finite(state_dict):
+                warn("Optimizer produced NaN/Inf parameters; assigning penalty fitness")
+                invalid_graph = True
+                break
             model.load_state_dict(state_dict)
-            prev_metrics_values = task.evaluate_metrics(model, task.train_data).requires_grad_()
+            prev_metrics_values = task.evaluate_metrics(model, task.train_data).detach()
+            prev_metrics_values = torch.nan_to_num(prev_metrics_values)
             area_under_metrics += float(metrics_values.detach().sum())
+        if invalid_graph:
+            tracemalloc.stop()
+            return None
         stop = time.perf_counter()
         _, peak_memory = tracemalloc.get_traced_memory()
         tracemalloc.stop()
         time_cost = stop - start
-        validation_metrics = task.evaluate_metrics(model, task.valid_data).detach().data.numpy()
+        validation_metrics = task.evaluate_metrics(model, task.valid_data).detach()
+        validation_metrics = torch.nan_to_num(validation_metrics)
+        validation_metrics = validation_metrics.data.numpy()
         validation_metrics = {m: float(validation_metrics[i]) for i, m in enumerate(task.metrics)}
         return area_under_metrics, validation_metrics, time_cost, peak_memory
 
@@ -525,3 +673,31 @@ class GuidedPopulation(Population):
                 setattr(optimizer, attr, zero_state)
             except Exception:
                 continue
+
+    @staticmethod
+    def _reset_optimizer_step_counters(optimizer):
+        candidate_attrs = [
+            "step",
+            "steps",
+            "iteration",
+            "iterations",
+            "t",
+        ]
+        for attr in candidate_attrs:
+            if not hasattr(optimizer, attr):
+                continue
+            value = getattr(optimizer, attr)
+            try:
+                if isinstance(value, torch.Tensor):
+                    setattr(optimizer, attr, torch.zeros_like(value))
+                elif isinstance(value, (int, float)):
+                    setattr(optimizer, attr, type(value)(0))
+            except Exception:
+                continue
+
+    @staticmethod
+    def _state_dict_is_finite(state_dict):
+        for value in state_dict.values():
+            if isinstance(value, torch.Tensor) and not torch.isfinite(value).all():
+                return False
+        return True

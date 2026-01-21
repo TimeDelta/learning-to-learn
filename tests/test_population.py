@@ -11,6 +11,7 @@ sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from attributes import FloatAttribute, IntAttribute
 from genes import NODE_TYPE_TO_INDEX, ConnectionGene, NodeGene
 from genome import OptimizerGenome
+from metrics import AreaUnderTaskMetrics, MemoryCost, TimeCost
 from models import ManyLossMinimaModel
 from population import GuidedPopulation
 from relative_rank_stagnation import RelativeRankStagnation
@@ -44,6 +45,8 @@ class DummyStatefulOptimizer(torch.nn.Module):
             if tuple(buf.shape) != tuple(param.shape):
                 raise RuntimeError("optimizer buffer shape mismatch")
             updated[name] = param.detach().clone()
+            # Persist the buffer we used so tests can inspect the resized shapes.
+            self.state_buffers[name] = buf.clone().detach()
         return updated
 
 
@@ -117,6 +120,24 @@ def test_generate_guided_offspring():
     for child in offspring:
         assert isinstance(child, OptimizerGenome)
         assert child.graph_dict is not None
+
+
+def test_eval_genomes_penalizes_skipped_empty_graphs():
+    config = make_config()
+    pop = GuidedPopulation(config)
+    task = RegressionTask.random_init(num_samples=4, silent=True)
+
+    genome = create_simple_genome()
+    genome.connections = {}
+    genome.skip_evaluation = True
+    genome.invalid_reason = "empty_graph"
+
+    pop.eval_genomes([(0, genome)], config, task, steps=1)
+
+    assert getattr(genome, "invalid_graph", False)
+    assert genome.fitnesses[AreaUnderTaskMetrics] == GuidedPopulation.INVALID_METRIC_VALUE
+    assert genome.fitnesses[TimeCost] == GuidedPopulation.INVALID_METRIC_VALUE
+    assert genome.fitnesses[MemoryCost] == GuidedPopulation.INVALID_METRIC_VALUE
 
 
 def test_generate_guided_offspring_handles_missing_elites():
@@ -280,6 +301,58 @@ def test_evaluate_optimizer_resizes_state_before_execution():
     pop.evaluate_optimizer(optimizer, model, task, steps=1)
 
     assert tuple(optimizer.state_buffers["fc1.weight"].shape) == tuple(model.fc1.weight.shape)
+
+
+def test_evaluate_optimizer_resets_state_and_step_each_run():
+    class TrackingOptimizer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            # Pre-populate the dict so the reset logic has something to clear.
+            self.state = {"fc1.weight": torch.ones(1, 1)}
+            self.step = 7
+            self.observed = []
+
+        def forward(self, loss, prev_loss, named_parameters):
+            # Record the state that evaluation sees before any updates.
+            self.observed.append((self.step, dict(self.state)))
+            updated = {}
+            for name, param in named_parameters:
+                updated[name] = param.detach().clone()
+            # Store non-zero tensors so subsequent runs would show stale state if not reset.
+            self.state = {name: torch.ones_like(param) for name, param in named_parameters}
+            self.step += 1
+            return updated
+
+    config = make_config()
+    pop = GuidedPopulation(config)
+    task = RegressionTask.random_init(num_samples=4, silent=True)
+    model = ManyLossMinimaModel(task.train_data.num_input_features)
+    optimizer = TrackingOptimizer()
+
+    pop.evaluate_optimizer(optimizer, model, task, steps=1)
+    # Simulate leftover state before the second evaluation.
+    optimizer.state = {k: v + 5 for k, v in optimizer.state.items()}
+    optimizer.step = 42
+    pop.evaluate_optimizer(optimizer, model, task, steps=1)
+
+    assert [step for step, _ in optimizer.observed] == [0, 0]
+    assert all(len(state) == 0 for _, state in optimizer.observed)
+
+
+def test_evaluate_optimizer_marks_nan_outputs_invalid():
+    class NaNOptimizer(torch.nn.Module):
+        def forward(self, loss, prev_loss, named_parameters):
+            return {name: torch.full_like(param, float("nan")) for name, param in named_parameters}
+
+    config = make_config()
+    pop = GuidedPopulation(config)
+    task = RegressionTask.random_init(num_samples=4, silent=True)
+    model = ManyLossMinimaModel(task.train_data.num_input_features)
+
+    optimizer = NaNOptimizer()
+    result = pop.evaluate_optimizer(optimizer, model, task, steps=1)
+
+    assert result is None
 
 
 def test_optimizer_state_attributes_include_empty_dicts():

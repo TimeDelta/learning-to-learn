@@ -1,3 +1,5 @@
+import copy
+import hashlib
 import logging
 import random
 from typing import Dict, Tuple
@@ -124,6 +126,15 @@ class NodeGene(BaseGene):
         # penalty for attrs only in one gene
         d += len(set(self.dynamic_attributes) ^ set(other.dynamic_attributes))
 
+        if getattr(self, "output_debug_names", None) and getattr(other, "output_debug_names", None):
+            if (
+                hashlib.md5("".join(self.output_debug_names).encode()).hexdigest()
+                != hashlib.md5("".join(other.output_debug_names).encode()).hexdigest()
+            ):
+                d += 1
+        if getattr(self, "scope", None) != getattr(other, "scope", None):
+            d += 1
+
         return d * config.compatibility_weight_coefficient
 
     def crossover(self, other):
@@ -148,7 +159,7 @@ class NodeGene(BaseGene):
     def copy(self):
         new_gene = self.__class__(self.key)
         new_gene.node_type = self.node_type
-        new_gene.dynamic_attributes = self.dynamic_attributes
+        new_gene.dynamic_attributes = copy.deepcopy(self.dynamic_attributes)
         return new_gene
 
     def __str__(self):

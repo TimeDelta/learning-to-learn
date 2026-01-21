@@ -81,10 +81,13 @@ class Task:
         self.check_partition_similarity()
 
     def evaluate_metrics(self, model: nn.Module, dataset: TaskDataset) -> Dict[str, float]:
-        values = {
-            m.name: m(model(torch.tensor(dataset.inputs, dtype=torch.float32)), dataset.outputs) for m in self.metrics
-        }
-        return torch.tensor([v for _, v in sorted(values.items(), key=lambda i: i[0])], dtype=torch.float32)
+        """Return stacked metric tensors so autograd gradients flow to the model."""
+        metric_pairs = [
+            (m.name, m(model(torch.tensor(dataset.inputs, dtype=torch.float32)), dataset.outputs)) for m in self.metrics
+        ]
+        metric_pairs.sort(key=lambda item: item[0])
+        tensors = [value for _, value in metric_pairs]
+        return torch.stack(tensors).to(dtype=torch.float32)
 
     def check_partition_similarity(self):
         train_in_feats, train_out_feats, valid_in_feats, valid_out_feats = self.features

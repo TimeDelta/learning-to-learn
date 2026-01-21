@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import math
 import os
 import re
@@ -26,10 +27,13 @@ def create_initial_genome(config, optimizer):
     for node in optimizer.graph.nodes():
         new_node_gene = NodeGene(next_node_id, node)
         new_node_gene.init_attributes(config.genome_config)
-        if new_node_gene:
-            genome.nodes[next_node_id] = new_node_gene
-            node_mapping[node] = next_node_id
-            next_node_id += 1
+        new_node_gene.dynamic_attributes["__node_kind__"] = node.kind()
+        scope = node.scopeName()
+        if scope:
+            gene.dynamic_attributes["__scope__"] = scope
+        genome.nodes[next_node_id] = new_node_gene
+        node_mapping[node] = next_node_id
+        next_node_id += 1
 
     connections = {}
     innovation = 0
@@ -62,19 +66,24 @@ def override_initial_population(population, config):
     Overrides the initial genomes in the population with copies of the exact initial genome.
     """
     new_population = {}
-    optimizers = []
-    optimizer_paths = []
+    unique_paths = []
+    seen_hashes = set()
     for fname in os.listdir("computation_graphs/optimizers/"):
-        if fname.endswith(".pt"):
-            optimizers.append(torch.jit.load(f"computation_graphs/optimizers/{fname}"))
-            optimizer_paths.append(f"computation_graphs/optimizers/{fname}")
-    i = 0
-    for key in population.population.keys():
-        new_genome = create_initial_genome(config, optimizers[i % len(optimizers)])
+        if not fname.endswith(".pt"):
+            continue
+        path = f"computation_graphs/optimizers/{fname}"
+        with open(path, "rb") as fh:
+            md5_hash = hashlib.md5(fh.read()).hexdigest()
+        if md5_hash in seen_hashes:
+            continue
+        seen_hashes.add(md5_hash)
+        unique_paths.append(path)
+    for key, path in zip(population.population.keys(), unique_paths):
+        optimizer = torch.jit.load(path)
+        new_genome = create_initial_genome(config, optimizer)
         new_genome.key = key
-        new_genome.optimizer_path = optimizer_paths[i % len(optimizers)]
+        new_genome.optimizer_path = path
         new_population[key] = new_genome
-        i += 1
     population.population = new_population
     population.shared_attr_vocab.add_names(ATTRIBUTE_NAMES)
     population.species.speciate(config, population.population, population.generation)

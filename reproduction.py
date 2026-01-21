@@ -1,8 +1,10 @@
 import math
 import random
 from collections import defaultdict
+from warnings import warn
 
 import numpy as np
+import torch
 from neat.config import *
 from neat.reproduction import DefaultReproduction
 
@@ -26,6 +28,7 @@ class GuidedReproduction(DefaultReproduction):
     def __init__(self, config, reporters, stagnation):
         super().__init__(config, reporters, stagnation)
         self.guide_fn = None
+        self.guided_start_generation = getattr(config, "guided_start_generation", 0)
 
     def reproduce(self, config, species, pop_size, generation, task):
         # Filter out stagnated species, collect the set of non-stagnated
@@ -83,24 +86,30 @@ class GuidedReproduction(DefaultReproduction):
             # elites
             for gid, g in old_members[: self.reproduction_config.elitism]:
                 new_population[gid] = g
-            spawn -= self.reproduction_config.elitism
-            if spawn <= 0:
+            remaining_spawn = spawn - self.reproduction_config.elitism
+            if remaining_spawn <= 0:
                 continue
 
             # 1) guided children
-            if spawn // 2 > 0:
-                guided = self.guide_fn(task, list(s.members.values()), self.reproduction_config, spawn // 2)
-                for kid in guided:
-                    gid = next(self.genome_indexer)
-                    kid.key = gid
-                    new_population[gid] = kid
-                    self.ancestors[gid] = (None, None)
+            guided_quota = remaining_spawn // 2
+            guided_children = []
+            if guided_quota > 0 and self.guide_fn is not None and generation >= self.guided_start_generation:
+                guided_children = self.guide_fn(task, list(s.members.values()), self.reproduction_config, guided_quota)
+
+            for kid in guided_children:
+                gid = next(self.genome_indexer)
+                kid.key = gid
+                new_population[gid] = kid
+                self.ancestors[gid] = (None, None)
+            remaining_spawn -= len(guided_children)
+            if remaining_spawn <= 0:
+                continue
 
             # 2) standard NEAT crossover + mutation
-            if spawn - spawn // 2 > 0:
+            if remaining_spawn > 0:
                 repro_cutoff = max(2, int(math.ceil(self.reproduction_config.survival_threshold * len(old_members))))
                 parents = old_members[:repro_cutoff]
-                for _ in range(spawn - spawn // 2):
+                for _ in range(remaining_spawn):
                     p1_id, p1 = random.choice(parents)
                     p2_id, p2 = random.choice(parents)
                     cid = next(self.genome_indexer)
@@ -109,6 +118,23 @@ class GuidedReproduction(DefaultReproduction):
                     child.mutate(config.genome_config)
                     if hasattr(child, "compile_optimizer"):
                         child.compile_optimizer(config.genome_config)
+                        graph_dict = getattr(child, "graph_dict", None)
+                        if graph_dict:
+                            edge_index = graph_dict.get("edge_index")
+                            num_edges = 0
+                            if edge_index is not None:
+                                if isinstance(edge_index, torch.Tensor):
+                                    edge_tensor = edge_index
+                                else:
+                                    edge_tensor = torch.as_tensor(edge_index)
+                                if edge_tensor.dim() == 1:
+                                    num_edges = edge_tensor.numel() // 2
+                                elif edge_tensor.dim() == 2:
+                                    num_edges = edge_tensor.size(1)
+                            if num_edges == 0:
+                                warn(
+                                    "NEAT offspring produced an empty graph after mutation; consider adjusting mutation rates."
+                                )
                     new_population[cid] = child
                     self.ancestors[cid] = (p1_id, p2_id)
 

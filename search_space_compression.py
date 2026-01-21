@@ -4,6 +4,7 @@
 import logging
 import math
 import os
+import random
 import time
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from warnings import warn
@@ -894,7 +895,7 @@ class GraphDecoder(nn.Module):
                                 used_idx_tensor = torch.tensor(
                                     list(used_name_indices), device=similarity_logits.device, dtype=torch.long
                                 )
-                                similarity_logits.index_fill_(0, used_idx_tensor, float("-inf"))
+                                similarity_logits.index_fill_(0, used_idx_tensor, -1e4)
                             eos_bias = self.attr_eos_bias_base + self.attr_eos_bias_slope * t
                             similarity_logits[self.attr_eos_index] = similarity_logits[self.attr_eos_index] + eos_bias
                             name_index = int(similarity_logits.argmax().item())
@@ -1255,15 +1256,20 @@ class OnlineTrainer:
         self.model = model.to(self.device)
         self.optimizer = optimizer
         self.dataset = []
+        self.invalid_dataset = []
         self.loss_history = []
         self.initial_loss = None
         self.last_prune_epoch = 0
         self.max_fitness_dim = 0
         self.task_feature_bank: Dict[int, np.ndarray] = {}
         self.task_metric_dims: Dict[int, int] = {}
+        self.invalid_target_ratio = 0.2
+        self.invalid_ratio_warmup = 5
 
-    def add_data(self, graphs, fitnesses, task_type: str, task_features):
-        for graph, fitness_dict in zip(graphs, fitnesses):
+    def add_data(self, graphs, fitnesses, task_type: str, task_features, invalid_flags=None):
+        if invalid_flags is None:
+            invalid_flags = [False] * len(graphs)
+        for graph, fitness_dict, is_invalid in zip(graphs, fitnesses, invalid_flags):
             data = graph.clone()
             # sort fitness values by key
             fitness = [f[1] for f in sorted(fitness_dict.items(), key=lambda item: item[0].name)]
@@ -1285,7 +1291,8 @@ class OnlineTrainer:
             data.fitness_dim = torch.tensor(len(fitness), dtype=torch.long)
             data.task_type = torch.tensor(task_type_id, dtype=torch.long)
             data.task_features = flat_tensor
-            self.dataset.append(data)
+            target_list = self.invalid_dataset if is_invalid else self.dataset
+            target_list.append(data)
 
     def train(
         self,
@@ -1300,10 +1307,21 @@ class OnlineTrainer:
         min_active_dims=5,
         stop_epsilon=1e-3,
         verbose=True,
+        generation=0,
     ):
         self._normalize_task_feature_shapes()
-        loader = DataLoader(self.dataset, batch_size=batch_size, shuffle=True)
-        dataset_size = len(self.dataset)
+        train_samples = list(self.dataset)
+        if self.invalid_dataset and train_samples:
+            ratio = min(self.invalid_target_ratio, generation / (generation + self.invalid_ratio_warmup))
+            invalid_count = max(1, int(len(train_samples) * ratio)) if ratio > 0 else 0
+            invalid_count = min(invalid_count, len(self.invalid_dataset))
+            if invalid_count > 0:
+                sampled_invalid = random.sample(self.invalid_dataset, invalid_count)
+                train_samples.extend(sampled_invalid)
+        elif self.invalid_dataset and not train_samples:
+            train_samples = list(self.invalid_dataset)
+        loader = DataLoader(train_samples, batch_size=batch_size, shuffle=True)
+        dataset_size = len(train_samples)
         total_batches = len(loader)
         train_start = time.perf_counter()
         if DEBUG_TRAINER:

@@ -35,5 +35,5 @@ species_elitism      = 2
 rank_tolerance       = 1e-06
 
 [GuidedReproduction]
-elitism            = 2
+elitism            = 5
 survival_threshold = 0.2
