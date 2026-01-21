@@ -438,6 +438,7 @@ class GuidedPopulation(Population):
         validation_metrics[TimeCost] = self.INVALID_METRIC_VALUE
         validation_metrics[MemoryCost] = self.INVALID_METRIC_VALUE
         genome.fitnesses = validation_metrics
+        genome.fitness = -0.1
         setattr(genome, "invalid_graph", True)
         if skip_evaluation:
             genome.skip_evaluation = True

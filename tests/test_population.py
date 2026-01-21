@@ -138,6 +138,7 @@ def test_eval_genomes_penalizes_skipped_empty_graphs():
     assert genome.fitnesses[AreaUnderTaskMetrics] == GuidedPopulation.INVALID_METRIC_VALUE
     assert genome.fitnesses[TimeCost] == GuidedPopulation.INVALID_METRIC_VALUE
     assert genome.fitnesses[MemoryCost] == GuidedPopulation.INVALID_METRIC_VALUE
+    assert genome.fitness == -0.1
 
 
 def test_generate_guided_offspring_handles_missing_elites():
