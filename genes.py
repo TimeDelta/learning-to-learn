@@ -116,22 +116,23 @@ class NodeGene(BaseGene):
         del self.dynamic_attributes[attr_to_remove]
 
     def distance(self, other, config):
+        def attr_equal(a, b):
+            if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
+                if a.shape != b.shape:
+                    return False
+                return torch.allclose(a, b)
+            return a == b
+
         d = 0.0 if self.node_type == other.node_type else 1.0
 
         common = set(self.dynamic_attributes) & set(other.dynamic_attributes)
         for name in common:
-            if self.dynamic_attributes[name] != other.dynamic_attributes[name]:
+            if not attr_equal(self.dynamic_attributes[name], other.dynamic_attributes[name]):
                 d += 1
 
         # penalty for attrs only in one gene
         d += len(set(self.dynamic_attributes) ^ set(other.dynamic_attributes))
 
-        if getattr(self, "output_debug_names", None) and getattr(other, "output_debug_names", None):
-            if (
-                hashlib.md5("".join(self.output_debug_names).encode()).hexdigest()
-                != hashlib.md5("".join(other.output_debug_names).encode()).hexdigest()
-            ):
-                d += 1
         if getattr(self, "scope", None) != getattr(other, "scope", None):
             d += 1
 
@@ -160,6 +161,10 @@ class NodeGene(BaseGene):
         new_gene = self.__class__(self.key)
         new_gene.node_type = self.node_type
         new_gene.dynamic_attributes = copy.deepcopy(self.dynamic_attributes)
+        if hasattr(self, "output_debug_names"):
+            new_gene.output_debug_names = copy.deepcopy(self.output_debug_names)
+        if hasattr(self, "scope"):
+            new_gene.scope = copy.deepcopy(self.scope)
         return new_gene
 
     def __str__(self):

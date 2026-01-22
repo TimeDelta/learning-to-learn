@@ -27,7 +27,7 @@ from tasks import *
 
 class GuidedPopulation(Population):
     _optimizer_state_attr_cache: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
-    INVALID_METRIC_VALUE = -1e4
+    INVALID_METRIC_VALUE = -1e9
 
     def __init__(self, config):
         super().__init__(config)
@@ -53,6 +53,16 @@ class GuidedPopulation(Population):
         stagnation = config.stagnation_type(config.stagnation_config, self.reporters)
         self.reproduction = GuidedReproduction(config.reproduction_config, self.reporters, stagnation)
         self.reproduction.guide_fn = self.generate_guided_offspring
+
+    @staticmethod
+    def _evaluation_metric_keys(task) -> List[Metric]:
+        metrics: List[Metric] = list(task.metrics)
+        metrics.extend([AreaUnderTaskMetrics, TimeCost, MemoryCost])
+        return sort_metrics_by_name(metrics)
+
+    @staticmethod
+    def _metric_best_values(metric_keys: List[Metric]) -> List[float]:
+        return [metric_best_value(metric) for metric in metric_keys]
 
     def genome_to_data(self, genome: OptimizerGenome):
         # always rebuild graph_dict so that new attributes are captured
@@ -110,8 +120,10 @@ class GuidedPopulation(Population):
         """
         task_type = task.name()
         task_type_id = TASK_TYPE_TO_INDEX[task_type]
-        metric_dim = len(task.metrics)
-        self.trainer.remember_task_signature(task_type, task.features, metric_dim)
+        metric_keys = self._evaluation_metric_keys(task)
+        metric_best_values = self._metric_best_values(metric_keys)
+        metric_dim = len(metric_keys)
+        self.trainer.remember_task_signature(task_type, task.features, metric_dim, metric_best_values)
         expected_len = TASK_FEATURE_DIMS[task_type]
         flat_features = flatten_task_features(task.features, expected_len)
         mu_t, lv_t = self.guide.tasks_encoder(torch.tensor([task_type_id], dtype=torch.long), [flat_features])
@@ -181,17 +193,38 @@ class GuidedPopulation(Population):
                     continue
             mu_t_head, lv_t_head = self.guide.tasks_encoder(torch.tensor([head_task_id], dtype=torch.long), [features])
             z_t_head = self.guide.reparameterize(mu_t_head, lv_t_head, self.guide.tasks_latent_mask).detach()
-            head_latents.append((head_task_id, head_dim, z_t_head.expand(total_latents, -1).clone()))
+            best_values = self.trainer.get_metric_best_values(head_task_id)
+            if best_values is not None:
+                best_list = list(best_values)
+            elif head_task_id == task_type_id:
+                best_list = list(metric_best_values)
+            else:
+                best_list = [0.0] * head_dim
+            best_tensor = torch.as_tensor(best_list, dtype=z_g.dtype, device=z_g.device)
+            if best_tensor.numel() < head_dim:
+                best_tensor = F.pad(best_tensor, (0, head_dim - best_tensor.numel()))
+            elif best_tensor.numel() > head_dim:
+                best_tensor = best_tensor[:head_dim]
+            head_latents.append((head_task_id, head_dim, z_t_head.expand(total_latents, -1).clone(), best_tensor))
 
         if not head_latents:
-            head_latents.append((task_type_id, metric_dim, z_t))
+            head_latents.append(
+                (
+                    task_type_id,
+                    metric_dim,
+                    z_t,
+                    torch.as_tensor(metric_best_values, dtype=z_g.dtype, device=z_g.device),
+                )
+            )
 
         opt = torch.optim.Adam([z_g], lr=latent_lr)
         for _ in range(latent_steps):
-            loss = 0.0
-            for head_task_id, head_dim, z_t_head in head_latents:
+            loss_terms = []
+            for head_task_id, head_dim, z_t_head, best_tensor in head_latents:
                 pred = self.guide.predict_task_head(head_task_id, head_dim, z_g, z_t_head)
-                loss = loss - pred.sum(dim=1).mean()
+                diff = pred - best_tensor
+                loss_terms.append(diff.pow(2).sum(dim=1).mean())
+            loss = torch.stack(loss_terms).sum()
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -314,11 +347,11 @@ class GuidedPopulation(Population):
 
             batch = max(1, len(self.trainer.dataset))
             if generation < gen_for_full_train_resize:
-                self.trainer.train(epochs=5, batch_size=batch, generation=self.generation)
+                self.trainer.train(epochs=25, batch_size=batch, generation=self.generation)
             elif generation > gen_for_full_train_resize:
-                self.trainer.train(epochs=1, batch_size=batch, generation=self.generation)
+                self.trainer.train(epochs=5, batch_size=batch, generation=self.generation)
             else:
-                self.trainer.train(warmup_epochs=10, batch_size=batch, generation=self.generation)
+                self.trainer.train(warmup_epochs=50, batch_size=batch, generation=self.generation)
 
             # Build next‐gen population by species
             self.population = self.reproduction.reproduce(
@@ -353,6 +386,7 @@ class GuidedPopulation(Population):
         """
         Evaluate each genome by using its network as a meta–optimizer.
         """
+        metric_keys = self._evaluation_metric_keys(task)
         raw_metrics: Dict[int, Dict[str, float]] = {}
         invalid_genomes: List[int] = []
         genome_map = {gid: g for gid, g in genomes}
@@ -397,31 +431,54 @@ class GuidedPopulation(Population):
             )
             return genomes
 
-        # 3. Pareto front ranking
+        # 3. Pareto front ranking (exclude penalized metrics from dominance calc)
         print("  Calculating Pareto Fronts")
-        fronts = nondominated_sort(raw_metrics)
+        pareto_metrics: Dict[int, Dict[Metric, float]] = {}
+        penalized_for_front: List[int] = []
+        for gid, metrics in raw_metrics.items():
+            if any(value <= self.INVALID_METRIC_VALUE for value in metrics.values()):
+                penalized_for_front.append(gid)
+            else:
+                pareto_metrics[gid] = metrics
 
-        # 4. Compute global min/max per metric
-        mins = {m: min(raw_metrics[g][m] for g in raw_metrics) for m in validation_metrics}
-        maxs = {m: max(raw_metrics[g][m] for g in raw_metrics) for m in validation_metrics}
+        fronts: List[List[int]] = []
+        if pareto_metrics:
+            fronts = nondominated_sort(pareto_metrics)
+        if penalized_for_front:
+            fronts.append(penalized_for_front)
+
+        # 4. Compute global min/max per metric using only valid Pareto entries
+        mins: Dict[Metric, float] = {}
+        maxs: Dict[Metric, float] = {}
+        for metric in metric_keys:
+            values = [metrics[metric] for metrics in pareto_metrics.values() if metric in metrics]
+            if values:
+                mins[metric] = min(values)
+                maxs[metric] = max(values)
+            else:
+                mins[metric] = 0.0
+                maxs[metric] = 0.0
 
         # 5. Assign fitness = Pareto rank base + composite normalized score
         for front_idx, front in enumerate(fronts, start=1):
             for genome_id in front:
                 # Composite min–max normalized score
                 scores = []
-                for m in validation_metrics:
+                metrics = raw_metrics[genome_id]
+                for m in metric_keys:
                     lo, hi = mins[m], maxs[m]
                     if hi - lo < epsilon:
-                        norm = 1.0
+                        norm = 0.0
                     else:
-                        v = raw_metrics[genome_id][m]
-                        if m.objective == "max":
+                        v = metrics.get(m, self.INVALID_METRIC_VALUE)
+                        if v <= self.INVALID_METRIC_VALUE:
+                            norm = 0.0
+                        elif m.objective == "max":
                             norm = (v - lo) / (hi - lo)
                         else:
                             norm = (hi - v) / (hi - lo)
                     scores.append(norm)
-                composite = sum(scores) / len(scores)
+                composite = sum(scores) / len(scores) if scores else 0.0
                 # Fitness: higher for earlier fronts, break ties by composite
                 genome_map[genome_id].fitness = (len(fronts) - front_idx + 1) + composite
                 print(f"    {genome_id}: {genome_map[genome_id].fitness}")

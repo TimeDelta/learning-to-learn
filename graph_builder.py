@@ -1,3 +1,4 @@
+import hashlib
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -7,6 +8,17 @@ import torch.nn as nn
 
 from genes import NODE_TYPE_OPTIONS, NodeGene
 from genome import OptimizerGenome
+
+
+def _encode_string_sequence(values):
+    tokens = [str(v) for v in values if v is not None]
+    if not tokens:
+        return None
+    hashed = []
+    for token in tokens:
+        digest = hashlib.sha256(token.encode("utf-8")).digest()
+        hashed.append(int.from_bytes(digest[:4], byteorder="little") / 0xFFFFFFFF)
+    return torch.tensor(hashed, dtype=torch.float32)
 
 
 class DynamicOptimizerModule(nn.Module):
@@ -95,6 +107,14 @@ def genome_from_graph_dict(graph_dict, genome_config, key=None) -> OptimizerGeno
                 node_type_name = "hidden"
         ng.node_type = node_type_name
         dyn_attrs = dict(attr_dict)
+        for seq_key in ("__output_types__", "__input_types__", "__input_kinds__", "__getattr_output_types__"):
+            val = dyn_attrs.get(seq_key)
+            if isinstance(val, (list, tuple)):
+                tensor = _encode_string_sequence(val)
+                if tensor is not None:
+                    dyn_attrs[seq_key] = tensor
+                else:
+                    dyn_attrs.pop(seq_key, None)
         dyn_attrs.setdefault("__node_kind__", node_type_name)
         ng.dynamic_attributes = dyn_attrs
 

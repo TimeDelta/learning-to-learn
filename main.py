@@ -16,6 +16,55 @@ from relative_rank_stagnation import RelativeRankStagnation
 from reproduction import *
 
 
+def _encode_string_sequence(values):
+    tokens = [str(v) for v in values if v is not None]
+    if not tokens:
+        return None
+    hashed = []
+    for token in tokens:
+        digest = hashlib.sha256(token.encode("utf-8")).digest()
+        hashed.append(int.from_bytes(digest[:4], byteorder="little") / 0xFFFFFFFF)
+    return torch.tensor(hashed, dtype=torch.float32)
+
+
+def _annotate_node_for_speciation(gene: NodeGene, node: torch._C.Node) -> None:
+    """Attach deterministic metadata so speciation can distinguish identical graphs."""
+    if node is None:
+        return
+    attrs = gene.dynamic_attributes
+    attrs["__node_kind__"] = node.kind()
+    scope = node.scopeName()
+    if scope:
+        attrs["__scope__"] = scope
+
+    outputs = list(node.outputs())
+    attrs["__num_outputs__"] = len(outputs)
+    output_tensor = _encode_string_sequence(str(out.type()) for out in outputs)
+    if output_tensor is not None:
+        attrs["__output_types__"] = output_tensor
+
+    inputs = list(node.inputs())
+    attrs["__num_inputs__"] = len(inputs)
+    if inputs:
+        kind_tensor = _encode_string_sequence(inp.node().kind() for inp in inputs)
+        if kind_tensor is not None:
+            attrs["__input_kinds__"] = kind_tensor
+        type_tensor = _encode_string_sequence(str(inp.type()) for inp in inputs)
+        if type_tensor is not None:
+            attrs["__input_types__"] = type_tensor
+        getattr_types = []
+        for inp in inputs:
+            src_node = inp.node()
+            if src_node.kind() == "prim::GetAttr" and src_node.outputsSize() > 0:
+                try:
+                    getattr_types.append(str(src_node.output().type()))
+                except RuntimeError:
+                    continue
+        getattr_tensor = _encode_string_sequence(getattr_types)
+        if getattr_tensor is not None:
+            attrs["__getattr_output_types__"] = getattr_tensor
+
+
 def create_initial_genome(config, optimizer):
     """
     Creates an initial genome that mirrors the structure of the provided TorchScript optimizer computation graph.
@@ -27,10 +76,7 @@ def create_initial_genome(config, optimizer):
     for node in optimizer.graph.nodes():
         new_node_gene = NodeGene(next_node_id, node)
         new_node_gene.init_attributes(config.genome_config)
-        new_node_gene.dynamic_attributes["__node_kind__"] = node.kind()
-        scope = node.scopeName()
-        if scope:
-            gene.dynamic_attributes["__scope__"] = scope
+        _annotate_node_for_speciation(new_node_gene, node)
         genome.nodes[next_node_id] = new_node_gene
         node_mapping[node] = next_node_id
         next_node_id += 1

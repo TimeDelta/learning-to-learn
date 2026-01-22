@@ -1263,6 +1263,7 @@ class OnlineTrainer:
         self.max_fitness_dim = 0
         self.task_feature_bank: Dict[int, np.ndarray] = {}
         self.task_metric_dims: Dict[int, int] = {}
+        self.task_metric_best_values: Dict[int, np.ndarray] = {}
         self.invalid_target_ratio = 0.2
         self.invalid_ratio_warmup = 5
 
@@ -1272,22 +1273,31 @@ class OnlineTrainer:
         for graph, fitness_dict, is_invalid in zip(graphs, fitnesses, invalid_flags):
             data = graph.clone()
             # sort fitness values by key
-            fitness = [f[1] for f in sorted(fitness_dict.items(), key=lambda item: item[0].name)]
+            metric_items = sorted(fitness_dict.items(), key=lambda item: item[0].name)
+            fitness = [float(value) for _, value in metric_items]
+            best_values = [float(getattr(metric, "best_value", 0.0)) for metric, _ in metric_items]
             task_type_id = TASK_TYPE_TO_INDEX[task_type]
             expected_len = TASK_FEATURE_DIMS[task_type]
             flat_features = flatten_task_features(task_features, expected_len)
-            self._remember_task_signature(task_type_id, flat_features, len(fitness))
+            self._remember_task_signature(task_type_id, flat_features, len(fitness), best_values)
             flat_tensor = torch.as_tensor(flat_features, dtype=torch.float).unsqueeze(0)
 
             fitness_tensor = torch.as_tensor(fitness, dtype=torch.float)
+            best_tensor = torch.as_tensor(best_values, dtype=torch.float)
             self._ensure_dataset_target_width(fitness_tensor.numel())
             if fitness_tensor.numel() < self.max_fitness_dim:
                 pad = self.max_fitness_dim - fitness_tensor.numel()
-                fitness_tensor = torch.cat([fitness_tensor, torch.zeros(pad)], dim=-1)
+                zeros = torch.zeros(pad, dtype=torch.float)
+                fitness_tensor = torch.cat([fitness_tensor, zeros], dim=-1)
+                best_tensor = torch.cat([best_tensor, torch.zeros(pad)], dim=-1)
+            elif best_tensor.numel() < self.max_fitness_dim:
+                pad = self.max_fitness_dim - best_tensor.numel()
+                best_tensor = torch.cat([best_tensor, torch.zeros(pad)], dim=-1)
             mask = torch.zeros(self.max_fitness_dim, dtype=torch.float)
             mask[: len(fitness)] = 1.0
             data.y = fitness_tensor
             data.fitness_mask = mask
+            data.metric_best_values = best_tensor
             data.fitness_dim = torch.tensor(len(fitness), dtype=torch.long)
             data.task_type = torch.tensor(task_type_id, dtype=torch.long)
             data.task_features = flat_tensor
@@ -1481,7 +1491,14 @@ class OnlineTrainer:
                 mask = batch.fitness_mask.to(self.device)
                 target = target_y.to(self.device)
                 pred = self._align_pred_to_mask(fitness_pred, mask)
-                diff = (pred - target) * mask
+                best = getattr(batch, "metric_best_values", None)
+                if best is None:
+                    best = torch.zeros_like(pred)
+                else:
+                    best = best.to(self.device)
+                target_canonical = (target - best) * mask
+                pred_canonical = (pred - best) * mask
+                diff = pred_canonical - target_canonical
                 denom = mask.sum().clamp_min(1.0)
                 loss_fitness = diff.pow(2).sum() / denom
 
@@ -1559,26 +1576,48 @@ class OnlineTrainer:
         if new_width <= self.max_fitness_dim:
             return
         pad = new_width - self.max_fitness_dim
-        for data in self.dataset:
-            data.y = torch.cat([data.y, torch.zeros(pad)], dim=-1)
-            data.fitness_mask = torch.cat([data.fitness_mask, torch.zeros(pad)], dim=-1)
+        for collection in (self.dataset, self.invalid_dataset):
+            for data in collection:
+                dtype = data.y.dtype if hasattr(data, "y") else torch.float32
+                data.y = torch.cat([data.y, torch.zeros(pad, dtype=dtype)], dim=-1)
+                mask_dtype = data.fitness_mask.dtype if hasattr(data, "fitness_mask") else torch.float32
+                data.fitness_mask = torch.cat([data.fitness_mask, torch.zeros(pad, dtype=mask_dtype)], dim=-1)
+                best_values = getattr(data, "metric_best_values", None)
+                best_dtype = best_values.dtype if best_values is not None else dtype
+                if best_values is None:
+                    data.metric_best_values = torch.zeros(new_width, dtype=best_dtype)
+                else:
+                    data.metric_best_values = torch.cat([best_values, torch.zeros(pad, dtype=best_dtype)], dim=-1)
         self.max_fitness_dim = new_width
 
-    def _remember_task_signature(self, task_type_id: int, flat_features: np.ndarray, fitness_dim: int):
+    def _remember_task_signature(
+        self,
+        task_type_id: int,
+        flat_features: np.ndarray,
+        fitness_dim: int,
+        metric_best_values: Optional[Sequence[float]] = None,
+    ):
         self.task_feature_bank[task_type_id] = flat_features
         self.task_metric_dims[task_type_id] = fitness_dim
+        if metric_best_values is not None:
+            self.task_metric_best_values[task_type_id] = np.asarray(metric_best_values, dtype=np.float32)
 
-    def remember_task_signature(self, task_type: str, task_features, fitness_dim: int):
+    def remember_task_signature(
+        self, task_type: str, task_features, fitness_dim: int, metric_best_values: Optional[Sequence[float]] = None
+    ):
         task_type_id = TASK_TYPE_TO_INDEX[task_type]
         expected_len = TASK_FEATURE_DIMS[task_type]
         flat = flatten_task_features(task_features, expected_len)
-        self._remember_task_signature(task_type_id, flat, fitness_dim)
+        self._remember_task_signature(task_type_id, flat, fitness_dim, metric_best_values)
 
     def get_task_features(self, task_type_id: int) -> Optional[np.ndarray]:
         return self.task_feature_bank.get(task_type_id)
 
     def get_task_metric_dim(self, task_type_id: int) -> Optional[int]:
         return self.task_metric_dims.get(task_type_id)
+
+    def get_metric_best_values(self, task_type_id: int) -> Optional[np.ndarray]:
+        return self.task_metric_best_values.get(task_type_id)
 
     def _normalize_task_feature_shapes(self):
         for data in self.dataset:
