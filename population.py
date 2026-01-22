@@ -55,6 +55,9 @@ class GuidedPopulation(Population):
         stagnation = config.stagnation_type(config.stagnation_config, self.reporters)
         self.reproduction = GuidedReproduction(config.reproduction_config, self.reporters, stagnation)
         self.reproduction.guide_fn = self.generate_guided_offspring
+        self.reproduction.optimizer_validator = lambda optimizer, task: self._optimizer_updates_parameters(
+            optimizer, task, check_steps=2
+        )
 
     @staticmethod
     def _evaluation_metric_keys(task) -> List[Metric]:
@@ -118,6 +121,8 @@ class GuidedPopulation(Population):
         n_offspring: int = 10,
         latent_steps: int = 50,
         latent_lr: float = 1e-2,
+        max_decode_attempts: int = 3,
+        decode_jitter_std: float = 0.1,
     ) -> List[OptimizerGenome]:
         """
         For a fixed (task_type, task_features), optimize `z_g` in latent space to maximize
@@ -254,78 +259,182 @@ class GuidedPopulation(Population):
             loss.backward()
             opt.step()
 
-        # 4) Decode
-        with torch.no_grad():
-            graphs = self.guide.decode(z_g)
-
         stats = []
-        rebuild_failures = 0
         new_genomes = []
         empty_graph_count = 0
+        duplicate_count = 0
+        rebuild_failures = 0
+        resample_attempts = 0
+        inactive_optimizer_count = 0
         debug_dir = Path("debug_guided_offspring")
         debug_dir.mkdir(parents=True, exist_ok=True)
         debug_save_limit = 5
         debug_saved = 0
         generation_idx = getattr(self, "generation", -1)
-        duplicate_count = 0
         seen_edge_sets = set()
+        total_requested = z_g.size(0)
+        max_decode_attempts = max(1, max_decode_attempts)
 
-        for i, graph_dict in enumerate(graphs):
-            genome = genome_from_graph_dict(graph_dict, self.config.genome_config, key=i)
-            num_edges = len(genome.connections)
-            num_params = sum(1 for _ in genome.connections.values())
+        for i in range(total_requested):
+            latent = z_g[i].unsqueeze(0).clone()
+            attempt = 0
+            accepted = False
+            while attempt < max_decode_attempts:
+                attempt += 1
+                with torch.no_grad():
+                    decoded = self.guide.decode(latent)
+                if isinstance(decoded, tuple):
+                    decoded_graphs, _ = decoded
+                else:
+                    decoded_graphs = decoded
+                graph_dict = decoded_graphs[0]
+                genome = genome_from_graph_dict(graph_dict, self.config.genome_config, key=i)
+                num_edges = len(genome.connections)
+                num_params = len(genome.connections)
 
-            edge_key = tuple(sorted(genome.connections.keys()))
-            if edge_key in seen_edge_sets and num_edges > 0:
-                duplicate_count += 1
-                warn("Guided offspring decoder produced a duplicate graph; skipping to preserve diversity.")
-                continue
-            seen_edge_sets.add(edge_key)
+                if num_edges == 0 or debug_saved < debug_save_limit:
+                    debug_path = debug_dir / f"gen{generation_idx}_child{i}_attempt{attempt}_edges{num_edges}.pt"
+                    torch.save(graph_dict, debug_path)
+                    debug_saved += 1
 
-            if num_edges == 0 or debug_saved < debug_save_limit:
-                debug_path = debug_dir / f"gen{generation_idx}_child{i}_edges{num_edges}.pt"
-                torch.save(graph_dict, debug_path)
-                debug_saved += 1
+                if num_edges == 0:
+                    empty_graph_count += 1
+                    if attempt < max_decode_attempts:
+                        latent = latent + torch.randn_like(latent) * decode_jitter_std
+                        resample_attempts += 1
+                        continue
+                    warn(
+                        "Guided offspring decoder produced an empty graph (no edges); assigning penalty fitness and skipping evaluation."
+                    )
+                    genome.graph_dict = graph_dict
+                    self._assign_penalty(genome, task, reason="empty_graph", skip_evaluation=True)
+                    new_genomes.append(genome)
+                    accepted = True
+                    break
 
-            if num_edges == 0:
-                empty_graph_count += 1
-                warn(
-                    "Guided offspring decoder produced an empty graph (no edges); assigning penalty fitness and skipping evaluation."
-                )
-                genome.graph_dict = graph_dict
-                self._assign_penalty(genome, task, reason="empty_graph", skip_evaluation=True)
-                new_genomes.append(genome)
-                continue
+                edge_key = tuple(sorted(genome.connections.keys()))
+                if edge_key in seen_edge_sets:
+                    duplicate_count += 1
+                    if attempt < max_decode_attempts:
+                        latent = latent + torch.randn_like(latent) * decode_jitter_std
+                        resample_attempts += 1
+                        continue
+                    warn("Guided offspring decoder produced a duplicate graph; skipping to preserve diversity.")
+                    break
 
-            optimizer = rebuild_and_script(graph_dict, self.config.genome_config, key=i, genome=genome)
-            if optimizer:
-                genome.optimizer = optimizer
-                genome.graph_dict = graph_dict
-                new_genomes.append(genome)
-                stats.append((i, num_edges, num_params))
-            else:
+                optimizer = rebuild_and_script(graph_dict, self.config.genome_config, key=i, genome=genome)
+                if optimizer:
+                    if not self._optimizer_updates_parameters(optimizer, task, check_steps=2):
+                        inactive_optimizer_count += 1
+                        if attempt < max_decode_attempts:
+                            latent = latent + torch.randn_like(latent) * decode_jitter_std
+                            resample_attempts += 1
+                            continue
+                        warn(
+                            "Guided offspring optimizer failed to modify model parameters; skipping child after retries."
+                        )
+                        genome.graph_dict = graph_dict
+                        self._assign_penalty(genome, task, reason="inactive_optimizer", skip_evaluation=True)
+                        new_genomes.append(genome)
+                        break
+
+                    genome.optimizer = optimizer
+                    genome.graph_dict = graph_dict
+                    new_genomes.append(genome)
+                    stats.append((i, num_edges, num_params))
+                    seen_edge_sets.add(edge_key)
+                    accepted = True
+                    break
+
                 rebuild_failures += 1
+                if attempt < max_decode_attempts:
+                    latent = latent + torch.randn_like(latent) * decode_jitter_std
+                    resample_attempts += 1
+                    continue
+                warn("Guided offspring decoder failed to rebuild a valid optimizer; skipping child.")
+                break
+
+            # move to next latent whether or not we accepted anything
 
         if empty_graph_count:
-            warn(f"Guided offspring decoder generated {empty_graph_count} empty graphs out of {len(graphs)}.")
+            warn(
+                f"Guided offspring decoder generated {empty_graph_count} empty graphs across {total_requested * max_decode_attempts} decode attempts."
+            )
         if duplicate_count:
             warn(
-                f"Guided offspring decoder skipped {duplicate_count} duplicate graphs out of {len(graphs)} to preserve diversity."
+                f"Guided offspring decoder encountered {duplicate_count} duplicate graphs while producing {total_requested} requests."
             )
+        if rebuild_failures:
+            warn(f"Guided offspring decoder rebuild failures: {rebuild_failures}")
+        if inactive_optimizer_count:
+            warn(f"Guided offspring optimizers with no parameter updates: {inactive_optimizer_count}")
 
         if stats:
             sample = ", ".join(f"child {idx}: edges={edges}, params={params}" for idx, edges, params in stats[:10])
             self.reporters.info(f"Guided offspring graph stats (first 10): {sample}")
 
-        total_generated = len(graphs)
-        survivors = len(stats)
-        if total_generated:
+        if total_requested:
             self.reporters.info(
-                "Guided offspring summary: %d/%d survived (duplicates=%d, empty=%d, rebuild_failures=%d)"
-                % (survivors, total_generated, duplicate_count, empty_graph_count, rebuild_failures)
+                "Guided offspring summary: %d/%d survived (duplicates=%d, empty=%d, rebuild_failures=%d, inactive=%d, resamples=%d)"
+                % (
+                    len(stats),
+                    total_requested,
+                    duplicate_count,
+                    empty_graph_count,
+                    rebuild_failures,
+                    inactive_optimizer_count,
+                    resample_attempts,
+                )
             )
 
         return new_genomes
+
+    def _optimizer_updates_parameters(self, optimizer, task, check_steps=2, delta_eps=1e-6):
+        """Run a short dry-run to ensure the optimizer changes model weights."""
+
+        try:
+            model = ManyLossMinimaModel(task.train_data.num_input_features)
+        except Exception:
+            return True
+
+        self._reset_optimizer_state(optimizer, None)
+        self._reset_optimizer_step_counters(optimizer)
+
+        prev_metrics = None
+        named_params = list(model.named_parameters())
+        baseline = {name: param.detach().clone() for name, param in named_params}
+
+        for _ in range(max(1, check_steps)):
+            metrics = task.evaluate_metrics(model, task.train_data)
+            if not torch.isfinite(metrics).all():
+                break
+            prev = torch.zeros_like(metrics) if prev_metrics is None else prev_metrics
+            self._ensure_optimizer_state_shapes(optimizer, named_params)
+            try:
+                updated_state = optimizer(metrics, prev, named_params)
+            except Exception:
+                updated_state = None
+            if updated_state is None:
+                break
+            state_dict = self._normalize_state_dict(updated_state, named_params)
+            total_delta = 0.0
+            for name, before in baseline.items():
+                after = state_dict.get(name)
+                if after is None:
+                    continue
+                total_delta += torch.norm(after - before, p=1).item()
+            model.load_state_dict(state_dict)
+            if total_delta > delta_eps:
+                self._reset_optimizer_state(optimizer, None)
+                self._reset_optimizer_step_counters(optimizer)
+                return True
+            prev_metrics = metrics.detach()
+            named_params = list(model.named_parameters())
+            baseline = {name: param.detach().clone() for name, param in named_params}
+
+        self._reset_optimizer_state(optimizer, None)
+        self._reset_optimizer_step_counters(optimizer)
+        return False
 
     def run(self, n=None, offspring_per_species=None):
         """

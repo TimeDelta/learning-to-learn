@@ -29,6 +29,8 @@ class GuidedReproduction(DefaultReproduction):
         super().__init__(config, reporters, stagnation)
         self.guide_fn = None
         self.guided_start_generation = getattr(config, "guided_start_generation", 0)
+        self.optimizer_validator = None
+        self.optimizer_validation_retries = getattr(config, "optimizer_validation_retries", 3)
 
     def reproduce(self, config, species, pop_size, generation, task):
         # Filter out stagnated species, collect the set of non-stagnated
@@ -110,33 +112,51 @@ class GuidedReproduction(DefaultReproduction):
                 repro_cutoff = max(2, int(math.ceil(self.reproduction_config.survival_threshold * len(old_members))))
                 parents = old_members[:repro_cutoff]
                 for _ in range(remaining_spawn):
-                    p1_id, p1 = random.choice(parents)
-                    p2_id, p2 = random.choice(parents)
-                    cid = next(self.genome_indexer)
-                    child = config.genome_type(cid)
-                    child.configure_crossover(p1, p2, config.genome_config)
-                    child.mutate(config.genome_config)
-                    if hasattr(child, "compile_optimizer"):
-                        child.compile_optimizer(config.genome_config)
-                        graph_dict = getattr(child, "graph_dict", None)
-                        if graph_dict:
-                            edge_index = graph_dict.get("edge_index")
-                            num_edges = 0
-                            if edge_index is not None:
-                                if isinstance(edge_index, torch.Tensor):
-                                    edge_tensor = edge_index
-                                else:
-                                    edge_tensor = torch.as_tensor(edge_index)
-                                if edge_tensor.dim() == 1:
-                                    num_edges = edge_tensor.numel() // 2
-                                elif edge_tensor.dim() == 2:
-                                    num_edges = edge_tensor.size(1)
-                            if num_edges == 0:
-                                warn(
-                                    "NEAT offspring produced an empty graph after mutation; consider adjusting mutation rates."
-                                )
-                    new_population[cid] = child
-                    self.ancestors[cid] = (p1_id, p2_id)
+                    attempts = 0
+                    child_added = False
+                    while attempts < max(1, self.optimizer_validation_retries):
+                        attempts += 1
+                        p1_id, p1 = random.choice(parents)
+                        p2_id, p2 = random.choice(parents)
+                        cid = next(self.genome_indexer)
+                        child = config.genome_type(cid)
+                        child.configure_crossover(p1, p2, config.genome_config)
+                        child.mutate(config.genome_config)
+                        optimizer_valid = True
+                        if hasattr(child, "compile_optimizer"):
+                            child.compile_optimizer(config.genome_config)
+                            graph_dict = getattr(child, "graph_dict", None)
+                            if graph_dict:
+                                edge_index = graph_dict.get("edge_index")
+                                num_edges = 0
+                                if edge_index is not None:
+                                    if isinstance(edge_index, torch.Tensor):
+                                        edge_tensor = edge_index
+                                    else:
+                                        edge_tensor = torch.as_tensor(edge_index)
+                                    if edge_tensor.dim() == 1:
+                                        num_edges = edge_tensor.numel() // 2
+                                    elif edge_tensor.dim() == 2:
+                                        num_edges = edge_tensor.size(1)
+                                if num_edges == 0:
+                                    warn(
+                                        "NEAT offspring produced an empty graph after mutation; consider adjusting mutation rates."
+                                    )
+                            optimizer = getattr(child, "optimizer", None)
+                            if self.optimizer_validator is not None and optimizer is not None and task is not None:
+                                optimizer_valid = self.optimizer_validator(optimizer, task)
+                                if not optimizer_valid:
+                                    warn("NEAT offspring optimizer failed parameter-update check; retrying mutation.")
+                        if not optimizer_valid:
+                            continue
+                        new_population[cid] = child
+                        self.ancestors[cid] = (p1_id, p2_id)
+                        child_added = True
+                        break
+                    if not child_added:
+                        self.reporters.info(
+                            f"Failed to produce valid NEAT child for species {s.key} after {attempts} attempts; reducing spawn count."
+                        )
 
         return new_population
 
@@ -167,7 +187,7 @@ class GuidedReproduction(DefaultReproduction):
                 parts.append(f"{metric_name}: {mean_value:.4f}")
             joined = ", ".join(parts)
             self.reporters.info(
-                f"Species {species.key} fitness metrics ({members_with_metrics}/{total_members} members contributing): {joined}"
+                f"Species {species.key} mean fitness metrics ({members_with_metrics}/{total_members} members contributing): {joined}"
             )
 
     @staticmethod

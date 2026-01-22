@@ -75,6 +75,10 @@ The implemented module (called *SelfCompressingFitnessRegularizedDAGVAE*, in `se
 
 Importantly, the evolutionary algorithm **combines** this Graph-VAE crossover with more traditional NEAT-style mating within species. In practice, this means there are two crossover pathways: (1) standard crossover between similar individuals (preserving fine-tuned structures within a species), and (2) occasional **graph-VAE generated offspring** that mix across species. This balance ensures both **exploitation and exploration**: the population can refine known good solutions while still injecting radically new variations.
 
+### Penalization of Invalid Offspring
+
+To prevent invalid or non-operative graphs from biasing the surrogate or inflating Pareto scores, every genome passes explicit validity filters before it is evaluated. Any sample that fails (decodes to an empty DAG, cannot be rebuilt, or produces an optimizer that leaves model parameters unchanged) is assigned a deterministic penalty vector: each fitness metric is set to ±10^9 depending on its objective direction. These penalties propagate into the population’s fitness log. Invalid graphs are omitted from normalizations for pareto fronts, etc.
+
 ## Other Papers that Might be Useful
 - [On the Relationship Between Variational Inference and Auto-Associative Memory](https://arxiv.org/pdf/2210.08013.pdf)
   - "In order to improve the memory capacity, modern Hopfield networks [22, 21, 8] propose several variants of the energy function using polynomial or exponential interactions. Extending these models to the continuous case, [30] proposed the Modern Continuous Hopfield Network (MCHN) with update rules implementing self attention, that they relate to the transformer model [36]. In [26], the authors introduce a general Hopfield network framework where the update rules are built using three components: a similarity function, a separation function, and a projection function."
