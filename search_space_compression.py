@@ -25,6 +25,7 @@ from torch_geometric.utils import (
     to_dense_batch,
 )
 
+from metrics import canonical_log_distance
 from tasks import TASK_FEATURE_DIMS, TASK_INDEX_TO_DIM, TASK_TYPE_TO_INDEX
 from utility import generate_random_string
 
@@ -1264,6 +1265,7 @@ class OnlineTrainer:
         self.task_feature_bank: Dict[int, np.ndarray] = {}
         self.task_metric_dims: Dict[int, int] = {}
         self.task_metric_best_values: Dict[int, np.ndarray] = {}
+        self.task_metric_guidance_weights: Dict[int, np.ndarray] = {}
         self.invalid_target_ratio = 0.2
         self.invalid_ratio_warmup = 5
 
@@ -1276,28 +1278,35 @@ class OnlineTrainer:
             metric_items = sorted(fitness_dict.items(), key=lambda item: item[0].name)
             fitness = [float(value) for _, value in metric_items]
             best_values = [float(getattr(metric, "best_value", 0.0)) for metric, _ in metric_items]
+            guidance_weights = [float(getattr(metric, "guidance_weight", 1.0)) for metric, _ in metric_items]
             task_type_id = TASK_TYPE_TO_INDEX[task_type]
             expected_len = TASK_FEATURE_DIMS[task_type]
             flat_features = flatten_task_features(task_features, expected_len)
-            self._remember_task_signature(task_type_id, flat_features, len(fitness), best_values)
+            self._remember_task_signature(task_type_id, flat_features, len(fitness), best_values, guidance_weights)
             flat_tensor = torch.as_tensor(flat_features, dtype=torch.float).unsqueeze(0)
 
             fitness_tensor = torch.as_tensor(fitness, dtype=torch.float)
             best_tensor = torch.as_tensor(best_values, dtype=torch.float)
+            weight_tensor = torch.as_tensor(guidance_weights, dtype=torch.float)
             self._ensure_dataset_target_width(fitness_tensor.numel())
             if fitness_tensor.numel() < self.max_fitness_dim:
                 pad = self.max_fitness_dim - fitness_tensor.numel()
                 zeros = torch.zeros(pad, dtype=torch.float)
                 fitness_tensor = torch.cat([fitness_tensor, zeros], dim=-1)
                 best_tensor = torch.cat([best_tensor, torch.zeros(pad)], dim=-1)
+                weight_tensor = torch.cat([weight_tensor, torch.ones(pad)], dim=-1)
             elif best_tensor.numel() < self.max_fitness_dim:
                 pad = self.max_fitness_dim - best_tensor.numel()
                 best_tensor = torch.cat([best_tensor, torch.zeros(pad)], dim=-1)
+            if weight_tensor.numel() < self.max_fitness_dim:
+                pad = self.max_fitness_dim - weight_tensor.numel()
+                weight_tensor = torch.cat([weight_tensor, torch.ones(pad)], dim=-1)
             mask = torch.zeros(self.max_fitness_dim, dtype=torch.float)
             mask[: len(fitness)] = 1.0
             data.y = fitness_tensor
             data.fitness_mask = mask
             data.metric_best_values = best_tensor
+            data.metric_guidance_weights = weight_tensor
             data.fitness_dim = torch.tensor(len(fitness), dtype=torch.long)
             data.task_type = torch.tensor(task_type_id, dtype=torch.long)
             data.task_features = flat_tensor
@@ -1496,11 +1505,36 @@ class OnlineTrainer:
                     best = torch.zeros_like(pred)
                 else:
                     best = best.to(self.device)
-                target_canonical = (target - best) * mask
-                pred_canonical = (pred - best) * mask
-                diff = pred_canonical - target_canonical
-                denom = mask.sum().clamp_min(1.0)
-                loss_fitness = diff.pow(2).sum() / denom
+                    if best.dim() == 1:
+                        best = best.unsqueeze(0)
+                    if best.size(-1) < pred.size(-1):
+                        pad = pred.size(-1) - best.size(-1)
+                        best = F.pad(best, (0, pad))
+                    elif best.size(-1) > pred.size(-1):
+                        best = best[..., : pred.size(-1)]
+                    if best.size(0) == 1 and pred.size(0) > 1:
+                        best = best.expand(pred.size(0), -1)
+                weights = getattr(batch, "metric_guidance_weights", None)
+                if weights is None:
+                    weights = torch.ones_like(pred)
+                else:
+                    weights = weights.to(self.device)
+                    if weights.dim() == 1:
+                        weights = weights.unsqueeze(0)
+                    if weights.size(-1) < pred.size(-1):
+                        pad = pred.size(-1) - weights.size(-1)
+                        weights = F.pad(weights, (0, pad), value=1.0)
+                    elif weights.size(-1) > pred.size(-1):
+                        weights = weights[..., : pred.size(-1)]
+                    if weights.size(0) == 1 and pred.size(0) > 1:
+                        weights = weights.expand(pred.size(0), -1)
+                weighted_mask = weights * mask
+                target_canonical = canonical_log_distance(target, best)
+                pred_canonical = canonical_log_distance(pred, best)
+                sq_error = (pred_canonical - target_canonical).pow(2)
+                weighted_error = sq_error * weighted_mask
+                denom = weighted_mask.sum().clamp_min(1.0)
+                loss_fitness = weighted_error.sum() / denom
 
                 # --- 5) total & backward ---
                 loss_terms = [
@@ -1588,6 +1622,14 @@ class OnlineTrainer:
                     data.metric_best_values = torch.zeros(new_width, dtype=best_dtype)
                 else:
                     data.metric_best_values = torch.cat([best_values, torch.zeros(pad, dtype=best_dtype)], dim=-1)
+                guidance_weights = getattr(data, "metric_guidance_weights", None)
+                weight_dtype = guidance_weights.dtype if guidance_weights is not None else dtype
+                if guidance_weights is None:
+                    data.metric_guidance_weights = torch.ones(new_width, dtype=weight_dtype)
+                else:
+                    data.metric_guidance_weights = torch.cat(
+                        [guidance_weights, torch.ones(pad, dtype=weight_dtype)], dim=-1
+                    )
         self.max_fitness_dim = new_width
 
     def _remember_task_signature(
@@ -1596,19 +1638,27 @@ class OnlineTrainer:
         flat_features: np.ndarray,
         fitness_dim: int,
         metric_best_values: Optional[Sequence[float]] = None,
+        metric_guidance_weights: Optional[Sequence[float]] = None,
     ):
         self.task_feature_bank[task_type_id] = flat_features
         self.task_metric_dims[task_type_id] = fitness_dim
         if metric_best_values is not None:
             self.task_metric_best_values[task_type_id] = np.asarray(metric_best_values, dtype=np.float32)
+        if metric_guidance_weights is not None:
+            self.task_metric_guidance_weights[task_type_id] = np.asarray(metric_guidance_weights, dtype=np.float32)
 
     def remember_task_signature(
-        self, task_type: str, task_features, fitness_dim: int, metric_best_values: Optional[Sequence[float]] = None
+        self,
+        task_type: str,
+        task_features,
+        fitness_dim: int,
+        metric_best_values: Optional[Sequence[float]] = None,
+        metric_guidance_weights: Optional[Sequence[float]] = None,
     ):
         task_type_id = TASK_TYPE_TO_INDEX[task_type]
         expected_len = TASK_FEATURE_DIMS[task_type]
         flat = flatten_task_features(task_features, expected_len)
-        self._remember_task_signature(task_type_id, flat, fitness_dim, metric_best_values)
+        self._remember_task_signature(task_type_id, flat, fitness_dim, metric_best_values, metric_guidance_weights)
 
     def get_task_features(self, task_type_id: int) -> Optional[np.ndarray]:
         return self.task_feature_bank.get(task_type_id)
@@ -1618,6 +1668,9 @@ class OnlineTrainer:
 
     def get_metric_best_values(self, task_type_id: int) -> Optional[np.ndarray]:
         return self.task_metric_best_values.get(task_type_id)
+
+    def get_metric_guidance_weights(self, task_type_id: int) -> Optional[np.ndarray]:
+        return self.task_metric_guidance_weights.get(task_type_id)
 
     def _normalize_task_feature_shapes(self):
         for data in self.dataset:

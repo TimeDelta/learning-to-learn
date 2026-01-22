@@ -33,6 +33,13 @@ Using Pareto-based selection yields a diverse **Pareto front** of solutions, eac
 
 In summary, multi-objective evolutionary selection ensures that the project optimizes not only for how well a network learns, but also for how elegant or tractable its design is. This keeps the search grounded, preventing bloated solutions and steering evolution toward general-purpose networks that are both **high-performing and low-complexity**.
 
+### Canonicalized Metrics for Surrogate Guidance
+
+The Pareto sorter stays weight-free, but the surrogate (Graph-VAE + predictor) must reason about heterogeneous metrics whose raw scales differ by orders of magnitude. Two mechanisms keep the guided offspring search well-behaved:
+
+- **Signed log-space distances:** Each metric advertises a best value (typically 0). Before computing the surrogate loss raw scores are converted to `sign(best_value) * log1p(|best_value|)`, compressing large ranges so accuracy, time, and memory all yield comparable gradients.
+- **Per-metric guidance weights:** Metrics also expose a guidance weight that scales their contribution in the surrogate/predictor losses and the latent optimization loop. Pareto ranking remains unbiased; weights only affect how the surrogate prioritizes improvements when generating children.
+
 ### Handling Invalid Guided Offspring
 
 The guided decoder sometimes samples latent points that produce unusable computation graphs (e.g., no edges or incompatible tensor shapes), particularly in the first few generations. To keep these failures from overwhelming the surrogate model:

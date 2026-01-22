@@ -64,6 +64,10 @@ class GuidedPopulation(Population):
     def _metric_best_values(metric_keys: List[Metric]) -> List[float]:
         return [metric_best_value(metric) for metric in metric_keys]
 
+    @staticmethod
+    def _metric_guidance_weights(metric_keys: List[Metric]) -> List[float]:
+        return [float(getattr(metric, "guidance_weight", 1.0)) for metric in metric_keys]
+
     def genome_to_data(self, genome: OptimizerGenome):
         # always rebuild graph_dict so that new attributes are captured
         # sort by node id so positions line up
@@ -122,8 +126,11 @@ class GuidedPopulation(Population):
         task_type_id = TASK_TYPE_TO_INDEX[task_type]
         metric_keys = self._evaluation_metric_keys(task)
         metric_best_values = self._metric_best_values(metric_keys)
+        metric_guidance_weights = self._metric_guidance_weights(metric_keys)
         metric_dim = len(metric_keys)
-        self.trainer.remember_task_signature(task_type, task.features, metric_dim, metric_best_values)
+        self.trainer.remember_task_signature(
+            task_type, task.features, metric_dim, metric_best_values, metric_guidance_weights
+        )
         expected_len = TASK_FEATURE_DIMS[task_type]
         flat_features = flatten_task_features(task.features, expected_len)
         mu_t, lv_t = self.guide.tasks_encoder(torch.tensor([task_type_id], dtype=torch.long), [flat_features])
@@ -205,7 +212,21 @@ class GuidedPopulation(Population):
                 best_tensor = F.pad(best_tensor, (0, head_dim - best_tensor.numel()))
             elif best_tensor.numel() > head_dim:
                 best_tensor = best_tensor[:head_dim]
-            head_latents.append((head_task_id, head_dim, z_t_head.expand(total_latents, -1).clone(), best_tensor))
+            weight_values = self.trainer.get_metric_guidance_weights(head_task_id)
+            if weight_values is not None:
+                weight_list = list(weight_values)
+            elif head_task_id == task_type_id:
+                weight_list = list(metric_guidance_weights)
+            else:
+                weight_list = [1.0] * head_dim
+            weight_tensor = torch.as_tensor(weight_list, dtype=z_g.dtype, device=z_g.device)
+            if weight_tensor.numel() < head_dim:
+                weight_tensor = F.pad(weight_tensor, (0, head_dim - weight_tensor.numel()), value=1.0)
+            elif weight_tensor.numel() > head_dim:
+                weight_tensor = weight_tensor[:head_dim]
+            head_latents.append(
+                (head_task_id, head_dim, z_t_head.expand(total_latents, -1).clone(), best_tensor, weight_tensor)
+            )
 
         if not head_latents:
             head_latents.append(
@@ -214,16 +235,18 @@ class GuidedPopulation(Population):
                     metric_dim,
                     z_t,
                     torch.as_tensor(metric_best_values, dtype=z_g.dtype, device=z_g.device),
+                    torch.as_tensor(metric_guidance_weights, dtype=z_g.dtype, device=z_g.device),
                 )
             )
 
         opt = torch.optim.Adam([z_g], lr=latent_lr)
         for _ in range(latent_steps):
             loss_terms = []
-            for head_task_id, head_dim, z_t_head, best_tensor in head_latents:
+            for head_task_id, head_dim, z_t_head, best_tensor, weight_tensor in head_latents:
                 pred = self.guide.predict_task_head(head_task_id, head_dim, z_g, z_t_head)
-                diff = pred - best_tensor
-                loss_terms.append(diff.pow(2).sum(dim=1).mean())
+                canonical = canonical_log_distance(pred, best_tensor)
+                weighted = canonical.pow(2) * weight_tensor
+                loss_terms.append(weighted.sum(dim=1).mean())
             loss = torch.stack(loss_terms).sum()
             opt.zero_grad()
             loss.backward()
