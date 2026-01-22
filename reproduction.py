@@ -19,7 +19,7 @@ class GuidedReproduction(DefaultReproduction):
         return DefaultClassConfig(
             param_dict,
             [
-                ConfigParameter("elitism", int, 0),
+                ConfigParameter("elitism", int, 5),
                 ConfigParameter("survival_threshold", float, 0.2),
                 ConfigParameter("min_species_size", int, 1),
             ],

@@ -27,16 +27,18 @@ from tasks import *
 
 class GuidedPopulation(Population):
     _optimizer_state_attr_cache: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
-    INVALID_METRIC_VALUE = -1e9
+    INVALID_METRIC_VALUE = 1e9
 
     def __init__(self, config):
         super().__init__(config)
         graph_latent_dim = 16
         task_latent_dim = 10
         num_node_types = 10
-        self.shared_attr_vocab = SharedAttributeVocab([], 5)
+        self.shared_attr_vocab = SharedAttributeVocab([], 50)
+        # Keep attribute-name embeddings high-dimensional (50d) while compressing the
+        # DeepSet attribute summaries down to 20d per node before DAG attention.
         attr_encoder = NodeAttributeDeepSetEncoder(
-            self.shared_attr_vocab, encoder_hdim=10, aggregator_hdim=20, out_dim=50
+            self.shared_attr_vocab, encoder_hdim=10, aggregator_hdim=20, out_dim=20
         )
         graph_encoder = GraphEncoder(
             len(NODE_TYPE_OPTIONS), attr_encoder, latent_dim=graph_latent_dim, hidden_dims=[32, 32]
@@ -257,6 +259,7 @@ class GuidedPopulation(Population):
             graphs = self.guide.decode(z_g)
 
         stats = []
+        rebuild_failures = 0
         new_genomes = []
         empty_graph_count = 0
         debug_dir = Path("debug_guided_offspring")
@@ -299,7 +302,9 @@ class GuidedPopulation(Population):
                 genome.optimizer = optimizer
                 genome.graph_dict = graph_dict
                 new_genomes.append(genome)
-            stats.append((i, num_edges, num_params))
+                stats.append((i, num_edges, num_params))
+            else:
+                rebuild_failures += 1
 
         if empty_graph_count:
             warn(f"Guided offspring decoder generated {empty_graph_count} empty graphs out of {len(graphs)}.")
@@ -312,12 +317,19 @@ class GuidedPopulation(Population):
             sample = ", ".join(f"child {idx}: edges={edges}, params={params}" for idx, edges, params in stats[:10])
             self.reporters.info(f"Guided offspring graph stats (first 10): {sample}")
 
+        total_generated = len(graphs)
+        survivors = len(stats)
+        if total_generated:
+            self.reporters.info(
+                "Guided offspring summary: %d/%d survived (duplicates=%d, empty=%d, rebuild_failures=%d)"
+                % (survivors, total_generated, duplicate_count, empty_graph_count, rebuild_failures)
+            )
+
         return new_genomes
 
-    def run(self, n=None, keep_per_species=2, offspring_per_species=None):
+    def run(self, n=None, offspring_per_species=None):
         """
         Runs NEAT with guided offspring replacing standard reproduction.
-        - keep_per_species:   number of top genomes in each species to preserve
         - offspring_per_species: if set, exact number of guided children per species
         """
         if self.config.no_fitness_termination and (n is None):
@@ -334,7 +346,7 @@ class GuidedPopulation(Population):
 
             # Evaluate real fitness. Using too few update steps makes every optimizer look identical,
             # so clamp to a minimum to expose behavioral differences early in the run.
-            eval_steps = max(2 * generation, 10)
+            eval_steps = max(2 * generation, 25)
             print(f"Evaluating genomes on {task.name()} for {eval_steps} steps")
             self.eval_genomes(list(self.population.items()), self.config, task, steps=eval_steps)
 
@@ -370,11 +382,11 @@ class GuidedPopulation(Population):
 
             batch = max(1, len(self.trainer.dataset))
             if generation < gen_for_full_train_resize:
-                self.trainer.train(epochs=25, batch_size=batch, generation=self.generation)
+                self.trainer.train(epochs=50, batch_size=batch, generation=self.generation)
             elif generation > gen_for_full_train_resize:
-                self.trainer.train(epochs=5, batch_size=batch, generation=self.generation)
+                self.trainer.train(epochs=10, batch_size=batch, generation=self.generation)
             else:
-                self.trainer.train(warmup_epochs=50, batch_size=batch, generation=self.generation)
+                self.trainer.train(warmup_epochs=100, batch_size=batch, generation=self.generation)
 
             # Build next‐gen population by species
             self.population = self.reproduction.reproduce(
@@ -427,7 +439,6 @@ class GuidedPopulation(Population):
                 continue
             model_copy = type(model)(task.train_data.num_input_features)
             model_copy.load_state_dict(model.state_dict())
-            # Slot shapes no longer propagated to decoder; guard removed.
             print(f"  Evaluating {genome_id} ({genome.optimizer_path})")
             result = self.evaluate_optimizer(genome.optimizer, model_copy, task, steps)
             if result is None:
@@ -459,7 +470,7 @@ class GuidedPopulation(Population):
         pareto_metrics: Dict[int, Dict[Metric, float]] = {}
         penalized_for_front: List[int] = []
         for gid, metrics in raw_metrics.items():
-            if any(value <= self.INVALID_METRIC_VALUE for value in metrics.values()):
+            if any(value == self.INVALID_METRIC_VALUE for value in metrics.values()):
                 penalized_for_front.append(gid)
             else:
                 pareto_metrics[gid] = metrics
@@ -494,7 +505,7 @@ class GuidedPopulation(Population):
                         norm = 0.0
                     else:
                         v = metrics.get(m, self.INVALID_METRIC_VALUE)
-                        if v <= self.INVALID_METRIC_VALUE:
+                        if v == self.INVALID_METRIC_VALUE:
                             norm = 0.0
                         elif m.objective == "max":
                             norm = (v - lo) / (hi - lo)
@@ -513,7 +524,7 @@ class GuidedPopulation(Population):
         return genomes
 
     def _assign_penalty(self, genome, task, reason="invalid_graph", skip_evaluation=False):
-        validation_metrics = {m: self.INVALID_METRIC_VALUE for m in task.metrics}
+        validation_metrics = {m: (1 if m.objective == "min" else -1) * self.INVALID_METRIC_VALUE for m in task.metrics}
         validation_metrics[AreaUnderTaskMetrics] = self.INVALID_METRIC_VALUE
         validation_metrics[TimeCost] = self.INVALID_METRIC_VALUE
         validation_metrics[MemoryCost] = self.INVALID_METRIC_VALUE

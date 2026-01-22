@@ -14,7 +14,7 @@ class RelativeRankStagnation(DefaultStagnation):
             [
                 ConfigParameter("species_fitness_func", str, "max"),
                 ConfigParameter("max_stagnation", int, 15),
-                ConfigParameter("species_elitism", int, 2),
+                ConfigParameter("species_elitism", int, 5),
                 ConfigParameter("rank_tolerance", float, 1e-6),
                 ConfigParameter("fitness_tolerance", float, 1e-9),
             ],
@@ -25,7 +25,7 @@ class RelativeRankStagnation(DefaultStagnation):
         self.rank_tolerance = getattr(config, "rank_tolerance", 1e-6)
         # DefaultStagnation may not set attributes when custom config objects are used, so cache them here.
         self.max_stagnation = getattr(config, "max_stagnation", 15)
-        self.species_elitism = getattr(config, "species_elitism", 2)
+        self.species_elitism = getattr(config, "species_elitism", 5)
         self.fitness_tolerance = getattr(config, "fitness_tolerance", 1e-9)
 
     def _compute_best_member_fitness(self, species) -> float:

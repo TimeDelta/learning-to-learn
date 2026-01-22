@@ -155,7 +155,7 @@ def train_model(encoder_cls, full_dataset, random_seed, val_ratio=0.2):
     random.seed(random_seed)
     torch.manual_seed(random_seed)
 
-    attr_encoder = NodeAttributeDeepSetEncoder(shared_attr_vocab, 10, 20, 50)
+    attr_encoder = NodeAttributeDeepSetEncoder(shared_attr_vocab, 10, 20, 20)
     graph_encoder = encoder_cls(num_node_types, attr_encoder, graph_latent_dim, hidden_dims=[16])
     task_encoder = TasksEncoder(hidden_dim=16, latent_dim=task_latent_dim, type_embedding_dim=8)
     decoder = GraphDecoder(num_node_types, graph_latent_dim, shared_attr_vocab)
@@ -200,7 +200,7 @@ if __name__ == "__main__":
         random_seed = random.randint(0, 99999999)
         data = generate_data(args.num_samples)
         attr_name_vocab = data[4]
-        globals()["shared_attr_vocab"] = SharedAttributeVocab(attr_name_vocab, 5)
+        globals()["shared_attr_vocab"] = SharedAttributeVocab(attr_name_vocab, 50)
         globals()["fitness_dim"] = len(data[1][0])
 
         final_att, auc_att, val_att = train_model(GraphEncoder, data[:4], random_seed)

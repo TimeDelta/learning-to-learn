@@ -26,12 +26,12 @@ enabled_default     = True
 enabled_mutate_rate = .01
 
 [DefaultSpeciesSet]
-compatibility_threshold = 3.0
+compatibility_threshold = 2.5
 
 [RelativeRankStagnation]
 species_fitness_func = max
-max_stagnation       = 15
-species_elitism      = 3
+max_stagnation       = 25
+species_elitism      = 5
 rank_tolerance       = 1e-06
 
 [GuidedReproduction]

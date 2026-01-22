@@ -1317,7 +1317,7 @@ class OnlineTrainer:
         self,
         epochs=1,
         batch_size=16,
-        kl_weight=0.1,
+        kl_weight=10.0,
         fitness_weight=1.5,
         warmup_epochs=None,
         loss_threshold=0.9,
@@ -1702,8 +1702,8 @@ if __name__ == "__main__":
     task_latent_dim = graph_latent_dim - 2
     attr_name_vocab_size = 50
     attr_name_vocab = [generate_random_string(5) for _ in range(attr_name_vocab_size)]
-    shared_attr_vocab = SharedAttributeVocab(attr_name_vocab, 5)
-    attr_encoder = NodeAttributeDeepSetEncoder(shared_attr_vocab, encoder_hdim=10, aggregator_hdim=20, out_dim=50)
+    shared_attr_vocab = SharedAttributeVocab(attr_name_vocab, 50)
+    attr_encoder = NodeAttributeDeepSetEncoder(shared_attr_vocab, encoder_hdim=10, aggregator_hdim=20, out_dim=20)
 
     graph_encoder = GraphEncoder(num_node_types, attr_encoder, graph_latent_dim, hidden_dims=[32, 32])
     task_encoder = TasksEncoder(hidden_dim=16, latent_dim=task_latent_dim, type_embedding_dim=8)

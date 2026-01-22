@@ -47,7 +47,7 @@ class MemoryCost(Metric):
     name = "Memory Cost"
     objective = "min"
     best_value = 0.0
-    guidance_weight = 1.0
+    guidance_weight = 0.1
 
 
 def metric_best_value(metric: Metric) -> float:
