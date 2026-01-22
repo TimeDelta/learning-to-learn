@@ -22,7 +22,7 @@ class MSELoss(Metric):
     name = "MSE"
     objective = "min"
     best_value = 0.0
-    guidance_weight = 5.0
+    guidance_weight = 1e3
 
     def __call__(self, output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         target_tensor = torch.as_tensor(target, dtype=output.dtype, device=output.device)
