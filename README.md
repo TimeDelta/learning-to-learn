@@ -22,31 +22,55 @@
      - “Such experimental trials convinced us that to solve the [Neural Architecture Search] dilemma, the connectionist paradigm alone is not adequate.” [1](#references)
   - Weight sharing speeds up the search by reducing the size of the search space but "there is evidence that [weight sharing] inhibits the search for optimal architectures (Yu et al., 2020)" though this would only apply under some circumstances. [5](#references)
   - Can take a while to find solution
-     - [5](#references) addresses this by linearizing the loss function of untrained networks at the data points in each batch and using Kendall’s Tau correlation coefficient, which measures the strength and direction of association that exists between two variables, to determine that an initialized network is not worth training. It is uncertain whether this generalizes to harder tasks. It also remains to be seen whether it can be used for an unsupervised context. It might be adaptable to reinforcement learning but that has not been shown and could prove unstable due to the general sparsity of signal in the reinforcement context. It's also unclear if this method can be adapted to spiking neural networks.
+     - [5](#references) addresses this by linearizing the loss function of untrained networks at the data points in each batch and using Kendall’s Tau correlation coefficient, which measures the strength and direction of association that exists between two variables, to determine that an initialized network is not worth training.
+     It is uncertain whether this generalizes to harder tasks.
+     It also remains to be seen whether it can be used for an unsupervised context.
+     It might be adaptable to reinforcement learning but that has not been shown and could prove unstable due to the general sparsity of signal in the reinforcement context.
+     It's also unclear if this method can be adapted to spiking neural networks.
 
 ## Proposed Solution
 ### Multi-Objective Fitness (Pareto Optimization)
 
-A central innovation is the use of **Pareto-based multi-objective optimization** for evaluating and selecting candidate networks. Each network (or "individual") in the population is evaluated on multiple objectives rather than a single metric. One set of objectives reflect task-specific performance and another reflects computational cost. Instead of combining these objectives into a single weighted fitness score, the algorithm employs **Pareto ranking** via non-dominated sorting: an individual is considered fitter if it is *Pareto-superior*-that is, better in at least one objective without being worse in any other-compared to others in the population ([53](#references)).
+A central innovation is the use of **Pareto-based multi-objective optimization** for evaluating and selecting candidate networks.
+Each network (or "individual") in the population is evaluated on multiple objectives rather than a single metric.
+One set of objectives reflect task-specific performance and another reflects computational cost.
+Instead of combining these objectives into a single weighted fitness score, the algorithm employs **Pareto ranking** via non-dominated sorting: an individual is considered fitter if it is *Pareto-superior*-that is, better in at least one objective without being worse in any other-compared to others in the population ([53](#references)).
 
-Using Pareto-based selection yields a diverse **Pareto front** of solutions, each representing a different balance of objectives (for example, one network might be extremely simple but moderately accurate, while another is more complex but achieves higher accuracy). This approach has several advantages for evolving learning systems:
+Using Pareto-based selection yields a diverse **Pareto front** of solutions, each representing a different balance of objectives (for example, one network might be extremely simple but moderately accurate, while another is more complex but achieves higher accuracy).
+This approach has several advantages for evolving learning systems:
 
-* **Robust, Generalizable Solutions:** Multi-objective evolution tends to produce more robust models than optimizing a single metric. The algorithm doesn't commit to one arbitrary trade-off; instead, it preserves a spectrum of high-performing solutions. Researchers can then analyze this Pareto front for insights into how different architectures trade off performance vs. complexity ([53](#references)).
-* **Favoring Minimal Architectures:** By explicitly treating computational cost as an objective to minimize, the evolution **naturally favors minimal efficient networks** that align with the Minimum Description principle-the best solution is the simplest one that explains the data ([55](#references)). The smallest networks that still perform well can be seen as **minimum description estimates (MDEs)** of the task. These MDEs are not just efficient; they are also scientifically interpretable, as they highlight the core components necessary to implement a given function or behavior.
-* **No Manual Tuning of Trade-offs:** Pareto ranking removes the need to hand-tune weights between objectives (such as how much to penalize complexity). Instead of a single "optimal" network according to a weighted sum, set of Pareto-optimal networks is obtained that captures different compromises. This is especially useful in research contexts, where one might prefer simpler models for interpretation unless complexity is absolutely required for performance ([53](#references)).
+* **Robust, Generalizable Solutions:**
+Multi-objective evolution tends to produce more robust models than optimizing a single metric.
+The algorithm doesn't commit to one arbitrary trade-off; instead, it preserves a spectrum of high-performing solutions.
+Researchers can then analyze this Pareto front for insights into how different architectures trade off performance vs. complexity ([53](#references)).
+* **Favoring Minimal Architectures:**
+By explicitly treating computational cost as an objective to minimize, the evolution **naturally favors minimal efficient networks** that align with the Minimum Description principle-the best solution is the simplest one that explains the data ([55](#references)).
+The smallest networks that still perform well can be seen as **minimum description estimates (MDEs)** of the task.
+These MDEs are not just efficient; they are also scientifically interpretable, as they highlight the core components necessary to implement a given function or behavior.
+* **No Manual Tuning of Trade-offs:**
+Pareto ranking removes the need to hand-tune weights between objectives (such as how much to penalize complexity).
+Instead of a single "optimal" network according to a weighted sum, set of Pareto-optimal networks is obtained that captures different compromises.
+This is especially useful in research contexts, where one might prefer simpler models for interpretation unless complexity is absolutely required for performance ([53](#references)).
 
-In summary, multi-objective evolutionary selection ensures that the project optimizes not only for how well a network learns, but also for how elegant or tractable its design is. This keeps the search grounded, preventing bloated solutions and steering evolution toward general-purpose networks that are both **high-performing and low-complexity**.
+In summary, multi-objective evolutionary selection ensures that the project optimizes not only for how well a network learns, but also for how elegant or tractable its design is.
+This keeps the search grounded, preventing bloated solutions and steering evolution toward general-purpose networks that are both **high-performing and low-complexity**.
 
 ### Canonicalized Metrics for Surrogate Guidance
 
-The Pareto sorter stays weight-free, but the surrogate (Graph-VAE + predictor) must reason about heterogeneous metrics whose raw scales differ by orders of magnitude. Two mechanisms keep the guided offspring search well-behaved:
+The Pareto sorter stays weight-free, but the surrogate (Graph-VAE + predictor) must reason about heterogeneous metrics whose raw scales differ by orders of magnitude.
+Two mechanisms keep the guided offspring search well-behaved:
 
-- **Signed log-space distances:** Each metric advertises a best value (typically 0). Before computing the surrogate loss raw scores are converted to `sign(best_value) * log1p(|best_value|)`, compressing large ranges so accuracy, time, and memory all yield comparable gradients.
-- **Per-metric guidance weights:** Metrics also expose a guidance weight that scales their contribution in the surrogate/predictor losses and the latent optimization loop. Pareto ranking remains unbiased; weights only affect how the surrogate prioritizes improvements when generating children.
+- **Signed log-space distances:**
+Each metric advertises a best value (typically 0).
+Before computing the surrogate loss raw scores are converted to `sign(best_value) * log1p(|best_value|)`, compressing large ranges so accuracy, time, and memory all yield comparable gradients.
+- **Per-metric guidance weights:**
+Metrics also expose a guidance weight that scales their contribution in the surrogate/predictor losses and the latent optimization loop.
+Pareto ranking remains unbiased; weights only affect how the surrogate prioritizes improvements when generating children.
 
 ### Handling Invalid Guided Offspring
 
-The guided decoder sometimes samples latent points that produce unusable computation graphs (e.g., no edges or incompatible tensor shapes), particularly in the first few generations. To keep these failures from overwhelming the surrogate model:
+The guided decoder sometimes samples latent points that produce unusable computation graphs (e.g., no edges or incompatible tensor shapes), particularly in the first few generations.
+To keep these failures from overwhelming the surrogate model:
 
 * Store invalid graph/metric pairs separately from the valid ones with a fixed penalty.
 * Mix only a small, generation-proportional fraction of the invalid graphs into each training epoch (capped at 20% of the valid graphs), so early generations focus on valid data while later ones still learn which latent regions to avoid
@@ -57,38 +81,65 @@ This subsampling keeps the decoder from collapsing onto invalid DAGs while still
 
 To avoid decoder stalls from attr-name loops that never received a termination signal, teacher forcing is used for those sequences:
 
-- The shared attribute vocabulary assigns explicit `<SOS>`/`<EOS>` tokens and exposes helpers that serialize each node’s dynamic attributes into deterministic name sequences. These targets supervise the attr-name GRU whenever ground-truth graphs exist.
+- The shared attribute vocabulary assigns explicit `<SOS>`/`<EOS>` tokens and exposes helpers that serialize each node’s dynamic attributes into deterministic name sequences.
+  These targets supervise the attr-name GRU whenever ground-truth graphs exist.
 - The graph decoder optionally consumes those targets, drives the GRU with embedded ground-truth tokens, and accumulates a per-step cross-entropy loss.
 - The trainer groups batched node attributes, builds the token targets, passes them through the guide model, and blends the decoder’s cross-entropy into the feature reconstruction term.
 
 ### Generative Cross-Species Crossover (Graph-VAE)
 
-Another key innovation is a Variational Autoencoder (VAE) that enables unrestricted structural recombination of neural network architectures. Traditional neuroevolution methods like NEAT use crossover within the same "species" of networks and rely on aligning genes (nodes and connections) based on historical markers to recombine two parents. Those methods struggle to recombine vastly different topologies because the correspondence between parts of two very different networks is ambiguous. The approach addresses this by **learning a continuous encoding of network graphs**, allowing any two networks-even of entirely different designs-to **mate** in a meaningful way ([54](#references)).
+Another key innovation is a Variational Autoencoder (VAE) that enables unrestricted structural recombination of neural network architectures.
+Traditional neuroevolution methods like NEAT use crossover within the same "species" of networks and rely on aligning genes (nodes and connections) based on historical markers to recombine two parents.
+Those methods struggle to recombine vastly different topologies because the correspondence between parts of two very different networks is ambiguous.
+The approach addresses this by **learning a continuous encoding of network graphs**, allowing any two networks-even of entirely different designs-to **mate** in a meaningful way ([54](#references)).
 
 The implemented module (called *SelfCompressingFitnessRegularizedDAGVAE*, in `search_space_compression.py`) acts as a **generative recombination mechanism** or a "cross-species mating system" for networks:
 
-* **Graph Encoding and Decoding:** The VAE is trained to take arbitrary computation graphs and encode them into a continuous latent vector space. It can then decode a latent vector back into a network graph. This provides a common representation for all networks, regardless of their topology ([54](#references)).
-* **Fitness-Regularized Compression:** The VAE's training is not just a standard graph autoencoding. It is **regularized with fitness prediction**: part of the VAE's objective is to predict the network's performance and complexity from the latent encoding. This means the VAE is encouraged to organize the latent space such that important features (those that correlate with high fitness) are captured in the representation. Dimensions of the latent vector that do not contribute to explaining variation in performance tend to be pruned out automatically (using techniques like Automatic Relevance Determination). The result is a compressed, fitness-informed search space: a smooth landscape where distances reflect meaningful differences in network capability.
-* **Cross-Species Mating via Latent Interpolation:** Once networks are encoded in this latent space, **any two networks** can be recombined by interpolating or randomly mixing their latent vectors and then decoding the result. In other words, the VAE enables **cross-species crossover**-two parent networks from entirely different niches or architectures can produce an offspring network. This generative crossover bypasses the historical gene-matching problem that NEAT faced without needing to explicitly align nodes or connections between parents.
-* **Sharing Innovations Across Lineages:** This mechanism effectively breaks down barriers between separate evolutionary lineages. Useful innovations that arise in one species can be transferred to very different architectures. Because a portion of each generation's offspring are generated via latent-space recombination, **new architectures can emerge that combine traits from wildly different ancestors**. This helps inject novel structural patterns that pure mutation or traditional crossover (limited to similar parents) might never produce.
-* **Expanded Exploration with Guided Search:** The VAE-driven crossover significantly **expands the exploration** of the search space while still being guided towards promising regions (due to the fitness-informed latent space). It serves as a kind of **surrogate model** that directs evolution: by sampling in latent space, it effectively samples networks that are expected to be high-performing or at least valid. This compresses the combinatorially vast search space of all possible networks into a more tractable form. The net effect is **increased diversity** of candidate solutions and the ability to discover innovative network motifs that conventional genetic operators might miss ([54](#references)).
+* **Graph Encoding and Decoding:**
+The VAE is trained to take arbitrary computation graphs and encode them into a continuous latent vector space. It can then decode a latent vector back into a network graph.
+This provides a common representation for all networks, regardless of their topology ([54](#references)).
+* **Fitness-Regularized Compression:**
+The VAE's training is not just a standard graph autoencoding.
+It is **regularized with fitness prediction**: part of the VAE's objective is to predict the network's performance and complexity from the latent encoding.
+This means the VAE is encouraged to organize the latent space such that important features (those that correlate with high fitness) are captured in the representation.
+Dimensions of the latent vector that do not contribute to explaining variation in performance tend to be pruned out automatically (using techniques like Automatic Relevance Determination).
+The result is a compressed, fitness-informed search space: a smooth landscape where distances reflect meaningful differences in network capability.
+* **Cross-Species Mating via Latent Interpolation:**
+Once networks are encoded in this latent space, **any two networks** can be recombined by interpolating or randomly mixing their latent vectors and then decoding the result.
+In other words, the VAE enables **cross-species crossover**-two parent networks from entirely different niches or architectures can produce an offspring network.
+This generative crossover bypasses the historical gene-matching problem that NEAT faced without needing to explicitly align nodes or connections between parents.
+* **Sharing Innovations Across Lineages:** This mechanism effectively breaks down barriers between separate evolutionary lineages.
+Useful innovations that arise in one species can be transferred to very different architectures. Because a portion of each generation's offspring are generated via latent-space recombination, **new architectures can emerge that combine traits from wildly different ancestors**. This helps inject novel structural patterns that pure mutation or traditional crossover (limited to similar parents) might never produce.
+* **Expanded Exploration with Guided Search:** The VAE-driven crossover significantly **expands the exploration** of the search space while still being guided towards promising regions (due to the fitness-informed latent space).
+It serves as a kind of **surrogate model** that directs evolution: by sampling in latent space, it effectively samples networks that are expected to be high-performing or at least valid.
+This compresses the combinatorially vast search space of all possible networks into a more tractable form.
+The net effect is **increased diversity** of candidate solutions and the ability to discover innovative network motifs that conventional genetic operators might miss ([54](#references)).
 
-Importantly, the evolutionary algorithm **combines** this Graph-VAE crossover with more traditional NEAT-style mating within species. In practice, this means there are two crossover pathways: (1) standard crossover between similar individuals (preserving fine-tuned structures within a species), and (2) occasional **graph-VAE generated offspring** that mix across species. This balance ensures both **exploitation and exploration**: the population can refine known good solutions while still injecting radically new variations.
+Importantly, the evolutionary algorithm **combines** this Graph-VAE crossover with more traditional NEAT-style mating within species.
+In practice, this means there are two crossover pathways: (1) standard crossover between similar individuals (preserving fine-tuned structures within a species), and (2) occasional **graph-VAE generated offspring** that mix across species.
+This balance ensures both **exploitation and exploration**: the population can refine known good solutions while still injecting radically new variations.
 
 ### Penalization of Invalid Offspring
 
-To prevent invalid or non-operative graphs from biasing the surrogate or inflating Pareto scores, every genome passes explicit validity filters before it is evaluated. Any sample that fails (decodes to an empty DAG, cannot be rebuilt, or produces an optimizer that leaves model parameters unchanged) is assigned a deterministic penalty vector: each fitness metric is set to ±10^9 depending on its objective direction. These penalties propagate into the population’s fitness log. Invalid graphs are omitted from normalizations for pareto fronts, etc.
+To prevent invalid or non-operative graphs from biasing the surrogate or inflating Pareto scores, every genome passes explicit validity filters before it is evaluated.
+Any sample that fails (decodes to an empty DAG, cannot be rebuilt, or produces an optimizer that leaves model parameters unchanged) is assigned a deterministic penalty vector: each fitness metric is set to ±10^9 depending on its objective direction.
+These penalties propagate into the population’s fitness log.
+Invalid graphs are omitted from normalizations for pareto fronts, etc.
 
 ## Other Papers that Might be Useful
 - [On the Relationship Between Variational Inference and Auto-Associative Memory](https://arxiv.org/pdf/2210.08013.pdf)
-  - "In order to improve the memory capacity, modern Hopfield networks [22, 21, 8] propose several variants of the energy function using polynomial or exponential interactions. Extending these models to the continuous case, [30] proposed the Modern Continuous Hopfield Network (MCHN) with update rules implementing self attention, that they relate to the transformer model [36]. In [26], the authors introduce a general Hopfield network framework where the update rules are built using three components: a similarity function, a separation function, and a projection function."
-  - "It has been shown that overparameterized auto-encoders also implement AM [28, 33]. These methods embed the stored patterns as attractors through training, and retrieval is performed by iterating over the auto-encoding loop."
+  - "In order to improve the memory capacity, modern Hopfield networks [22, 21, 8] propose several variants of the energy function using polynomial or exponential interactions.
+  Extending these models to the continuous case, [30] proposed the Modern Continuous Hopfield Network (MCHN) with update rules implementing self attention, that they relate to the transformer model [36].
+  In [26], the authors introduce a general Hopfield network framework where the update rules are built using three components: a similarity function, a separation function, and a projection function."
+  - "It has been shown that overparameterized auto-encoders also implement AM [28, 33].
+  These methods embed the stored patterns as attractors through training, and retrieval is performed by iterating over the auto-encoding loop."
 - [Multifactorial Evolutionary Algorithm with Online Transfer Parameter Estimation: MFEA-II](https://www.researchgate.net/profile/Abhishek-Gupta-17/publication/331729696_Multifactorial_Evolutionary_Algorithm_With_Online_Transfer_Parameter_Estimation_MFEA-II/links/5c98495892851cf0ae95ec75/Multifactorial-Evolutionary-Algorithm-With-Online-Transfer-Parameter-Estimation-MFEA-II.pdf)
 - [STCA: Spatio-Temporal Credit Assignment with Delayed Feedback in Deep Spiking Neural Networks](https://www.ijcai.org/proceedings/2019/0189.pdf)
 - [Sparse Distributed Memory using N-of-M Codes](apt.cs.manchester.ac.uk/ftp/pub/apt/papers/NofMnnV3.pdf)
 - [A discrete time neural network model with spiking neurons: II: Dynamics with noise](https://arxiv.org/abs/1709.06206)
 - [The Information Bottleneck Problem and Its Applications in Machine Learning](https://arxiv.org/pdf/2004.14941.pdf)
-  - “The information bottleneck (IB) theory recently emerged as a bold information-theoretic paradigm for analyzing DL systems. Adopting mutual information as the figure of merit, it suggests that the best representation T should be maximally informative about Y while minimizing the mutual information with X.” (a.k.a. compression)
+  - “The information bottleneck (IB) theory recently emerged as a bold information-theoretic paradigm for analyzing DL systems.
+  Adopting mutual information as the figure of merit, it suggests that the best representation T should be maximally informative about Y while minimizing the mutual information with X.” (a.k.a. compression)
 - [Neurons detect cognitive boundaries to structure episodic memories in humans](https://authors.library.caltech.edu/107546/4/41593_2022_1020_MOESM1_ESM.pdf)
 - [Why think step-by-step? Reasoning emerges from the locality of experience](https://arxiv.org/pdf/2304.03843.pdf)
 - [Accurate online training of dynamical spiking neural networks through Forward Propagation Through Time](https://arxiv.org/abs/2112.11231#:~:text=Here%2C%20we%20show%20how%20a,regularized%20risk%20on%20the%20loss.)
@@ -107,10 +158,20 @@ To prevent invalid or non-operative graphs from biasing the surrogate or inflati
   - "the intrinsic dimensionality of neural activity is largely determined by three sources of information: (1) incoming stimuli, (2) ongoing movements, and (3) the multitude of latent variables that characterize prior experiences and future expectations."
   - "In early sensory areas, the intrinsic dimensionality is expected to be strongly associated with incoming stimuli."
   - "signals in the primary motor cortex seem to carry information about the upcoming movement without regard to higher order latent variables ... the intrinsic dimensionality in the late stages of the motor system seem to be strongly tied to ongoing movements"
-  - "Although the general principles that govern embedding dimensionality are not known, several computationally inspired hypotheses have been proposed. One dominant hypothesis is that the information in any given brain area is extracted by other areas and peripheral systems through a linear readout. A linear readout scheme is a weighted average of the activity across neurons and has an intuitive geometric interpretation: it is a projection of the neural activity in the full Euclidean state space along a specific direction. One common strategy to evaluate this hypothesis is to quantify the degree to which a linear decoder can extract desired information from population activity in a brain area."
-  - "An extension of this hypothesis is that embedding across a population of neurons is organized such that different linear decoders can extract information about different task-relevant variables without interference. For example, movement and movement preparation signals in monkeys’ motor cortex reside in orthogonal subspaces [53]. This organization could ensure that preparation does not trigger movement [54,55], and may help protect previous motor memories [56]. Similar principles might govern interactions across cortical areas, by confining to orthogonal subspaces information that is private to an area and information that is communicated [57,58] ... We note however, that despite strong enthusiasm, direct evidence that the brain processes and/or communicates information through orthogonal linear decoders is wanting."
-  - "In general, high-dimensional embeddings with more degrees of freedom can facilitate extraction of task-relevant variables without interference (Rigotti et al. 2013; Cayco-Gajic et al. 2017; Cayco-Gajic and Silver 2019; Litwin-Kumar et al. 2017; Lanore et al. 2021). However, embedding information in arbitrarily high dimensional subspaces can have adverse effects for generalization [64]. To improve generalization, embeddings have to be appropriately constrained to capture the structural relationships and inherent invariances in the environment [10,38,65]. A theory for the ensuing trade-offs has been recently developed for the case where the activity is organized in multiple disjoint manifolds corresponding to different categories [66] and applied to interpret representations in the visual system [67] and in deep networks [68]. It is also possible to organize information embedding such that certain linear projection reflect information in more abstract form and therefore enable generalization, while others enable finer discrimination [15]."
-  - "The utility of linear decodability however, becomes less clear for intermediate stages of information processing in higher brain areas that carry information about latent variables that support flexible mental computations. While an experimenter may apply linear decoders to find information about a hypothesized latent variable in a certain brain area, there is no a priori reason to assume that the brain relies on such decoders."
+  - "Although the general principles that govern embedding dimensionality are not known, several computationally inspired hypotheses have been proposed.
+  One dominant hypothesis is that the information in any given brain area is extracted by other areas and peripheral systems through a linear readout.
+  A linear readout scheme is a weighted average of the activity across neurons and has an intuitive geometric interpretation: it is a projection of the neural activity in the full Euclidean state space along a specific direction.
+  One common strategy to evaluate this hypothesis is to quantify the degree to which a linear decoder can extract desired information from population activity in a brain area."
+  - "An extension of this hypothesis is that embedding across a population of neurons is organized such that different linear decoders can extract information about different task-relevant variables without interference.
+  For example, movement and movement preparation signals in monkeys’ motor cortex reside in orthogonal subspaces [53].
+  This organization could ensure that preparation does not trigger movement [54,55], and may help protect previous motor memories [56]. Similar principles might govern interactions across cortical areas, by confining to orthogonal subspaces information that is private to an area and information that is communicated [57,58] ... We note however, that despite strong enthusiasm, direct evidence that the brain processes and/or communicates information through orthogonal linear decoders is wanting."
+  - "In general, high-dimensional embeddings with more degrees of freedom can facilitate extraction of task-relevant variables without interference (Rigotti et al. 2013; Cayco-Gajic et al. 2017; Cayco-Gajic and Silver 2019; Litwin-Kumar et al. 2017; Lanore et al. 2021).
+  However, embedding information in arbitrarily high dimensional subspaces can have adverse effects for generalization [64].
+  To improve generalization, embeddings have to be appropriately constrained to capture the structural relationships and inherent invariances in the environment [10,38,65].
+  A theory for the ensuing trade-offs has been recently developed for the case where the activity is organized in multiple disjoint manifolds corresponding to different categories [66] and applied to interpret representations in the visual system [67] and in deep networks [68].
+  It is also possible to organize information embedding such that certain linear projection reflect information in more abstract form and therefore enable generalization, while others enable finer discrimination [15]."
+  - "The utility of linear decodability however, becomes less clear for intermediate stages of information processing in higher brain areas that carry information about latent variables that support flexible mental computations.
+  While an experimenter may apply linear decoders to find information about a hypothesized latent variable in a certain brain area, there is no a priori reason to assume that the brain relies on such decoders."
   - "For instance, ring-like manifolds, on which activity is represented by a single angular latent variable, can emerge from only weak structure in the connectivity"
 - [Model-agnostic Measure of Generalization Difficulty](https://arxiv.org/abs/2305.01034)
 - [Adaptive Inference through Early-Exit Networks: Design, Challenges and Directions](https://arxiv.org/abs/2106.05022)
