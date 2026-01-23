@@ -115,6 +115,8 @@ It serves as a kind of **surrogate model** that directs evolution: by sampling i
 This compresses the combinatorially vast search space of all possible networks into a more tractable form.
 The net effect is **increased diversity** of candidate solutions and the ability to discover innovative network motifs that conventional genetic operators might miss ([54](#references)).
 
+*Guided latent retries.* To keep promising latents alive, the decoder retains a non-empty graph seen during each child’s decode attempts if available and jitters subsequent retries around that anchor rather than restarting from the original latent. Empirically this turns “almost valid” intermediate graphs into stepping stones, increasing the likelihood that at least one decode per latent survives the structural filters (implementation: `population.py:260-340`).
+
 Importantly, the evolutionary algorithm **combines** this Graph-VAE crossover with more traditional NEAT-style mating within species.
 In practice, this means there are two crossover pathways: (1) standard crossover between similar individuals (preserving fine-tuned structures within a species), and (2) occasional **graph-VAE generated offspring** that mix across species.
 This balance ensures both **exploitation and exploration**: the population can refine known good solutions while still injecting radically new variations.

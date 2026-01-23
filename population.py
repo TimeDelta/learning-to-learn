@@ -27,7 +27,7 @@ from tasks import *
 
 class GuidedPopulation(Population):
     _optimizer_state_attr_cache: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
-    INVALID_METRIC_VALUE = 1e9
+    INVALID_METRIC_VALUE = 1e6
 
     def __init__(self, config):
         super().__init__(config)
@@ -279,6 +279,7 @@ class GuidedPopulation(Population):
             latent = z_g[i].unsqueeze(0).clone()
             attempt = 0
             accepted = False
+            best_nonempty_latent = None
             while attempt < max_decode_attempts:
                 attempt += 1
                 with torch.no_grad():
@@ -292,6 +293,9 @@ class GuidedPopulation(Population):
                 num_edges = len(genome.connections)
                 num_params = len(genome.connections)
 
+                if num_edges > 0:
+                    best_nonempty_latent = latent.detach().clone()
+
                 if num_edges == 0 or debug_saved < debug_save_limit:
                     debug_path = debug_dir / f"gen{generation_idx}_child{i}_attempt{attempt}_edges{num_edges}.pt"
                     torch.save(graph_dict, debug_path)
@@ -300,7 +304,8 @@ class GuidedPopulation(Population):
                 if num_edges == 0:
                     empty_graph_count += 1
                     if attempt < max_decode_attempts:
-                        latent = latent + torch.randn_like(latent) * decode_jitter_std
+                        base = best_nonempty_latent if best_nonempty_latent is not None else latent
+                        latent = base + torch.randn_like(base) * decode_jitter_std
                         resample_attempts += 1
                         continue
                     warn(
@@ -316,7 +321,8 @@ class GuidedPopulation(Population):
                 if edge_key in seen_edge_sets:
                     duplicate_count += 1
                     if attempt < max_decode_attempts:
-                        latent = latent + torch.randn_like(latent) * decode_jitter_std
+                        base = best_nonempty_latent if best_nonempty_latent is not None else latent
+                        latent = base + torch.randn_like(base) * decode_jitter_std
                         resample_attempts += 1
                         continue
                     warn("Guided offspring decoder produced a duplicate graph; skipping to preserve diversity.")
@@ -327,7 +333,8 @@ class GuidedPopulation(Population):
                     if not self._optimizer_updates_parameters(optimizer, task, check_steps=2):
                         inactive_optimizer_count += 1
                         if attempt < max_decode_attempts:
-                            latent = latent + torch.randn_like(latent) * decode_jitter_std
+                            base = best_nonempty_latent if best_nonempty_latent is not None else latent
+                            latent = base + torch.randn_like(base) * decode_jitter_std
                             resample_attempts += 1
                             continue
                         warn(
@@ -348,7 +355,8 @@ class GuidedPopulation(Population):
 
                 rebuild_failures += 1
                 if attempt < max_decode_attempts:
-                    latent = latent + torch.randn_like(latent) * decode_jitter_std
+                    base = best_nonempty_latent if best_nonempty_latent is not None else latent
+                    latent = base + torch.randn_like(base) * decode_jitter_std
                     resample_attempts += 1
                     continue
                 warn("Guided offspring decoder failed to rebuild a valid optimizer; skipping child.")
