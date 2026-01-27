@@ -29,6 +29,19 @@
      It's also unclear if this method can be adapted to spiking neural networks.
 
 ## Proposed Solution
+### Initial Population
+`computation_graphs/optimizers/` includes TorchScript optimizers that seed generation 0. The following algorithms are available out of the box:
+
+- Plain SGD family: `gradient_descent_backprop.py`, `momentum_sgd_backprop.py`, `nesterov_sgd_backprop.py`, `sgdw_backprop.py`
+- Classic adaptive methods: `adagrad_backprop.py`, `rmsprop_backprop.py`, `adagrad_norm_backprop.py`, `rmsprop_norm_backprop.py`
+- Adam-family variants: `adam_backprop.py`, `adamw_backprop.py`, `radam_backprop.py`, `qhadam_backprop.py`, `yogi_backprop.py`, `ada_belief_backprop.py`, `lamb_backprop.py`
+- Other adaptive/normalized optimizers: `adafactor_backprop.py`, `adan_backprop.py`, `adanorm_backprop.py`
+- Curvature- or Hessian-aware methods: `adahessian_backprop.py`, `lion_backprop.py`, `scaled_signsgd_backprop.py`
+- Lookahead / proximal hybrids: `lookahead_adam_backprop.py`, `lookahead_rmsprop_backprop.py`, `ftrl_proximal_backprop.py`
+- Resilient backprop family: `rprop_backprop.py`, `irprop_plus_backprop.py`
+
+To generate the corresponding .pt files, run this command in the main directory: `find computation_graphs/optimizers -name '*.py' -print0 | xargs -0 -n1 python3.10`
+
 ### Multi-Objective Fitness (Pareto Optimization)
 
 A central innovation is the use of **Pareto-based multi-objective optimization** for evaluating and selecting candidate networks.
