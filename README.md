@@ -49,7 +49,7 @@ The smallest networks that still perform well can be seen as **minimum descripti
 These MDEs are not just efficient; they are also scientifically interpretable, as they highlight the core components necessary to implement a given function or behavior.
 * **No Manual Tuning of Trade-offs:**
 Pareto ranking removes the need to hand-tune weights between objectives (such as how much to penalize complexity).
-Instead of a single "optimal" network according to a weighted sum, set of Pareto-optimal networks is obtained that captures different compromises.
+Instead of a single "optimal" network according to a weighted sum, a set of Pareto-optimal networks is obtained that captures different compromises.
 This is especially useful in research contexts, where one might prefer simpler models for interpretation unless complexity is absolutely required for performance ([53](#references)).
 
 In summary, multi-objective evolutionary selection ensures that the project optimizes not only for how well a network learns, but also for how elegant or tractable its design is.
@@ -115,8 +115,6 @@ It serves as a kind of **surrogate model** that directs evolution: by sampling i
 This compresses the combinatorially vast search space of all possible networks into a more tractable form.
 The net effect is **increased diversity** of candidate solutions and the ability to discover innovative network motifs that conventional genetic operators might miss ([54](#references)).
 
-*Guided latent retries.* To keep promising latents alive, the decoder retains a non-empty graph seen during each child’s decode attempts if available and jitters subsequent retries around that anchor rather than restarting from the original latent. Empirically this turns “almost valid” intermediate graphs into stepping stones, increasing the likelihood that at least one decode per latent survives the structural filters (implementation: `population.py:260-340`).
-
 Importantly, the evolutionary algorithm **combines** this Graph-VAE crossover with more traditional NEAT-style mating within species.
 In practice, this means there are two crossover pathways: (1) standard crossover between similar individuals (preserving fine-tuned structures within a species), and (2) occasional **graph-VAE generated offspring** that mix across species.
 This balance ensures both **exploitation and exploration**: the population can refine known good solutions while still injecting radically new variations.
@@ -124,9 +122,15 @@ This balance ensures both **exploitation and exploration**: the population can r
 ### Penalization of Invalid Offspring
 
 To prevent invalid or non-operative graphs from biasing the surrogate or inflating Pareto scores, every genome passes explicit validity filters before it is evaluated.
-Any sample that fails (decodes to an empty DAG, cannot be rebuilt, or produces an optimizer that leaves model parameters unchanged) is assigned a deterministic penalty vector: each fitness metric is set to ±10^9 depending on its objective direction.
+Any sample that fails (decodes to an empty DAG, cannot be rebuilt, or produces an optimizer that leaves model parameters unchanged) is assigned a deterministic penalty vector: each fitness metric is set to ±10^6 depending on its objective direction.
 These penalties propagate into the population’s fitness log.
 Invalid graphs are omitted from normalizations for pareto fronts, etc.
+
+### Other explanations to incoporate (!!TODO)
+*Guided latent retries.* To keep promising latents alive, the decoder retains a non-empty graph seen during each child’s decode attempts if available and jitters subsequent retries around that anchor rather than restarting from the original latent.
+Empirically this turns “almost valid” intermediate graphs into stepping stones, increasing the likelihood that at least one decode per latent survives the structural filters (implementation: `population.py:260-340`).
+
+Immediately after the seed generation is evaluated, the surrogate compression autoencoder (SCAE) undergoes a dedicated 100-epoch warm-up before the graph bottlenecks are hard-resized via `resize_bottleneck()`. This forces the ARD priors to discard dormant latent dimensions so subsequent guided offspring start from a compact, data-informed representation rather than the wide initial prior.
 
 ## Other Papers that Might be Useful
 - [On the Relationship Between Variational Inference and Auto-Associative Memory](https://arxiv.org/pdf/2210.08013.pdf)

@@ -58,6 +58,7 @@ class GuidedPopulation(Population):
         self.reproduction.optimizer_validator = lambda optimizer, task: self._optimizer_updates_parameters(
             optimizer, task, check_steps=2
         )
+        self._initial_compression_done = False
 
     @staticmethod
     def _evaluation_metric_keys(task) -> List[Metric]:
@@ -504,6 +505,15 @@ class GuidedPopulation(Population):
                 self.trainer.train(epochs=10, batch_size=batch, generation=self.generation)
             else:
                 self.trainer.train(warmup_epochs=100, batch_size=batch, generation=self.generation)
+
+            if not self._initial_compression_done:
+                self.reporters.info("Running initial SCAE warmup (100 epochs) and forcing bottleneck compression")
+                self.trainer.train(epochs=100, batch_size=batch, generation=self.generation)
+                try:
+                    self.guide.resize_bottleneck()
+                except Exception as exc:
+                    warn(f"Initial bottleneck resize failed: {exc}")
+                self._initial_compression_done = True
 
             # Build next‐gen population by species
             self.population = self.reproduction.reproduce(
