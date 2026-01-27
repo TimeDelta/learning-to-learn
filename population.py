@@ -56,7 +56,7 @@ class GuidedPopulation(Population):
         self.reproduction = GuidedReproduction(config.reproduction_config, self.reporters, stagnation)
         self.reproduction.guide_fn = self.generate_guided_offspring
         self.reproduction.optimizer_validator = lambda optimizer, task: self._optimizer_updates_parameters(
-            optimizer, task, check_steps=2
+            optimizer, task, check_steps=1
         )
         self._initial_compression_done = False
 
@@ -122,8 +122,8 @@ class GuidedPopulation(Population):
         n_offspring: int = 10,
         latent_steps: int = 50,
         latent_lr: float = 1e-2,
-        max_decode_attempts: int = 3,
-        decode_jitter_std: float = 0.1,
+        max_decode_attempts: int = 5,
+        decode_jitter_std: float = 0.05,
     ) -> List[OptimizerGenome]:
         """
         For a fixed (task_type, task_features), optimize `z_g` in latent space to maximize
@@ -398,7 +398,7 @@ class GuidedPopulation(Population):
 
         return new_genomes
 
-    def _optimizer_updates_parameters(self, optimizer, task, check_steps=2, delta_eps=1e-6):
+    def _optimizer_updates_parameters(self, optimizer, task, check_steps=2, delta_eps=1e-12):
         """Run a short dry-run to ensure the optimizer changes model weights."""
 
         try:
