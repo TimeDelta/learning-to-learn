@@ -41,7 +41,8 @@ class AdaHessianBackprop(nn.Module):
             rademacher_dist = torch.randint(0, 2, param.shape, device=param.device, dtype=torch.int64)
             rademacher_dist = rademacher_dist.to(param.dtype) * 2 - 1
             grad_dot = torch.sum(grad * rademacher_dist)
-            hvp = torch.autograd.grad(grad_dot, param, retain_graph=True, allow_unused=True)[0]
+            hvps = torch.autograd.grad([grad_dot], [param], retain_graph=True, allow_unused=True, create_graph=False)
+            hvp = hvps[0] if hvps else None
             if hvp is None:
                 hvp = torch.zeros_like(param)
             diag_estimate = hvp * rademacher_dist

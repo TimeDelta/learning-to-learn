@@ -29,8 +29,17 @@ class GuidedReproduction(DefaultReproduction):
         super().__init__(config, reporters, stagnation)
         self.guide_fn = None
         self.guided_start_generation = getattr(config, "guided_start_generation", 0)
+        self.guided_max_fraction = float(getattr(config, "guided_max_fraction", 0.5))
+        self.guided_ramp_generations = max(1, int(getattr(config, "guided_ramp_generations", 20)))
         self.optimizer_validator = None
         self.optimizer_validation_retries = getattr(config, "optimizer_validation_retries", 3)
+
+    def _guided_fraction(self, generation: int) -> float:
+        if generation < self.guided_start_generation:
+            return 0.0
+        steps_since_start = generation - self.guided_start_generation + 1
+        ramp_progress = min(1.0, max(0.0, steps_since_start / self.guided_ramp_generations))
+        return self.guided_max_fraction * ramp_progress
 
     def reproduce(self, config, species, pop_size, generation, task):
         # Filter out stagnated species, collect the set of non-stagnated
@@ -93,7 +102,9 @@ class GuidedReproduction(DefaultReproduction):
                 continue
 
             # 1) guided children
-            guided_quota = remaining_spawn // 2
+            guided_fraction = self._guided_fraction(generation)
+            guided_quota = int(round(remaining_spawn * guided_fraction))
+            guided_quota = min(guided_quota, remaining_spawn)
             guided_children = []
             if guided_quota > 0 and self.guide_fn is not None and generation >= self.guided_start_generation:
                 guided_children = self.guide_fn(task, list(s.members.values()), self.reproduction_config, guided_quota)

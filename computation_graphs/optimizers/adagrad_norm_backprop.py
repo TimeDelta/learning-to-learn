@@ -26,14 +26,17 @@ class AdaGradNormBackprop(nn.Module):
         for (name, param), grad in zip(named_parameters, grads):
             if grad is None:
                 grad = torch.zeros_like(param)
-            grad_norm_sq = torch.sum(grad * grad)
+            grad_norm_sq = torch.sum(grad * grad).detach()
             if name not in self.accum:
-                self.accum[name] = torch.zeros(1, device=param.device, dtype=param.dtype)
+                self.accum[name] = torch.zeros_like(grad_norm_sq)
             accum = self.accum[name] + grad_norm_sq
-            denom = torch.sqrt(accum) + self.eps
-            step_scale = self.step_size / denom
+            denom = torch.sqrt(accum + self.eps)
+            step_scale = (self.step_size / denom).clamp(max=1.0)
+            finite_mask = torch.isfinite(step_scale)
+            if not bool(finite_mask.all()):
+                step_scale = torch.where(finite_mask, step_scale, torch.zeros_like(step_scale))
             new_params[name] = param - step_scale * grad
-            self.accum[name] = accum
+            self.accum[name] = accum.detach()
 
         return new_params
 

@@ -1354,6 +1354,13 @@ class OnlineTrainer:
         num_loss_terms = 5
         prev_loss_terms = torch.zeros(num_loss_terms)
         avg_loss_terms = torch.zeros(num_loss_terms)
+        loss_term_labels = [
+            "adjacency_recon",
+            "attribute_recon",
+            "graph_kl",
+            "task_kl",
+            "fitness",
+        ]
 
         def stop():
             max_loss_term_change = (avg_loss_terms - prev_loss_terms).abs().max().item()
@@ -1454,17 +1461,26 @@ class OnlineTrainer:
 
                     def to_tensor(value):
                         value = convert_string(value)
-                        if not isinstance(value, torch.Tensor):
-                            value = torch.as_tensor([value], dtype=torch.float)
-                        return value
+                        if isinstance(value, torch.Tensor):
+                            tensor = value.detach()
+                        else:
+                            tensor = torch.as_tensor([value], dtype=torch.float)
+                        return tensor.reshape(-1).float().to(self.device)
 
                     def attribute_value_loss(value):
-                        value = convert_string(value)
-                        if isinstance(value, int):
-                            value = float(value)
-                        if isinstance(value, torch.Tensor):
-                            value = value.abs().sum()
-                        return value
+                        tensor = to_tensor(value)
+                        return tensor.abs().sum()
+
+                    def mse_aligned(pred_tensor, target_tensor):
+                        if pred_tensor.numel() == target_tensor.numel():
+                            return F.mse_loss(pred_tensor, target_tensor)
+                        size = min(pred_tensor.numel(), target_tensor.numel())
+                        loss = F.mse_loss(pred_tensor[:size], target_tensor[:size])
+                        if pred_tensor.numel() > size:
+                            loss = loss + pred_tensor[size:].abs().sum()
+                        if target_tensor.numel() > size:
+                            loss = loss + target_tensor[size:].abs().sum()
+                        return loss
 
                     for node_idx in range(num_nodes):
                         all_attr_names = set(pred_attrs[node_idx].keys()) | set(target_attrs[node_idx].keys())
@@ -1472,7 +1488,9 @@ class OnlineTrainer:
                             pred_value = pred_attrs[node_idx].get(attr_name)
                             target_value = target_attrs[node_idx].get(attr_name)
                             if (pred_value is not None) and (target_value is not None):
-                                loss_feat += F.mse_loss(to_tensor(pred_value), to_tensor(target_value))
+                                pred_tensor = to_tensor(pred_value)
+                                target_tensor = to_tensor(target_value)
+                                loss_feat += mse_aligned(pred_tensor, target_tensor)
                             elif target_value is not None:
                                 loss_feat += attribute_value_loss(target_value)
                             else:
@@ -1559,11 +1577,14 @@ class OnlineTrainer:
             self.loss_history.append(avg_loss_terms.cpu().numpy())
 
             if verbose:
+                label_str = ", ".join(
+                    f"{name}={value:.4g}" for name, value in zip(loss_term_labels, avg_loss_terms.tolist())
+                )
                 if not epochs:
-                    print(f"Epoch {epoch}, Loss terms per batch: {avg_loss_terms} = {avg_loss_terms.sum():.4f}")
+                    print(f"Epoch {epoch}, Loss terms per batch: [{label_str}] (total={avg_loss_terms.sum():.4f})")
                 else:
                     print(
-                        f"Epoch {epoch}/{epochs}, Loss terms per batch: {avg_loss_terms} = {avg_loss_terms.sum():.4f}"
+                        f"Epoch {epoch}/{epochs}, Loss terms per batch: [{label_str}] (total={avg_loss_terms.sum():.4f})"
                     )
             if DEBUG_TRAINER and epoch_timer is not None:
                 logger.info(

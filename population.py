@@ -1,9 +1,12 @@
+import atexit
 import copy
 import random
 import re
+import signal
 import time
 import tracemalloc
 import weakref
+from collections import Counter
 from pathlib import Path
 from typing import Dict, List
 from warnings import warn
@@ -24,6 +27,36 @@ from reproduction import GuidedReproduction
 from search_space_compression import *
 from tasks import *
 
+_INVALID_REASON_COUNTER: Counter = Counter()
+_INVALID_REASON_REPORT_REGISTERED = False
+
+
+def _dump_invalid_reason_summary():
+    if not _INVALID_REASON_COUNTER:
+        print("[invalid-offspring] No penalized guided offspring recorded.")
+        return
+    total = sum(_INVALID_REASON_COUNTER.values())
+    parts = ", ".join(f"{reason}={count}" for reason, count in sorted(_INVALID_REASON_COUNTER.items()))
+    print(f"[invalid-offspring] total={total} :: {parts}")
+
+
+def _register_invalid_reason_reporter():
+    global _INVALID_REASON_REPORT_REGISTERED
+    if _INVALID_REASON_REPORT_REGISTERED:
+        return
+
+    def _signal_handler(signum, frame):  # pragma: no cover - signal handler
+        _dump_invalid_reason_summary()
+        raise SystemExit(128 + signum)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _signal_handler)
+        except (ValueError, OSError):
+            pass
+    atexit.register(_dump_invalid_reason_summary)
+    _INVALID_REASON_REPORT_REGISTERED = True
+
 
 class GuidedPopulation(Population):
     _optimizer_state_attr_cache: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
@@ -31,6 +64,7 @@ class GuidedPopulation(Population):
 
     def __init__(self, config):
         super().__init__(config)
+        _register_invalid_reason_reporter()
         graph_latent_dim = 16
         task_latent_dim = 10
         num_node_types = 10
@@ -59,6 +93,7 @@ class GuidedPopulation(Population):
             optimizer, task, check_steps=1
         )
         self._initial_compression_done = False
+        self._enable_initial_compression = getattr(config, "enable_initial_compression", False)
 
     @staticmethod
     def _evaluation_metric_keys(task) -> List[Metric]:
@@ -453,10 +488,9 @@ class GuidedPopulation(Population):
         if self.config.no_fitness_termination and (n is None):
             raise RuntimeError("Cannot have no generational limit with no fitness termination")
 
-        generation = 0
+        self.generation = 0
         gen_for_full_train_resize = 25
-        while n is None or generation < n:
-            generation += 1
+        while n is None or self.generation < n:
             self.reporters.start_generation(self.generation)
 
             task_type = random.choice(list(TASK_TYPE_TO_CLASS.keys()))
@@ -464,7 +498,7 @@ class GuidedPopulation(Population):
 
             # Evaluate real fitness. Using too few update steps makes every optimizer look identical,
             # so clamp to a minimum to expose behavioral differences early in the run.
-            eval_steps = max(2 * generation, 25)
+            eval_steps = max(2 * self.generation, 25)
             print(f"Evaluating genomes on {task.name()} for {eval_steps} steps")
             self.eval_genomes(list(self.population.items()), self.config, task, steps=eval_steps)
 
@@ -499,21 +533,13 @@ class GuidedPopulation(Population):
                 )
 
             batch = max(1, len(self.trainer.dataset))
-            if generation < gen_for_full_train_resize:
-                self.trainer.train(epochs=50, batch_size=batch, generation=self.generation)
-            elif generation > gen_for_full_train_resize:
-                self.trainer.train(epochs=10, batch_size=batch, generation=self.generation)
-            else:
-                self.trainer.train(warmup_epochs=100, batch_size=batch, generation=self.generation)
-
-            if not self._initial_compression_done:
-                self.reporters.info("Running initial SCAE warmup (100 epochs) and forcing bottleneck compression")
+            if self.generation == 0:
+                self.reporters.info("Running initial SCAE warmup (100 epochs)")
                 self.trainer.train(epochs=100, batch_size=batch, generation=self.generation)
-                try:
-                    self.guide.resize_bottleneck()
-                except Exception as exc:
-                    warn(f"Initial bottleneck resize failed: {exc}")
-                self._initial_compression_done = True
+            elif self.generation < gen_for_full_train_resize:
+                self.trainer.train(epochs=50, batch_size=batch, generation=self.generation)
+            else:
+                self.trainer.train(warmup_epochs=25, epochs=10, batch_size=batch, generation=self.generation)
 
             # Build next‐gen population by species
             self.population = self.reproduction.reproduce(
@@ -551,6 +577,7 @@ class GuidedPopulation(Population):
         metric_keys = self._evaluation_metric_keys(task)
         raw_metrics: Dict[int, Dict[str, float]] = {}
         invalid_genomes: List[int] = []
+        invalid_reason_counts: Counter = Counter()
         genome_map = {gid: g for gid, g in genomes}
 
         model = ManyLossMinimaModel(task.train_data.num_input_features)
@@ -562,6 +589,8 @@ class GuidedPopulation(Population):
                     reason=getattr(genome, "invalid_reason", "empty_graph"),
                     skip_evaluation=True,
                 )
+                reason = getattr(genome, "invalid_reason", "empty_graph")
+                invalid_reason_counts[reason] += 1
                 invalid_genomes.append(genome_id)
                 continue
             model_copy = type(model)(task.train_data.num_input_features)
@@ -569,7 +598,9 @@ class GuidedPopulation(Population):
             print(f"  Evaluating {genome_id} ({genome.optimizer_path})")
             result = self.evaluate_optimizer(genome.optimizer, model_copy, task, steps)
             if result is None:
-                self._assign_penalty(genome_map[genome_id], task)
+                penalty_metrics = self._assign_penalty(genome_map[genome_id], task)
+                reason = getattr(genome_map[genome_id], "invalid_reason", "invalid_graph")
+                invalid_reason_counts[reason] += 1
                 invalid_genomes.append(genome_id)
                 continue
             setattr(genome_map[genome_id], "invalid_graph", False)
@@ -648,6 +679,9 @@ class GuidedPopulation(Population):
             self.reporters.info(
                 f"Invalid or skipped guided offspring penalized: {len(invalid_genomes)}/{len(genome_map)}"
             )
+        if invalid_reason_counts:
+            parts = ", ".join(f"{reason}={count}" for reason, count in sorted(invalid_reason_counts.items()))
+            self.reporters.info(f"Invalid guided offspring reasons: {parts}")
         return genomes
 
     def _assign_penalty(self, genome, task, reason="invalid_graph", skip_evaluation=False):
@@ -661,6 +695,7 @@ class GuidedPopulation(Population):
         if skip_evaluation:
             genome.skip_evaluation = True
         genome.invalid_reason = reason
+        _INVALID_REASON_COUNTER[reason] += 1
         return validation_metrics
 
     def evaluate_optimizer(self, optimizer, model, task, steps=10):
@@ -718,7 +753,19 @@ class GuidedPopulation(Population):
                     warn("Optimizer state mismatch detected; resetting state buffers and retrying")
                     self._reset_optimizer_state(optimizer, named_params)
                     self._ensure_optimizer_state_shapes(optimizer, named_params)
-                    updated_state = optimizer(metrics_values, prev_metrics_values, named_params)
+                    metrics_values = task.evaluate_metrics(model, task.train_data)
+                    if not torch.isfinite(metrics_values).all():
+                        invalid_graph = True
+                        break
+                    if not metrics_values.requires_grad:
+                        raise RuntimeError(
+                            "Task metrics tensor must retain gradient information; ensure evaluate_metrics returns differentiable tensors."
+                        )
+                    if prev_metrics_values is None:
+                        prev = torch.zeros_like(metrics_values)
+                    else:
+                        prev = prev_metrics_values
+                    updated_state = optimizer(metrics_values, prev, named_params)
                 else:
                     raise
             state_dict = self._normalize_state_dict(updated_state, named_params)

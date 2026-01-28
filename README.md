@@ -106,7 +106,7 @@ Traditional neuroevolution methods like NEAT use crossover within the same "spec
 Those methods struggle to recombine vastly different topologies because the correspondence between parts of two very different networks is ambiguous.
 The approach addresses this by **learning a continuous encoding of network graphs**, allowing any two networks-even of entirely different designs-to **mate** in a meaningful way ([54](#references)).
 
-The implemented module (called *SelfCompressingFitnessRegularizedDAGVAE*, in `search_space_compression.py`) acts as a **generative recombination mechanism** or a "cross-species mating system" for networks:
+The implemented module (called *SelfCompressingFitnessRegularizedDAGVAE*, in [`search_space_compression.py`](fsearch_space_compression.py)) acts as a **generative recombination mechanism** or a "cross-species mating system" for networks:
 
 * **Graph Encoding and Decoding:**
 The VAE is trained to take arbitrary computation graphs and encode them into a continuous latent vector space. It can then decode a latent vector back into a network graph.
@@ -141,9 +141,11 @@ Invalid graphs are omitted from normalizations for pareto fronts, etc.
 
 ### Other explanations to incoporate (!!TODO)
 *Guided latent retries.* To keep promising latents alive, the decoder retains a non-empty graph seen during each child’s decode attempts if available and jitters subsequent retries around that anchor rather than restarting from the original latent.
-Empirically this turns “almost valid” intermediate graphs into stepping stones, increasing the likelihood that at least one decode per latent survives the structural filters (implementation: `population.py:260-340`).
+Empirically this turns “almost valid” intermediate graphs into stepping stones, increasing the likelihood that at least one decode per latent survives the structural filters (implementation: [`population.py:260-340`](population.py)).
 
-Immediately after the seed generation is evaluated, the surrogate compression autoencoder (SCAE) undergoes a dedicated 100-epoch warm-up before the graph bottlenecks are hard-resized via `resize_bottleneck()`. This forces the ARD priors to discard dormant latent dimensions so subsequent guided offspring start from a compact, data-informed representation rather than the wide initial prior.
+Immediately after the seed generation is evaluated, the self-compressing autoencoder (SCAE) undergoes a dedicated 100-epoch warm-up.
+
+Linear ramp up of percentage of population created via guided mechanism to provide SCAE with more training examples before relying so heavily on it (mitigation of mode collapse).
 
 ## Other Papers that Might be Useful
 - [On the Relationship Between Variational Inference and Auto-Associative Memory](https://arxiv.org/pdf/2210.08013.pdf)

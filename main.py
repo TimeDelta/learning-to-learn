@@ -73,6 +73,7 @@ def create_initial_genome(config, optimizer):
 
     node_mapping = {}  # from TorchScript nodes to genome node keys
     next_node_id = 0
+    graph_inputs = {val.node() for val in optimizer.graph.inputs()}
     for node in optimizer.graph.nodes():
         new_node_gene = NodeGene(next_node_id, node)
         new_node_gene.init_attributes(config.genome_config)
@@ -96,10 +97,7 @@ def create_initial_genome(config, optimizer):
                 conn.innovation = innovation
                 innovation += 1
                 connections[key] = conn
-            elif (
-                ", %loss.1 : Tensor, %prev_loss : Tensor, %named_parameters.1 : (str, Tensor)[] = prim::Param()"
-                not in str(producer)
-            ):
+            elif producer not in graph_inputs or producer.kind() != "prim::Param":
                 print(f"WARNING: missing mapping for input node [{producer}]")
 
     genome.connections = connections

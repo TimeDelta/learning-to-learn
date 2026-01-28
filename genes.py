@@ -69,7 +69,7 @@ class NodeGene(BaseGene):
                 else:
                     warn(f"Unknown attribute type for node [{node}]: {attribute_type}")
                 ATTRIBUTE_NAMES.add(attribute_name)
-                if not self.dynamic_attributes[attribute]:
+                if self.dynamic_attributes[attribute] is None:
                     warn(f"Missing value for " + str(attribute))
             self.num_outputs = len(list(node.outputs()))
             self.output_debug_names = [o.debugName() for o in node.outputs()]
@@ -117,7 +117,9 @@ class NodeGene(BaseGene):
 
     def distance(self, other, config):
         def attr_equal(a, b):
-            if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
+            if isinstance(a, torch.Tensor) or isinstance(b, torch.Tensor):
+                if not (isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor)):
+                    return False  # tensors never equal non-tensors
                 if a.shape != b.shape:
                     return False
                 return torch.allclose(a, b)
