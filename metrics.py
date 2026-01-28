@@ -22,7 +22,7 @@ class MSELoss(Metric):
     name = "MSE"
     objective = "min"
     best_value = 0.0
-    guidance_weight = 1e3
+    guidance_weight = 1.0
 
     def __call__(self, output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         target_tensor = torch.as_tensor(target, dtype=output.dtype, device=output.device)
@@ -47,7 +47,7 @@ class MemoryCost(Metric):
     name = "Memory Cost"
     objective = "min"
     best_value = 0.0
-    guidance_weight = 0.1
+    guidance_weight = 1.0
 
 
 def metric_best_value(metric: Metric) -> float:
