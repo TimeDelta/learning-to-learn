@@ -42,6 +42,34 @@
 
 To generate the corresponding .pt files, run this command in the main directory: `find computation_graphs/optimizers -name '*.py' -print0 | xargs -0 -n1 python3.10`
 
+### Experiment Tracking and CLI options
+Run `main.py` directly to evolve optimizers. The script now exposes switches for MLflow tracking and general configuration, so you can keep experiments reproducible:
+
+```
+python3 main.py \
+  --config-file neat-config \
+  --num-generations 250 \
+  --enable-mlflow \
+  --mlflow-experiment learning-to-learn \
+  --mlflow-run-name warmup_run \
+  --mlflow-tag stage=warmup --mlflow-tag dataset=cifar10
+```
+
+Key flags:
+
+- `--config-file`: choose an alternate NEAT config.
+- `--num-generations`: change the evolutionary horizon (default 1000).
+- `--enable-mlflow`: turn on MLflow streaming. Pair it with `--mlflow-tracking-uri`, `--mlflow-experiment`, `--mlflow-run-name`, `--mlflow-tag KEY=VALUE`, and `--mlflow-nested` to match your tracking server layout.
+
+When MLflow is enabled, the run logs population best/mean/worst fitnesses, species counts, genome complexity per generation, final winner metrics, the NEAT config artifact, and a JSON summary of invalid guided-offspring reasons. It now also captures:
+
+- OnlineTrainer epoch summaries (adjacency/attribute reconstruction, KL terms, fitness loss, and totals) so the `Epoch … Loss terms per batch` lines end up in the MLflow run as metrics + `logs/progress.log` text.
+- Per-metric fitness predictor losses (`trainer_metric_<metric_name>` metrics plus the CSV/HTML artifacts) so you can see which task objectives dominate each epoch.
+- Guided offspring production stats (`guided_children_*` metrics for requested/created totals and invalid counts per reason) logged once per generation alongside your trainer curves.
+- Genetic-distance statistics, compatibility-threshold changes, and a per-generation species table (same columns as the NEAT stdout reporter) under `species/generation_*.json`.
+
+This mirrors what shows up in stdout while giving you a permanent experiment record.
+
 ### Multi-Objective Fitness (Pareto Optimization)
 
 A central innovation is the use of **Pareto-based multi-objective optimization** for evaluating and selecting candidate networks.

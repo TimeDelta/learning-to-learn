@@ -94,6 +94,58 @@ class GuidedPopulation(Population):
         )
         self._initial_compression_done = False
         self._enable_initial_compression = getattr(config, "enable_initial_compression", False)
+        self.guided_stats_callback = None
+        self._guided_offspring_stats = None
+        self.dataset_stats_callback = None
+
+    def _reset_guided_offspring_stats(self):
+        self._guided_offspring_stats = {
+            "generation": self.generation,
+            "requested": 0,
+            "accepted": 0,
+            "invalid_total": 0,
+            "invalid_by_reason": Counter(),
+        }
+
+    def _accumulate_guided_offspring_stats(self, requested: int, accepted: int, invalid_counts: Counter):
+        stats = self._guided_offspring_stats
+        if stats is None:
+            return
+        stats["requested"] += int(requested or 0)
+        stats["accepted"] += int(accepted or 0)
+        if invalid_counts:
+            total_invalid = int(sum(invalid_counts.values()))
+            stats["invalid_total"] += total_invalid
+            stats["invalid_by_reason"].update(invalid_counts)
+
+    def _emit_guided_offspring_stats(self):
+        stats = self._guided_offspring_stats
+        if not stats:
+            return
+        summary = {
+            "generation": stats.get("generation", self.generation),
+            "requested": stats.get("requested", 0),
+            "accepted": stats.get("accepted", 0),
+            "invalid_total": stats.get("invalid_total", 0),
+            "invalid_by_reason": dict(stats.get("invalid_by_reason", {})),
+        }
+        if self.guided_stats_callback:
+            self.guided_stats_callback(summary)
+        if summary["invalid_total"]:
+            parts = ", ".join(f"{reason}={count}" for reason, count in sorted(summary["invalid_by_reason"].items()))
+            self.reporters.info(f"Guided offspring invalid counts: total={summary['invalid_total']} :: {parts}")
+        self._guided_offspring_stats = summary
+
+    def _emit_dataset_stats(self, valid_size: int, invalid_size: int):
+        if not self.dataset_stats_callback:
+            return
+        summary = {
+            "generation": self.generation,
+            "valid": int(valid_size or 0),
+            "invalid": int(invalid_size or 0),
+        }
+        summary["total"] = summary["valid"] + summary["invalid"]
+        self.dataset_stats_callback(summary)
 
     @staticmethod
     def _evaluation_metric_keys(task) -> List[Metric]:
@@ -310,6 +362,7 @@ class GuidedPopulation(Population):
         seen_edge_sets = set()
         total_requested = z_g.size(0)
         max_decode_attempts = max(1, max_decode_attempts)
+        invalid_reason_counts: Counter = Counter()
 
         for i in range(total_requested):
             latent = z_g[i].unsqueeze(0).clone()
@@ -349,6 +402,7 @@ class GuidedPopulation(Population):
                     )
                     genome.graph_dict = graph_dict
                     self._assign_penalty(genome, task, reason="empty_graph", skip_evaluation=True)
+                    invalid_reason_counts["empty_graph"] += 1
                     new_genomes.append(genome)
                     accepted = True
                     break
@@ -378,6 +432,7 @@ class GuidedPopulation(Population):
                         )
                         genome.graph_dict = graph_dict
                         self._assign_penalty(genome, task, reason="inactive_optimizer", skip_evaluation=True)
+                        invalid_reason_counts["inactive_optimizer"] += 1
                         new_genomes.append(genome)
                         break
 
@@ -431,6 +486,7 @@ class GuidedPopulation(Population):
                 )
             )
 
+        self._accumulate_guided_offspring_stats(total_requested, len(new_genomes), invalid_reason_counts)
         return new_genomes
 
     def _optimizer_updates_parameters(self, optimizer, task, check_steps=2, delta_eps=1e-12):
@@ -492,6 +548,7 @@ class GuidedPopulation(Population):
         gen_for_full_train_resize = 25
         while n is None or self.generation < n:
             self.reporters.start_generation(self.generation)
+            self._reset_guided_offspring_stats()
 
             task_type = random.choice(list(TASK_TYPE_TO_CLASS.keys()))
             task = TASK_TYPE_TO_CLASS[task_type].random_init()
@@ -540,6 +597,7 @@ class GuidedPopulation(Population):
                 self.trainer.train(epochs=50, batch_size=batch, generation=self.generation)
             else:
                 self.trainer.train(warmup_epochs=25, epochs=10, batch_size=batch, generation=self.generation)
+            self._emit_dataset_stats(len(self.trainer.dataset), len(self.trainer.invalid_dataset))
 
             # Build next‐gen population by species
             self.population = self.reproduction.reproduce(
@@ -561,6 +619,7 @@ class GuidedPopulation(Population):
             # Re‐speciate and finalize generation
             self.species.speciate(self.config, self.population, self.generation)
             self._adjust_compatibility_threshold(len(self.species.species))
+            self._emit_guided_offspring_stats()
             self.reporters.end_generation(self.config, self.population, self.species)
 
             self.generation += 1

@@ -1262,12 +1262,18 @@ class OnlineTrainer:
         self.initial_loss = None
         self.last_prune_epoch = 0
         self.max_fitness_dim = 0
+        self.metric_name_order: List[Optional[str]] = []
         self.task_feature_bank: Dict[int, np.ndarray] = {}
         self.task_metric_dims: Dict[int, int] = {}
         self.task_metric_best_values: Dict[int, np.ndarray] = {}
         self.task_metric_guidance_weights: Dict[int, np.ndarray] = {}
         self.invalid_target_ratio = 0.2
         self.invalid_ratio_warmup = 5
+        self.progress_callback = None
+
+    def set_progress_callback(self, callback):
+        """Register a callable invoked after each epoch with loss summaries."""
+        self.progress_callback = callback
 
     def add_data(self, graphs, fitnesses, task_type: str, task_features, invalid_flags=None):
         if invalid_flags is None:
@@ -1276,6 +1282,7 @@ class OnlineTrainer:
             data = graph.clone()
             # sort fitness values by key
             metric_items = sorted(fitness_dict.items(), key=lambda item: item[0].name)
+            self._record_metric_names(metric_items)
             fitness = [float(value) for _, value in metric_items]
             best_values = [float(getattr(metric, "best_value", 0.0)) for metric, _ in metric_items]
             guidance_weights = [float(getattr(metric, "guidance_weight", 1.0)) for metric, _ in metric_items]
@@ -1370,6 +1377,8 @@ class OnlineTrainer:
             epoch_timer = time.perf_counter() if DEBUG_TRAINER else None
             prev_loss_terms = avg_loss_terms.clone()
             total_loss_terms = torch.zeros(num_loss_terms)
+            per_metric_error_sum = None
+            per_metric_weight_sum = None
             self.model.train()
             for batch_idx, batch in enumerate(loader, start=1):
                 batch_timer = time.perf_counter() if DEBUG_TRAINER else None
@@ -1553,6 +1562,12 @@ class OnlineTrainer:
                 weighted_error = sq_error * weighted_mask
                 denom = weighted_mask.sum().clamp_min(1.0)
                 loss_fitness = weighted_error.sum() / denom
+                if self.max_fitness_dim > 0:
+                    if per_metric_error_sum is None or per_metric_error_sum.numel() != weighted_error.size(-1):
+                        per_metric_error_sum = torch.zeros(weighted_error.size(-1))
+                        per_metric_weight_sum = torch.zeros(weighted_error.size(-1))
+                    per_metric_error_sum += weighted_error.detach().sum(dim=0).cpu()
+                    per_metric_weight_sum += weighted_mask.detach().sum(dim=0).cpu()
 
                 # --- 5) total & backward ---
                 loss_terms = [
@@ -1575,6 +1590,27 @@ class OnlineTrainer:
                     )
             avg_loss_terms = total_loss_terms / len(loader)
             self.loss_history.append(avg_loss_terms.cpu().numpy())
+
+            per_metric_losses = {}
+            if self.max_fitness_dim > 0 and per_metric_weight_sum is not None and per_metric_weight_sum.numel() > 0:
+                metric_values = per_metric_error_sum / per_metric_weight_sum.clamp_min(1.0)
+                metric_values = metric_values.tolist()
+                weight_list = per_metric_weight_sum.tolist()
+                for idx, value in enumerate(metric_values):
+                    if idx >= len(weight_list) or weight_list[idx] <= 0:
+                        continue
+                    per_metric_losses[self._metric_name_for_index(idx)] = float(value)
+
+            if self.progress_callback is not None:
+                loss_metrics = {name: float(value) for name, value in zip(loss_term_labels, avg_loss_terms.tolist())}
+                self.progress_callback(
+                    generation=generation,
+                    epoch=epoch,
+                    total_epochs=epochs,
+                    total_loss=float(avg_loss_terms.sum().item()),
+                    loss_terms=loss_metrics,
+                    per_metric_losses=per_metric_losses,
+                )
 
             if verbose:
                 label_str = ", ".join(
@@ -1652,6 +1688,7 @@ class OnlineTrainer:
                         [guidance_weights, torch.ones(pad, dtype=weight_dtype)], dim=-1
                     )
         self.max_fitness_dim = new_width
+        self._ensure_metric_name_capacity(new_width)
 
     def _remember_task_signature(
         self,
@@ -1667,6 +1704,27 @@ class OnlineTrainer:
             self.task_metric_best_values[task_type_id] = np.asarray(metric_best_values, dtype=np.float32)
         if metric_guidance_weights is not None:
             self.task_metric_guidance_weights[task_type_id] = np.asarray(metric_guidance_weights, dtype=np.float32)
+
+    def _ensure_metric_name_capacity(self, new_width: int):
+        if new_width <= len(self.metric_name_order):
+            return
+        self.metric_name_order.extend([None] * (new_width - len(self.metric_name_order)))
+
+    def _record_metric_names(self, metric_items):
+        names = [metric.name for metric, _ in metric_items]
+        self._ensure_metric_name_capacity(max(len(names), self.max_fitness_dim))
+        for idx, name in enumerate(names):
+            if idx >= len(self.metric_name_order):
+                self.metric_name_order.append(name)
+            elif self.metric_name_order[idx] is None:
+                self.metric_name_order[idx] = name
+
+    def _metric_name_for_index(self, idx: int) -> str:
+        if 0 <= idx < len(self.metric_name_order):
+            name = self.metric_name_order[idx]
+            if name:
+                return name
+        return f"metric_{idx}"
 
     def remember_task_signature(
         self,
