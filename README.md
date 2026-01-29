@@ -175,6 +175,10 @@ Immediately after the seed generation is evaluated, the self-compressing autoenc
 
 Linear ramp up of percentage of population created via guided mechanism to provide SCAE with more training examples before relying so heavily on it (mitigation of mode collapse).
 
+Adaptive metric scaling for the fitness predictor uses a learned log-variance per metric inside the [`TaskConditionedFitnessPredictor`](search_space_compression.py).
+Each metric’s squared canonical error is modulated by `exp(-s_i)` and regularized by `s_i`, where `s_i` is the head’s log variance parameter (initialized at 0).
+This keeps gradients for wildly different metrics (e.g., memory cost vs. AU task reward) much closer to the same numeric range without relying on per-generation normalization and still allows `metric_guidance_weights` to express explicit preferences.
+
 ## Other Papers that Might be Useful
 - [On the Relationship Between Variational Inference and Auto-Associative Memory](https://arxiv.org/pdf/2210.08013.pdf)
   - "In order to improve the memory capacity, modern Hopfield networks [22, 21, 8] propose several variants of the energy function using polynomial or exponential interactions.

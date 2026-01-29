@@ -1014,6 +1014,8 @@ class FitnessPredictor(nn.Module):
         self.fc2 = nn.Linear(hidden_dim, fitness_dim)
         self.output_dim = fitness_dim
         self.latent_dim = latent_dim
+        # Learnable log-variance per metric to balance gradients without per-generation normalization
+        self.log_metric_scale = nn.Parameter(torch.zeros(fitness_dim))
 
     def forward(self, z_graph, z_task):
         return self.fc2(F.relu(self.fc1(torch.cat([z_graph, z_task], dim=-1))))
@@ -1062,7 +1064,9 @@ class TaskConditionedFitnessPredictor(nn.Module):
                 )
         return head
 
-    def forward(self, z_graph, z_task, task_types: torch.LongTensor, fitness_dims: torch.LongTensor) -> torch.Tensor:
+    def forward(
+        self, z_graph, z_task, task_types: torch.LongTensor, fitness_dims: torch.LongTensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         if fitness_dims is None:
             raise ValueError("fitness_dims tensor required for task-conditioned predictor")
         if task_types.dim() == 0:
@@ -1072,8 +1076,10 @@ class TaskConditionedFitnessPredictor(nn.Module):
         batch_size = z_graph.size(0)
         max_dim = int(fitness_dims.max().item()) if batch_size > 0 else 0
         if max_dim == 0:
-            return z_graph.new_zeros((batch_size, 0))
+            zeros = z_graph.new_zeros((batch_size, 0))
+            return zeros, zeros
         preds = z_graph.new_zeros((batch_size, max_dim))
+        log_scales = z_graph.new_zeros((batch_size, max_dim))
         unique_tasks = torch.unique(task_types).tolist()
         for task_id in unique_tasks:
             idx = (task_types == task_id).nonzero(as_tuple=False).view(-1)
@@ -1083,7 +1089,13 @@ class TaskConditionedFitnessPredictor(nn.Module):
             head = self.ensure_head(task_id, output_dim)
             head_pred = head(z_graph[idx], z_task[idx])
             preds[idx, :output_dim] = head_pred
-        return preds
+            head_log_scales = head.log_metric_scale
+            if head_log_scales.numel() != output_dim:
+                raise RuntimeError(
+                    f"Fitness head for task {task_id} has scale dim {head_log_scales.numel()}, expected {output_dim}"
+                )
+            log_scales[idx, :output_dim] = head_log_scales.unsqueeze(0).expand(idx.numel(), -1)
+        return preds, log_scales
 
     def predict_task(self, task_type_id: int, output_dim: int, z_graph, z_task) -> torch.Tensor:
         head = self.ensure_head(task_type_id, output_dim)
@@ -1181,8 +1193,19 @@ class SelfCompressingFitnessRegularizedDAGVAE(nn.Module):
             decoded_graphs, decoder_aux = decoded, None
         if fitness_dims is None:
             raise RuntimeError("fitness_dims must be provided for task-conditioned fitness prediction")
-        fitness_pred = self.fitness_predictor(graph_latent, task_latent, task_type, fitness_dims)
-        return decoded_graphs, fitness_pred, graph_latent, task_latent, mu_g, lv_g, mu_t, lv_t, decoder_aux
+        fitness_pred, metric_log_scales = self.fitness_predictor(graph_latent, task_latent, task_type, fitness_dims)
+        return (
+            decoded_graphs,
+            fitness_pred,
+            metric_log_scales,
+            graph_latent,
+            task_latent,
+            mu_g,
+            lv_g,
+            mu_t,
+            lv_t,
+            decoder_aux,
+        )
 
     def prune_latent_dims(self, num_prune=1):
         # Identify and mask out dims with highest precision (least variance)
@@ -1401,6 +1424,7 @@ class OnlineTrainer:
                 (
                     decoded_graphs,
                     fitness_pred,
+                    metric_log_scales,
                     graph_latent,
                     task_latent,
                     mu_g,
@@ -1527,6 +1551,7 @@ class OnlineTrainer:
                 mask = batch.fitness_mask.to(self.device)
                 target = target_y.to(self.device)
                 pred = self._align_pred_to_mask(fitness_pred, mask)
+                log_scales = self._align_pred_to_mask(metric_log_scales, mask)
                 best = getattr(batch, "metric_best_values", None)
                 if best is None:
                     best = torch.zeros_like(pred)
@@ -1559,14 +1584,16 @@ class OnlineTrainer:
                 target_canonical = canonical_log_distance(target, best)
                 pred_canonical = canonical_log_distance(pred, best)
                 sq_error = (pred_canonical - target_canonical).pow(2)
-                weighted_error = sq_error * weighted_mask
+                hetero_term = sq_error * torch.exp(-log_scales) + log_scales
+                weighted_error = hetero_term * weighted_mask
                 denom = weighted_mask.sum().clamp_min(1.0)
                 loss_fitness = weighted_error.sum() / denom
+                raw_weighted_error = sq_error * weighted_mask
                 if self.max_fitness_dim > 0:
                     if per_metric_error_sum is None or per_metric_error_sum.numel() != weighted_error.size(-1):
                         per_metric_error_sum = torch.zeros(weighted_error.size(-1))
                         per_metric_weight_sum = torch.zeros(weighted_error.size(-1))
-                    per_metric_error_sum += weighted_error.detach().sum(dim=0).cpu()
+                    per_metric_error_sum += raw_weighted_error.detach().sum(dim=0).cpu()
                     per_metric_weight_sum += weighted_mask.detach().sum(dim=0).cpu()
 
                 # --- 5) total & backward ---
