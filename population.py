@@ -210,7 +210,9 @@ class GuidedPopulation(Population):
         latent_lr: float = 1e-2,
         max_decode_attempts: int = 5,
         decode_jitter_std: float = 0.05,
-        latent_tether_weight: float = 1e-3,
+        latent_tether_weight: float | None = None,
+        latent_tether_init: float = 1e-3,
+        latent_tether_prior: float = 1e-4,
     ) -> List[OptimizerGenome]:
         """
         For a fixed (task_type, task_features), optimize `z_g` in latent space to maximize
@@ -266,6 +268,7 @@ class GuidedPopulation(Population):
             z_g = z_g_encoded
 
         z_g_initial = z_g.detach().clone()
+        learnable_tether = latent_tether_weight is None
 
         total_latents = z_g.size(0)
         if total_latents == 0:
@@ -290,18 +293,39 @@ class GuidedPopulation(Population):
         best_tensor = best_tensor.expand(total_latents, -1)
         weight_tensor = weight_tensor.expand(total_latents, -1)
 
-        opt = torch.optim.Adam([z_g], lr=latent_lr)
+        tether_params: List[torch.Tensor] = []
+        latent_tether_logit = None
+        if learnable_tether:
+            if latent_tether_init <= 0:
+                latent_tether_init = 1e-6
+            init_value = torch.full((total_latents, 1), float(latent_tether_init), device=z_g.device)
+            # inverse softplus to match the requested initial value.
+            latent_tether_logit = torch.log(torch.expm1(init_value)).clamp(min=-20.0, max=20.0)
+            latent_tether_logit = latent_tether_logit.detach().clone().requires_grad_(True)
+            tether_params.append(latent_tether_logit)
+
+        opt_params: List[torch.Tensor] = [z_g]
+        opt_params.extend(tether_params)
+        opt = torch.optim.Adam(opt_params, lr=latent_lr)
         for _ in range(latent_steps):
             pred, _ = self.guide.fitness_predictor(z_g)
             canonical = canonical_log_distance(pred, best_tensor)
             weighted = canonical.pow(2) * weight_tensor
             loss = weighted.sum(dim=1).mean()
-            if latent_tether_weight > 0:
-                tether = F.mse_loss(z_g, z_g_initial)
-                loss = loss + latent_tether_weight * tether
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
+            per_latent_tether = F.mse_loss(z_g, z_g_initial, reduction="none").mean(dim=1)
+            if learnable_tether and latent_tether_logit is not None:
+                weights = F.softplus(latent_tether_logit).view(-1)
+                tether = (weights * per_latent_tether).mean()
+                loss = loss + tether
+                if latent_tether_prior > 0:
+                    target = torch.full_like(weights, float(latent_tether_init))
+                    prior = F.mse_loss(weights, target)
+                    loss = loss + latent_tether_prior * prior
+            elif latent_tether_weight:
+                loss = loss + float(latent_tether_weight) * per_latent_tether.mean()
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
 
         stats = []
         new_genomes = []
@@ -543,7 +567,7 @@ class GuidedPopulation(Population):
             batch = max(1, len(self.trainer.dataset))
             if self.generation == 0:
                 self.reporters.info("Running initial SCAE warmup (100 epochs)")
-                self.trainer.train(epochs=100, batch_size=batch, generation=self.generation)
+                self.trainer.train(epochs=10, batch_size=batch, generation=self.generation)
             elif self.generation < gen_for_full_train_resize:
                 self.trainer.train(epochs=50, batch_size=batch, generation=self.generation)
             else:

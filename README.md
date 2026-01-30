@@ -179,7 +179,8 @@ Adaptive metric scaling for the fitness predictor uses a learned log-variance pe
 Each metric’s squared canonical error is modulated by `exp(-s_i)` and regularized by `s_i`, where `s_i` is the head’s log variance parameter (initialized at 0).
 This keeps gradients for wildly different metrics (e.g., memory cost vs. AU task reward) much closer to the same numeric range without relying on per-generation normalization and still allows `metric_guidance_weights` to express explicit preferences.
 
-Tether the latent search to the posterior (L2 penalty on deviation from the encoded seed) so that z_g stays in regions where the decoder was trained to emit real graphs.
+*Learnable latent tether.* Guided decoding now keeps each latent within the encoder’s posterior by penalizing `||z_g - z_g^0||_2` with a softplus-parameterized weight that is optimized alongside the latents (and softly regularized toward a prior).
+This lets “trust region” radii expand for confident tasks and tighten whenever the decoder starts collapsing to empty graphs.
 
 ## Other Papers that Might be Useful
 - [On the Relationship Between Variational Inference and Auto-Associative Memory](https://arxiv.org/pdf/2210.08013.pdf)
