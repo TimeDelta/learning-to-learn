@@ -13,9 +13,9 @@ attribute_add_prob      = 0.03
 attribute_delete_prob   = 0.03
 
 conn_add_prob         = 0.5
-conn_delete_prob      = 0.5
+conn_delete_prob      = 0.05
 node_add_prob         = 0.2
-node_delete_prob      = 0.2
+node_delete_prob      = 0.02
 
 node_type_mutate_rate = 0.01
 
