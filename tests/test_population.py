@@ -17,11 +17,11 @@ from population import GuidedPopulation
 from relative_rank_stagnation import RelativeRankStagnation
 from reproduction import GuidedReproduction
 from search_space_compression import (
+    FitnessPredictor,
     GraphEncoder,
     NodeAttributeDeepSetEncoder,
     OnlineTrainer,
     SharedAttributeVocab,
-    TaskConditionedFitnessPredictor,
     flatten_task_features,
 )
 from tasks import RegressionTask
@@ -158,39 +158,19 @@ def test_generate_guided_offspring_handles_missing_elites():
         assert isinstance(child, OptimizerGenome)
 
 
-def test_trainer_handles_variable_fitness_dims():
-    config = make_config()
-    pop = GuidedPopulation(config)
-    task = RegressionTask.random_init(num_samples=4, silent=True)
+def test_fitness_predictor_returns_per_metric_log_scales():
+    predictor = FitnessPredictor(latent_dim=4, hidden_dim=8, fitness_dim=3)
+    z_graph = torch.randn(5, 4)
+    predictor.log_metric_scale.data = torch.tensor([0.1, -0.2, 0.05])
 
-    class DummyMetric:
-        def __init__(self, name):
-            self.name = name
-            self.objective = "min"
+    preds, log_scales = predictor(z_graph)
 
-    graph = pop.genome_to_data(create_simple_genome())
-    pop.trainer.add_data([graph], [{DummyMetric("m1"): 0.1}], task.name(), task.features)
-    assert pop.trainer.max_fitness_dim == 1
-
-    graph2 = pop.genome_to_data(create_simple_genome())
-    pop.trainer.add_data([graph2], [{DummyMetric("m1"): 0.2, DummyMetric("m2"): 0.3}], task.name(), task.features)
-    assert pop.trainer.max_fitness_dim == 2
-    assert pop.trainer.dataset[0].y.numel() == 2
-
-
-def test_task_conditioned_predictor_builds_per_task_heads():
-    predictor = TaskConditionedFitnessPredictor(latent_dim=4, hidden_dim=8)
-    z_graph = torch.randn(3, 2)
-    z_task = torch.randn(3, 2)
-    task_types = torch.tensor([0, 1, 0], dtype=torch.long)
-    fitness_dims = torch.tensor([1, 2, 1], dtype=torch.long)
-
-    outputs = predictor(z_graph, z_task, task_types, fitness_dims)
-    assert outputs.shape == (3, 2)
-    assert torch.allclose(outputs[task_types == 0, 1], torch.zeros(2))
-
-    head_out = predictor.predict_task(1, 2, z_graph[:1], z_task[:1])
-    assert head_out.shape == (1, 2)
+    assert preds.shape == (5, 3)
+    assert log_scales.shape == (5, 3)
+    # All rows should share the learned scale parameters
+    expected = predictor.log_metric_scale.detach()
+    assert torch.allclose(log_scales[0], expected)
+    assert torch.allclose(log_scales, expected.unsqueeze(0).expand_as(log_scales))
 
 
 def test_flatten_task_features_respects_expected_length():
@@ -207,44 +187,6 @@ def test_flatten_task_features_respects_expected_length():
     flat_long = flatten_task_features(features_long, expected_len=4)
     assert flat_long.shape[0] == 4
     assert np.allclose(flat_long, np.arange(4))
-
-
-def test_online_trainer_aligns_predictions_to_mask():
-    pred = torch.randn(2, 2)
-    mask = torch.ones(2, 4)
-    aligned = OnlineTrainer._align_pred_to_mask(pred, mask)
-    assert aligned.shape[1] == 4
-    assert torch.allclose(aligned[:, :2], pred)
-    assert torch.allclose(aligned[:, 2:], torch.zeros(2, 2))
-
-    mask_small = torch.ones(2, 1)
-    aligned_small = OnlineTrainer._align_pred_to_mask(pred, mask_small)
-    assert aligned_small.shape[1] == 1
-
-    # handle 1-D predictions/masks gracefully
-    one_d_pred = torch.randn(2)
-    one_d_mask = torch.ones(4)
-    aligned_one_d = OnlineTrainer._align_pred_to_mask(one_d_pred, one_d_mask)
-    assert aligned_one_d.shape == (2, 4)
-
-
-def test_trainer_normalizes_task_feature_shapes():
-    config = make_config()
-    pop = GuidedPopulation(config)
-    graph = pop.genome_to_data(create_simple_genome())
-
-    class DummyMetric:
-        def __init__(self, name):
-            self.name = name
-            self.objective = "min"
-
-    task = RegressionTask.random_init(num_samples=4, silent=True)
-    pop.trainer.add_data([graph], [{DummyMetric("m1"): 0.1}], task.name(), task.features)
-
-    data = pop.trainer.dataset[0]
-    data.task_features = torch.randn(72)  # emulate legacy 1-D storage
-    pop.trainer._normalize_task_feature_shapes()
-    assert data.task_features.dim() == 2
 
 
 def test_graph_encoder_pads_trailing_empty_graphs():

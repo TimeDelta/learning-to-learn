@@ -8,7 +8,7 @@ import tracemalloc
 import weakref
 from collections import Counter
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Sequence
 from warnings import warn
 
 import torch
@@ -66,8 +66,11 @@ class GuidedPopulation(Population):
         super().__init__(config)
         _register_invalid_reason_reporter()
         graph_latent_dim = 16
-        task_latent_dim = 10
         num_node_types = 10
+        self.task = RegressionTask.random_init()
+        self.metric_keys = self._evaluation_metric_keys(self.task)
+        self.metric_best_values = self._metric_best_values(self.metric_keys)
+        self.metric_guidance_weights = self._metric_guidance_weights(self.metric_keys)
         self.shared_attr_vocab = SharedAttributeVocab([], 50)
         # Keep attribute-name embeddings high-dimensional (50d) while compressing the
         # DeepSet attribute summaries down to 20d per node before DAG attention.
@@ -77,20 +80,17 @@ class GuidedPopulation(Population):
         graph_encoder = GraphEncoder(
             len(NODE_TYPE_OPTIONS), attr_encoder, latent_dim=graph_latent_dim, hidden_dims=[32, 32]
         )
-        task_encoder = TasksEncoder(
-            hidden_dim=16, latent_dim=task_latent_dim, type_embedding_dim=max(len(TASK_FEATURE_DIMS) // 2, 1)
-        )
         decoder = GraphDecoder(len(NODE_TYPE_OPTIONS), graph_latent_dim, self.shared_attr_vocab)
-        predictor = TaskConditionedFitnessPredictor(latent_dim=graph_latent_dim + task_latent_dim, hidden_dim=64)
+        predictor = FitnessPredictor(latent_dim=graph_latent_dim, hidden_dim=64, fitness_dim=len(self.metric_keys))
 
-        self.guide = SelfCompressingFitnessRegularizedDAGVAE(graph_encoder, task_encoder, decoder, predictor)
+        self.guide = SelfCompressingFitnessRegularizedDAGVAE(graph_encoder, decoder, predictor)
         self.optimizer = torch.optim.Adam(self.guide.parameters(), lr=0.001)
-        self.trainer = OnlineTrainer(self.guide, self.optimizer)
+        self.trainer = OnlineTrainer(self.guide, self.optimizer, metric_keys=self.metric_keys)
         stagnation = config.stagnation_type(config.stagnation_config, self.reporters)
         self.reproduction = GuidedReproduction(config.reproduction_config, self.reporters, stagnation)
         self.reproduction.guide_fn = self.generate_guided_offspring
-        self.reproduction.optimizer_validator = lambda optimizer, task: self._optimizer_updates_parameters(
-            optimizer, task, check_steps=1
+        self.reproduction.optimizer_validator = lambda optimizer: self._optimizer_updates_parameters(
+            optimizer, check_steps=1
         )
         self._initial_compression_done = False
         self._enable_initial_compression = getattr(config, "enable_initial_compression", False)
@@ -203,7 +203,6 @@ class GuidedPopulation(Population):
 
     def generate_guided_offspring(
         self,
-        task,
         starting_genomes: List[OptimizerGenome],
         config,
         n_offspring: int = 10,
@@ -218,20 +217,10 @@ class GuidedPopulation(Population):
         the surrogate predictor, decode each optimized z_g back into a DAG, then
         convert those DAGs into new NEAT genomes.
         """
-        task_type = task.name()
-        task_type_id = TASK_TYPE_TO_INDEX[task_type]
-        metric_keys = self._evaluation_metric_keys(task)
-        metric_best_values = self._metric_best_values(metric_keys)
-        metric_guidance_weights = self._metric_guidance_weights(metric_keys)
+        metric_keys = self.metric_keys
+        metric_best_values = self.metric_best_values
+        metric_guidance_weights = self.metric_guidance_weights
         metric_dim = len(metric_keys)
-        self.trainer.remember_task_signature(
-            task_type, task.features, metric_dim, metric_best_values, metric_guidance_weights
-        )
-        expected_len = TASK_FEATURE_DIMS[task_type]
-        flat_features = flatten_task_features(task.features, expected_len)
-        mu_t, lv_t = self.guide.tasks_encoder(torch.tensor([task_type_id], dtype=torch.long), [flat_features])
-        z_t = self.guide.reparameterize(mu_t, lv_t, self.guide.tasks_latent_mask).detach()
-        z_t = z_t.expand(n_offspring, -1).clone()
 
         # 2) Initialize random graph latents and set requires_grad=True
         graph_latent_dim = self.guide.graph_encoder.latent_dim
@@ -282,70 +271,31 @@ class GuidedPopulation(Population):
         if total_latents == 0:
             return []
 
-        head_specs = self.guide.available_task_heads()
-        if not head_specs:
-            head_specs = [(task_type_id, metric_dim)]
-        elif task_type_id not in {tid for tid, _ in head_specs}:
-            head_specs.append((task_type_id, metric_dim))
+        predictor_dim = self.guide.fitness_predictor.output_dim
 
-        head_latents = []
-        for head_task_id, head_dim in head_specs:
-            features = self.trainer.get_task_features(head_task_id)
-            if features is None:
-                if head_task_id == task_type_id:
-                    features = flat_features
-                else:
-                    continue
-            mu_t_head, lv_t_head = self.guide.tasks_encoder(torch.tensor([head_task_id], dtype=torch.long), [features])
-            z_t_head = self.guide.reparameterize(mu_t_head, lv_t_head, self.guide.tasks_latent_mask).detach()
-            best_values = self.trainer.get_metric_best_values(head_task_id)
-            if best_values is not None:
-                best_list = list(best_values)
-            elif head_task_id == task_type_id:
-                best_list = list(metric_best_values)
-            else:
-                best_list = [0.0] * head_dim
-            best_tensor = torch.as_tensor(best_list, dtype=z_g.dtype, device=z_g.device)
-            if best_tensor.numel() < head_dim:
-                best_tensor = F.pad(best_tensor, (0, head_dim - best_tensor.numel()))
-            elif best_tensor.numel() > head_dim:
-                best_tensor = best_tensor[:head_dim]
-            weight_values = self.trainer.get_metric_guidance_weights(head_task_id)
-            if weight_values is not None:
-                weight_list = list(weight_values)
-            elif head_task_id == task_type_id:
-                weight_list = list(metric_guidance_weights)
-            else:
-                weight_list = [1.0] * head_dim
-            weight_tensor = torch.as_tensor(weight_list, dtype=z_g.dtype, device=z_g.device)
-            if weight_tensor.numel() < head_dim:
-                weight_tensor = F.pad(weight_tensor, (0, head_dim - weight_tensor.numel()), value=1.0)
-            elif weight_tensor.numel() > head_dim:
-                weight_tensor = weight_tensor[:head_dim]
-            head_latents.append(
-                (head_task_id, head_dim, z_t_head.expand(total_latents, -1).clone(), best_tensor, weight_tensor)
-            )
+        def pad_metric_tensor(values: Sequence[float], fill_value: float) -> torch.Tensor:
+            tensor = torch.as_tensor(values, dtype=z_g.dtype, device=z_g.device)
+            if tensor.numel() < predictor_dim:
+                tensor = F.pad(tensor, (0, predictor_dim - tensor.numel()), value=fill_value)
+            elif tensor.numel() > predictor_dim:
+                tensor = tensor[:predictor_dim]
+            return tensor
 
-        if not head_latents:
-            head_latents.append(
-                (
-                    task_type_id,
-                    metric_dim,
-                    z_t,
-                    torch.as_tensor(metric_best_values, dtype=z_g.dtype, device=z_g.device),
-                    torch.as_tensor(metric_guidance_weights, dtype=z_g.dtype, device=z_g.device),
-                )
-            )
+        best_tensor = pad_metric_tensor(metric_best_values, 0.0)
+        weight_tensor = pad_metric_tensor(metric_guidance_weights, 1.0)
+        if best_tensor.dim() == 1:
+            best_tensor = best_tensor.unsqueeze(0)
+        if weight_tensor.dim() == 1:
+            weight_tensor = weight_tensor.unsqueeze(0)
+        best_tensor = best_tensor.expand(total_latents, -1)
+        weight_tensor = weight_tensor.expand(total_latents, -1)
 
         opt = torch.optim.Adam([z_g], lr=latent_lr)
         for _ in range(latent_steps):
-            loss_terms = []
-            for head_task_id, head_dim, z_t_head, best_tensor, weight_tensor in head_latents:
-                pred = self.guide.predict_task_head(head_task_id, head_dim, z_g, z_t_head)
-                canonical = canonical_log_distance(pred, best_tensor)
-                weighted = canonical.pow(2) * weight_tensor
-                loss_terms.append(weighted.sum(dim=1).mean())
-            loss = torch.stack(loss_terms).sum()
+            pred, _ = self.guide.fitness_predictor(z_g)
+            canonical = canonical_log_distance(pred, best_tensor)
+            weighted = canonical.pow(2) * weight_tensor
+            loss = weighted.sum(dim=1).mean()
             if latent_tether_weight > 0:
                 tether = F.mse_loss(z_g, z_g_initial)
                 loss = loss + latent_tether_weight * tether
@@ -495,11 +445,11 @@ class GuidedPopulation(Population):
         self._accumulate_guided_offspring_stats(total_requested, len(new_genomes), invalid_reason_counts)
         return new_genomes
 
-    def _optimizer_updates_parameters(self, optimizer, task, check_steps=2, delta_eps=1e-12):
+    def _optimizer_updates_parameters(self, optimizer, check_steps=2, delta_eps=1e-12):
         """Run a short dry-run to ensure the optimizer changes model weights."""
 
         try:
-            model = ManyLossMinimaModel(task.train_data.num_input_features)
+            model = ManyLossMinimaModel(self.task.train_data.num_input_features)
         except Exception:
             return True
 
@@ -511,7 +461,7 @@ class GuidedPopulation(Population):
         baseline = {name: param.detach().clone() for name, param in named_params}
 
         for _ in range(max(1, check_steps)):
-            metrics = task.evaluate_metrics(model, task.train_data)
+            metrics = self.task.evaluate_metrics(model, self.task.train_data)
             if not torch.isfinite(metrics).all():
                 break
             prev = torch.zeros_like(metrics) if prev_metrics is None else prev_metrics
@@ -556,14 +506,11 @@ class GuidedPopulation(Population):
             self.reporters.start_generation(self.generation)
             self._reset_guided_offspring_stats()
 
-            task_type = random.choice(list(TASK_TYPE_TO_CLASS.keys()))
-            task = TASK_TYPE_TO_CLASS[task_type].random_init()
-
             # Evaluate real fitness. Using too few update steps makes every optimizer look identical,
             # so clamp to a minimum to expose behavioral differences early in the run.
             eval_steps = max(2 * self.generation, 25)
-            print(f"Evaluating genomes on {task.name()} for {eval_steps} steps")
-            self.eval_genomes(list(self.population.items()), self.config, task, steps=eval_steps)
+            print(f"Evaluating genomes on {self.task.name()} for {eval_steps} steps")
+            self.eval_genomes(list(self.population.items()), self.config, self.task, steps=eval_steps)
 
             # Termination check
             if not self.config.no_fitness_termination:
@@ -585,13 +532,11 @@ class GuidedPopulation(Population):
                     valid_graphs.append(data)
                     valid_fits.append(genome.fitnesses)
             if valid_graphs:
-                self.trainer.add_data(valid_graphs, valid_fits, task_type, task.features)
+                self.trainer.add_data(valid_graphs, valid_fits)
             if invalid_graphs:
                 self.trainer.add_data(
                     invalid_graphs,
                     invalid_fits,
-                    task_type,
-                    task.features,
                     invalid_flags=[True] * len(invalid_graphs),
                 )
 
@@ -607,7 +552,7 @@ class GuidedPopulation(Population):
 
             # Build next‐gen population by species
             self.population = self.reproduction.reproduce(
-                self.config, self.species, self.config.pop_size, self.generation, task
+                self.config, self.species, self.config.pop_size, self.generation, self.task
             )
 
             # Handle possible extinction

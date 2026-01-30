@@ -4,15 +4,15 @@ import random
 import time
 import tracemalloc
 
-import mlflow
 import numpy as np
 import torch
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 
+import mlflow
 from attributes import BoolAttribute, FloatAttribute, IntAttribute, StringAttribute
 from genes import NODE_TYPE_TO_INDEX
-from metrics import MSELoss
+from metrics import MSELoss, sort_metrics_by_name
 from models import ManyLossMinimaModel
 from search_space_compression import (
     AsyncGraphEncoder,
@@ -23,9 +23,8 @@ from search_space_compression import (
     OnlineTrainer,
     SelfCompressingFitnessRegularizedDAGVAE,
     SharedAttributeVocab,
-    TasksEncoder,
 )
-from tasks import TASK_TYPE_TO_CLASS, TASK_TYPE_TO_INDEX
+from tasks import TASK_TYPE_TO_CLASS
 
 # default until dataset generation sets real number of fitness dimensions
 fitness_dim = 1
@@ -114,11 +113,6 @@ def evaluate_fitness_loss(model, graphs, fitnesses, task_type, task_features, ba
         data = graph.clone()
         fitness = [f[1] for f in sorted(fitness_dict.items(), key=lambda item: item[0].name)]
         data.y = torch.tensor(fitness, dtype=torch.float)
-        data.task_type = torch.tensor([TASK_TYPE_TO_INDEX[task_type]], dtype=torch.long)
-        if isinstance(task_features, torch.Tensor):
-            data.task_features = task_features.detach().cpu().tolist()
-        else:
-            data.task_features = list(task_features)
         dataset.append(data)
 
     loader = DataLoader(dataset, batch_size=batch_size)
@@ -133,8 +127,8 @@ def evaluate_fitness_loss(model, graphs, fitnesses, task_type, task_features, ba
                 batch.edge_index,
                 batch.node_attributes,
                 batch.batch,
-                batch.task_type,
-                batch.task_features,
+                teacher_attr_targets=None,
+                num_graphs=batch.num_graphs,
             )
             loss = torch.nn.functional.mse_loss(pred, batch.y.to(device))
             losses.append(loss.item())
@@ -157,13 +151,13 @@ def train_model(encoder_cls, full_dataset, random_seed, val_ratio=0.2):
 
     attr_encoder = NodeAttributeDeepSetEncoder(shared_attr_vocab, 10, 20, 20)
     graph_encoder = encoder_cls(num_node_types, attr_encoder, graph_latent_dim, hidden_dims=[16])
-    task_encoder = TasksEncoder(hidden_dim=16, latent_dim=task_latent_dim, type_embedding_dim=8)
     decoder = GraphDecoder(num_node_types, graph_latent_dim, shared_attr_vocab)
-    predictor = FitnessPredictor(latent_dim=graph_latent_dim + task_latent_dim, hidden_dim=32, fitness_dim=fitness_dim)
-    model = SelfCompressingFitnessRegularizedDAGVAE(graph_encoder, task_encoder, decoder, predictor)
+    predictor = FitnessPredictor(latent_dim=graph_latent_dim, hidden_dim=32, fitness_dim=fitness_dim)
+    model = SelfCompressingFitnessRegularizedDAGVAE(graph_encoder, decoder, predictor)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    trainer = OnlineTrainer(model, optimizer)
-    trainer.add_data(train_graphs, train_fitnesses, task_type, task_features)
+    metric_keys = sort_metrics_by_name(train_fitnesses[0].keys()) if train_fitnesses else []
+    trainer = OnlineTrainer(model, optimizer, metric_keys=metric_keys)
+    trainer.add_data(train_graphs, train_fitnesses)
 
     loss_history = trainer.train(epochs=10, batch_size=4, warmup_epochs=10, verbose=True)
     train_losses = [lh.sum().item() for lh in loss_history]
@@ -185,7 +179,6 @@ if __name__ == "__main__":
 
     num_node_types = len(NODE_TYPE_TO_INDEX)
     graph_latent_dim = 16
-    task_latent_dim = 8
 
     res_attention_final = []
     res_attention_auc = []

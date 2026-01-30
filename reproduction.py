@@ -154,10 +154,9 @@ class GuidedReproduction(DefaultReproduction):
                                         "NEAT offspring produced an empty graph after mutation; consider adjusting mutation rates."
                                     )
                             optimizer = getattr(child, "optimizer", None)
-                            if self.optimizer_validator is not None and optimizer is not None and task is not None:
-                                optimizer_valid = self.optimizer_validator(optimizer, task)
-                                if not optimizer_valid:
-                                    warn("NEAT offspring optimizer failed parameter-update check; retrying mutation.")
+                            optimizer_valid = self.optimizer_validator(optimizer)
+                            if not optimizer_valid:
+                                warn("NEAT offspring optimizer failed parameter-update check; retrying mutation.")
                         if not optimizer_valid:
                             continue
                         new_population[cid] = child
