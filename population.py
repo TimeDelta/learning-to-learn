@@ -680,7 +680,34 @@ class GuidedPopulation(Population):
             validation_metrics[AreaUnderTaskMetrics] = area_under_metrics
             validation_metrics[TimeCost] = time_cost
             validation_metrics[MemoryCost] = mem_cost
-            raw_metrics[genome_id] = validation_metrics
+
+            # Guard against accidental over-long/unnamed fitness vectors by
+            # stripping any keys that are not part of the expected metric list.
+            filtered_metrics: Dict[Metric, float] = {}
+            missing_metrics = []
+            for metric in metric_keys:
+                value = validation_metrics.get(metric)
+                if value is None:
+                    missing_metrics.append(metric.name if hasattr(metric, "name") else str(metric))
+                    filtered_metrics[metric] = self.INVALID_METRIC_VALUE
+                else:
+                    filtered_metrics[metric] = value
+
+            extra_keys = [key for key in validation_metrics.keys() if key not in filtered_metrics]
+            if missing_metrics:
+                warn(
+                    "Evaluation skipped Metrics (%s); filling with penalty values." % ", ".join(sorted(missing_metrics))
+                )
+            if extra_keys:
+                warn(
+                    "Evaluation produced unexpected Metrics for genome %s: %s; dropping extras."
+                    % (
+                        genome_id,
+                        ", ".join(sorted(str(key) for key in extra_keys)),
+                    )
+                )
+
+            raw_metrics[genome_id] = filtered_metrics
 
         if not raw_metrics:
             self.reporters.info(
