@@ -211,6 +211,7 @@ class GuidedPopulation(Population):
         latent_lr: float = 1e-2,
         max_decode_attempts: int = 5,
         decode_jitter_std: float = 0.05,
+        latent_tether_weight: float = 1e-3,
     ) -> List[OptimizerGenome]:
         """
         For a fixed (task_type, task_features), optimize `z_g` in latent space to maximize
@@ -274,6 +275,8 @@ class GuidedPopulation(Population):
             z_g = torch.cat([z_g_encoded, z_g_random], dim=0).clone().detach().requires_grad_(True)
         else:
             z_g = z_g_encoded
+
+        z_g_initial = z_g.detach().clone()
 
         total_latents = z_g.size(0)
         if total_latents == 0:
@@ -343,6 +346,9 @@ class GuidedPopulation(Population):
                 weighted = canonical.pow(2) * weight_tensor
                 loss_terms.append(weighted.sum(dim=1).mean())
             loss = torch.stack(loss_terms).sum()
+            if latent_tether_weight > 0:
+                tether = F.mse_loss(z_g, z_g_initial)
+                loss = loss + latent_tether_weight * tether
             opt.zero_grad()
             loss.backward()
             opt.step()

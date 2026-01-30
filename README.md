@@ -179,6 +179,8 @@ Adaptive metric scaling for the fitness predictor uses a learned log-variance pe
 Each metric’s squared canonical error is modulated by `exp(-s_i)` and regularized by `s_i`, where `s_i` is the head’s log variance parameter (initialized at 0).
 This keeps gradients for wildly different metrics (e.g., memory cost vs. AU task reward) much closer to the same numeric range without relying on per-generation normalization and still allows `metric_guidance_weights` to express explicit preferences.
 
+Tether the latent search to the posterior (L2 penalty on deviation from the encoded seed) so that z_g stays in regions where the decoder was trained to emit real graphs.
+
 ## Other Papers that Might be Useful
 - [On the Relationship Between Variational Inference and Auto-Associative Memory](https://arxiv.org/pdf/2210.08013.pdf)
   - "In order to improve the memory capacity, modern Hopfield networks [22, 21, 8] propose several variants of the energy function using polynomial or exponential interactions.
