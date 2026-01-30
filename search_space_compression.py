@@ -529,6 +529,7 @@ class GraphDecoder(nn.Module):
         shared_attr_vocab: SharedAttributeVocab,
         hidden_dim: int = 128,
         gdn_layers: int = 2,
+        edge_threshold: float = 0.5,
     ):
         super().__init__()
         self.shared_attr_vocab = shared_attr_vocab
@@ -559,6 +560,7 @@ class GraphDecoder(nn.Module):
         self.gdns = nn.ModuleList([GraphDeconvNet(hidden_dim, hidden_dim) for _ in range(gdn_layers)])
         self.max_nodes = 1000
         self.max_attributes_per_node = 50
+        self.edge_threshold = edge_threshold
         # Encourage attribute decoder to terminate by progressively biasing the EOS logit.
         self.attr_eos_bias_base = 0.0
         self.attr_eos_bias_slope = 0.1
@@ -667,7 +669,7 @@ class GraphDecoder(nn.Module):
                             hidden_edge = self.edge_rnn(edge_in, hidden_edge)
                             p_edge = torch.sigmoid(self.edge_head(hidden_edge)).view(-1)
                             p_edge = torch.nan_to_num(p_edge, nan=0.0).clamp(0.0, 1.0)
-                            if torch.bernoulli(p_edge).item() == 1:
+                            if bool((p_edge > self.edge_threshold).item()):
                                 edges.append([i, t])
                             edge_in = p_edge.unsqueeze(0)
                         t += 1
