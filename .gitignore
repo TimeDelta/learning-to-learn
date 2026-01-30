@@ -1,2 +1,6 @@
 **/__pycache__
 mlflow/
+mlruns/
+mlartifacts/
+mlflow.db
+debug_guided_offspring/
