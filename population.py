@@ -203,7 +203,7 @@ class GuidedPopulation(Population):
 
     def generate_guided_offspring(
         self,
-        starting_genomes: List[OptimizerGenome],
+        starting_genomes: Sequence[OptimizerGenome],
         config,
         n_offspring: int = 10,
         latent_steps: int = 50,
@@ -334,6 +334,7 @@ class GuidedPopulation(Population):
         rebuild_failures = 0
         resample_attempts = 0
         inactive_optimizer_count = 0
+        missing_slot_rejections = 0
         debug_dir = Path("debug_guided_offspring")
         debug_dir.mkdir(parents=True, exist_ok=True)
         debug_save_limit = 5
@@ -381,7 +382,7 @@ class GuidedPopulation(Population):
                         "Guided offspring decoder produced an empty graph (no edges); assigning penalty fitness and skipping evaluation."
                     )
                     genome.graph_dict = graph_dict
-                    self._assign_penalty(genome, task, reason="empty_graph", skip_evaluation=True)
+                    self._assign_penalty(genome, self.task, reason="empty_graph", skip_evaluation=True)
                     invalid_reason_counts["empty_graph"] += 1
                     new_genomes.append(genome)
                     accepted = True
@@ -398,9 +399,35 @@ class GuidedPopulation(Population):
                     warn("Guided offspring decoder produced a duplicate graph; skipping to preserve diversity.")
                     break
 
+                slot_ok, slot_details = self._graph_output_slot_coverage(graph_dict)
+                if not slot_ok:
+                    missing_slot_rejections += 1
+                    detail_parts = []
+                    missing_slots = slot_details.get("missing_slots", [])
+                    slot_attrs = slot_details.get("attributes", {})
+                    for slot_idx in missing_slots:
+                        attr_names = slot_attrs.get(slot_idx) or []
+                        attrs_summary = ",".join(attr_names) if attr_names else "<none>"
+                        detail_parts.append(f"slot{slot_idx}[attrs={attrs_summary}]")
+                    message = "Guided offspring graph never routed into optimizer outputs; " + (
+                        "; ".join(detail_parts) if detail_parts else "no slot metadata available"
+                    )
+                    if attempt < max_decode_attempts:
+                        self.reporters.info(message + " -- resampling latent")
+                        base = best_nonempty_latent if best_nonempty_latent is not None else latent
+                        latent = base + torch.randn_like(base) * decode_jitter_std
+                        resample_attempts += 1
+                        continue
+                    warn(message + "; assigning penalty fitness.")
+                    genome.graph_dict = graph_dict
+                    self._assign_penalty(genome, self.task, reason="missing_output_slots", skip_evaluation=True)
+                    invalid_reason_counts["missing_output_slots"] += 1
+                    new_genomes.append(genome)
+                    break
+
                 optimizer = rebuild_and_script(graph_dict, self.config.genome_config, key=i, genome=genome)
                 if optimizer:
-                    if not self._optimizer_updates_parameters(optimizer, task, check_steps=2):
+                    if not self._optimizer_updates_parameters(optimizer, self.task, check_steps=2):
                         inactive_optimizer_count += 1
                         if attempt < max_decode_attempts:
                             base = best_nonempty_latent if best_nonempty_latent is not None else latent
@@ -411,7 +438,7 @@ class GuidedPopulation(Population):
                             "Guided offspring optimizer failed to modify model parameters; skipping child after retries."
                         )
                         genome.graph_dict = graph_dict
-                        self._assign_penalty(genome, task, reason="inactive_optimizer", skip_evaluation=True)
+                        self._assign_penalty(genome, self.task, reason="inactive_optimizer", skip_evaluation=True)
                         invalid_reason_counts["inactive_optimizer"] += 1
                         new_genomes.append(genome)
                         break
@@ -445,6 +472,8 @@ class GuidedPopulation(Population):
             )
         if rebuild_failures:
             warn(f"Guided offspring decoder rebuild failures: {rebuild_failures}")
+        if missing_slot_rejections:
+            warn(f"Guided offspring decoder graphs missing optimizer output coverage: {missing_slot_rejections}")
         if inactive_optimizer_count:
             warn(f"Guided offspring optimizers with no parameter updates: {inactive_optimizer_count}")
 
@@ -468,6 +497,52 @@ class GuidedPopulation(Population):
 
         self._accumulate_guided_offspring_stats(total_requested, len(new_genomes), invalid_reason_counts)
         return new_genomes
+
+    def _graph_output_slot_coverage(self, graph_dict):
+        output_keys = list(getattr(self.config.genome_config, "output_keys", []))
+        if not output_keys:
+            return True, {"missing_slots": [], "attributes": {}, "referenced_slots": []}
+
+        edge_index = graph_dict.get("edge_index")
+        if edge_index is None:
+            details = {"missing_slots": output_keys, "attributes": {}, "referenced_slots": []}
+            return False, details
+
+        try:
+            if isinstance(edge_index, torch.Tensor):
+                edge_tensor = edge_index.detach().long()
+            else:
+                edge_tensor = torch.as_tensor(edge_index, dtype=torch.long)
+        except Exception:
+            details = {"missing_slots": output_keys, "attributes": {}, "referenced_slots": []}
+            return False, details
+
+        if edge_tensor.dim() == 1:
+            edge_tensor = edge_tensor.view(2, -1)
+        elif edge_tensor.dim() != 2 or edge_tensor.size(0) != 2:
+            details = {"missing_slots": output_keys, "attributes": {}, "referenced_slots": []}
+            return False, details
+
+        referenced = set()
+        if edge_tensor.numel() > 0:
+            referenced.update(int(v) for v in edge_tensor[1].flatten().tolist())
+
+        missing = [int(ok) for ok in output_keys if int(ok) not in referenced]
+        attr_lookup = {}
+        node_attrs = graph_dict.get("node_attributes") or []
+        for slot in missing:
+            if 0 <= slot < len(node_attrs):
+                attrs = node_attrs[slot] or {}
+                if isinstance(attrs, dict):
+                    names = sorted(attribute_key_to_name(name) for name in attrs.keys())
+                else:
+                    names = []
+            else:
+                names = []
+            attr_lookup[slot] = names
+
+        details = {"missing_slots": missing, "attributes": attr_lookup, "referenced_slots": sorted(referenced)}
+        return len(missing) == 0, details
 
     def _optimizer_updates_parameters(self, optimizer, check_steps=2, delta_eps=1e-12):
         """Run a short dry-run to ensure the optimizer changes model weights."""
@@ -534,7 +609,7 @@ class GuidedPopulation(Population):
             # so clamp to a minimum to expose behavioral differences early in the run.
             eval_steps = max(2 * self.generation, 25)
             print(f"Evaluating genomes on {self.task.name()} for {eval_steps} steps")
-            self.eval_genomes(list(self.population.items()), self.config, self.task, steps=eval_steps)
+            self.eval_genomes(list(self.population.items()), self.config, steps=eval_steps)
 
             # Termination check
             if not self.config.no_fitness_termination:
@@ -567,7 +642,7 @@ class GuidedPopulation(Population):
             batch = max(1, len(self.trainer.dataset))
             if self.generation == 0:
                 self.reporters.info("Running initial SCAE warmup (100 epochs)")
-                self.trainer.train(epochs=10, batch_size=batch, generation=self.generation)
+                self.trainer.train(epochs=100, batch_size=batch, generation=self.generation)
             elif self.generation < gen_for_full_train_resize:
                 self.trainer.train(epochs=50, batch_size=batch, generation=self.generation)
             else:
@@ -604,22 +679,22 @@ class GuidedPopulation(Population):
         self.reporters.found_solution(self.config, self.generation, best)
         return best
 
-    def eval_genomes(self, genomes, config, task, steps=10, epsilon=1e-10):
+    def eval_genomes(self, genomes, config, steps=10, epsilon=1e-10):
         """
         Evaluate each genome by using its network as a meta–optimizer.
         """
-        metric_keys = self._evaluation_metric_keys(task)
+        metric_keys = self._evaluation_metric_keys(self.task)
         raw_metrics: Dict[int, Dict[str, float]] = {}
         invalid_genomes: List[int] = []
         invalid_reason_counts: Counter = Counter()
         genome_map = {gid: g for gid, g in genomes}
 
-        model = ManyLossMinimaModel(task.train_data.num_input_features)
+        model = ManyLossMinimaModel(self.task.train_data.num_input_features)
         for genome_id, genome in genomes:
             if getattr(genome, "skip_evaluation", False):
                 self._assign_penalty(
                     genome_map[genome_id],
-                    task,
+                    self.task,
                     reason=getattr(genome, "invalid_reason", "empty_graph"),
                     skip_evaluation=True,
                 )
@@ -627,12 +702,12 @@ class GuidedPopulation(Population):
                 invalid_reason_counts[reason] += 1
                 invalid_genomes.append(genome_id)
                 continue
-            model_copy = type(model)(task.train_data.num_input_features)
+            model_copy = type(model)(self.task.train_data.num_input_features)
             model_copy.load_state_dict(model.state_dict())
             print(f"  Evaluating {genome_id} ({genome.optimizer_path})")
-            result = self.evaluate_optimizer(genome.optimizer, model_copy, task, steps)
+            result = self.evaluate_optimizer(genome.optimizer, model_copy, steps)
             if result is None:
-                penalty_metrics = self._assign_penalty(genome_map[genome_id], task)
+                penalty_metrics = self._assign_penalty(genome_map[genome_id])
                 reason = getattr(genome_map[genome_id], "invalid_reason", "invalid_graph")
                 invalid_reason_counts[reason] += 1
                 invalid_genomes.append(genome_id)
@@ -745,8 +820,10 @@ class GuidedPopulation(Population):
             self.reporters.info(f"Invalid guided offspring reasons: {parts}")
         return genomes
 
-    def _assign_penalty(self, genome, task, reason="invalid_graph", skip_evaluation=False):
-        validation_metrics = {m: (1 if m.objective == "min" else -1) * self.INVALID_METRIC_VALUE for m in task.metrics}
+    def _assign_penalty(self, genome, reason="invalid_graph", skip_evaluation=False):
+        validation_metrics = {
+            m: (1 if m.objective == "min" else -1) * self.INVALID_METRIC_VALUE for m in self.task.metrics
+        }
         validation_metrics[AreaUnderTaskMetrics] = self.INVALID_METRIC_VALUE
         validation_metrics[TimeCost] = self.INVALID_METRIC_VALUE
         validation_metrics[MemoryCost] = self.INVALID_METRIC_VALUE
@@ -759,14 +836,13 @@ class GuidedPopulation(Population):
         _INVALID_REASON_COUNTER[reason] += 1
         return validation_metrics
 
-    def evaluate_optimizer(self, optimizer, model, task, steps=10):
+    def evaluate_optimizer(self, optimizer, model, steps=10):
         """
         Runs the optimizer over a number of steps.
 
         Args:
           optimizer: A TorchScript JIT Graph instance that updates parameters.
           model: The model whose performance is measured by the provided task.
-          task: The task on which to evaluate the optimizer.
           steps: Number of update iterations.
         """
         # Each evaluation should start from a clean optimizer state so the outcome
@@ -783,7 +859,7 @@ class GuidedPopulation(Population):
 
         invalid_graph = False
         for step in range(steps):
-            metrics_values = task.evaluate_metrics(model, task.train_data)
+            metrics_values = self.task.evaluate_metrics(model, self.task.train_data)
             if not torch.isfinite(metrics_values).all():
                 warn("Task metrics produced NaN/Inf; assigning penalty fitness")
                 invalid_graph = True
@@ -814,7 +890,7 @@ class GuidedPopulation(Population):
                     warn("Optimizer state mismatch detected; resetting state buffers and retrying")
                     self._reset_optimizer_state(optimizer, named_params)
                     self._ensure_optimizer_state_shapes(optimizer, named_params)
-                    metrics_values = task.evaluate_metrics(model, task.train_data)
+                    metrics_values = self.task.evaluate_metrics(model, self.task.train_data)
                     if not torch.isfinite(metrics_values).all():
                         invalid_graph = True
                         break
@@ -835,7 +911,7 @@ class GuidedPopulation(Population):
                 invalid_graph = True
                 break
             model.load_state_dict(state_dict)
-            prev_metrics_values = task.evaluate_metrics(model, task.train_data).detach()
+            prev_metrics_values = self.task.evaluate_metrics(model, self.task.train_data).detach()
             prev_metrics_values = torch.nan_to_num(prev_metrics_values)
             area_under_metrics += float(metrics_values.detach().sum())
         if invalid_graph:
@@ -845,10 +921,10 @@ class GuidedPopulation(Population):
         _, peak_memory = tracemalloc.get_traced_memory()
         tracemalloc.stop()
         time_cost = stop - start
-        validation_metrics = task.evaluate_metrics(model, task.valid_data).detach()
+        validation_metrics = self.task.evaluate_metrics(model, self.task.valid_data).detach()
         validation_metrics = torch.nan_to_num(validation_metrics)
         validation_metrics = validation_metrics.data.numpy()
-        validation_metrics = {m: float(validation_metrics[i]) for i, m in enumerate(task.metrics)}
+        validation_metrics = {m: float(validation_metrics[i]) for i, m in enumerate(self.task.metrics)}
         return area_under_metrics, validation_metrics, time_cost, peak_memory
 
     def _adjust_compatibility_threshold(self, species_count):

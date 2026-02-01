@@ -99,6 +99,26 @@ def test_genome_to_data():
     assert "b" in pop.shared_attr_vocab.name_to_index
 
 
+def test_graph_output_slot_precheck_detects_missing_slots():
+    config = make_config()
+    pop = GuidedPopulation(config)
+    graph_dict = {
+        "edge_index": torch.empty((2, 0), dtype=torch.long),
+        "node_attributes": [{} for _ in range(3)],
+    }
+
+    ok, details = pop._graph_output_slot_coverage(graph_dict)
+    assert not ok
+    assert details["missing_slots"] == config.genome_config.output_keys
+
+    first_output = config.genome_config.output_keys[0]
+    graph_dict["edge_index"] = torch.tensor([[0], [first_output]], dtype=torch.long)
+
+    ok2, details2 = pop._graph_output_slot_coverage(graph_dict)
+    assert ok2
+    assert details2["missing_slots"] == []
+
+
 def test_generate_guided_offspring():
     config = make_config()
     pop = GuidedPopulation(config)

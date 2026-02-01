@@ -14,12 +14,39 @@ class DummyGenome:
         self.fitness = fitness
         self.crossover_parents = None
         self.mutated = False
+        self.optimizer = None
+        self.graph_dict = None
+        self.nodes = {}
+        self.connections = {}
+        self.is_fallback = False
 
     def configure_crossover(self, p1, p2, config):
         self.crossover_parents = (p1.key, p2.key)
 
     def mutate(self, config):
         self.mutated = True
+
+    def configure_new(self, genome_config):
+        for node_key in getattr(genome_config, "output_keys", []):
+            self.nodes[node_key] = {"node_type": "output"}
+
+    def create_connection(self, genome_config, input_id, output_id):
+        conn = type("DummyConn", (), {})()
+        conn.key = (input_id, output_id)
+        conn.enabled = True
+        self.connections[conn.key] = conn
+        return conn
+
+    def create_node(self, genome_config, node_id):
+        node = type("DummyNode", (), {})()
+        node.key = node_id
+        node.node_type = "hidden"
+        node.dynamic_attributes = {}
+        return node
+
+    def compile_optimizer(self, genome_config):
+        self.optimizer = object()
+        self.graph_dict = {}
 
 
 class DummySpecies:
@@ -58,7 +85,13 @@ class DummyReporters:
 class DummyConfig:
     def __init__(self, genome_type):
         self.genome_type = genome_type
-        self.genome_config = object()
+
+        class GC:
+            def __init__(self):
+                self.input_keys = [-1, -2]
+                self.output_keys = [0, 1]
+
+        self.genome_config = GC()
 
 
 def make_reproduction(elitism=1, survival_threshold=0.5, reporters=None, stagnation=None):
@@ -84,8 +117,9 @@ def test_guided_and_standard_offspring():
 
     guided_called = {}
 
-    def guide_fn(name, features, starting, config, n_offspring):
+    def guide_fn(starting, repro_config, n_offspring):
         guided_called["n"] = n_offspring
+        guided_called["starting_size"] = len(starting)
         return [DummyGenome(50)]
 
     repro.guide_fn = guide_fn
@@ -101,6 +135,7 @@ def test_guided_and_standard_offspring():
     pop = repro.reproduce(config, species_set, 3, 0, DummyTask())
 
     assert guided_called["n"] == 1
+    assert guided_called["starting_size"] == len(species.members)
     # expect 3 individuals: 1 elite, 1 guided, 1 crossover
     assert len(pop) == 3
     assert 101 in pop  # elite preserved
@@ -158,3 +193,52 @@ def test_stagnated_species_removed_from_species_set():
 
     assert alive_species.key in species_set.species
     assert stagnant_species.key not in species_set.species
+
+
+def test_fallback_min_graph_used_when_validation_fails():
+    g1 = DummyGenome(301, fitness=1.0)
+    g2 = DummyGenome(302, fitness=0.8)
+    species = DummySpecies(4, [g1, g2])
+    species_set = DummySpeciesSet(species)
+
+    repro = make_reproduction(elitism=0)
+    repro.compute_spawn = lambda *a, **k: [2]
+    repro.optimizer_validator = lambda optimizer: False
+
+    config = DummyConfig(DummyGenome)
+
+    class DummyTask:
+        def name(self):
+            return "dummy"
+
+        features = []
+
+    pop = repro.reproduce(config, species_set, 2, 0, DummyTask())
+
+    assert len(pop) == 2
+    fallback_children = [child for child in pop.values() if getattr(child, "_minimum_graph_fallback", False)]
+    assert fallback_children
+
+
+def test_minimum_graph_connects_hidden_and_outputs():
+    repro = make_reproduction(elitism=0)
+    config = DummyConfig(DummyGenome)
+
+    genome = repro._build_random_minimum_genome(config, key=999)
+
+    hidden_ids = getattr(genome, "hidden_node_ids", [])
+    assert len(hidden_ids) >= 2
+
+    output_keys = set(config.genome_config.output_keys)
+    input_keys = list(config.genome_config.input_keys)
+    conn_keys = set(genome.connections.keys())
+
+    for out_key in output_keys:
+        assert any(dst == out_key for _, dst in conn_keys)
+
+    for hid in hidden_ids:
+        assert any(dst == hid for _, dst in conn_keys)
+        assert any(src == hid for src, _ in conn_keys)
+
+    for in_key in input_keys:
+        assert any(src == in_key and dst in hidden_ids for src, dst in conn_keys)

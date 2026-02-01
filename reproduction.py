@@ -107,7 +107,7 @@ class GuidedReproduction(DefaultReproduction):
             guided_quota = min(guided_quota, remaining_spawn)
             guided_children = []
             if guided_quota > 0 and self.guide_fn is not None and generation >= self.guided_start_generation:
-                guided_children = self.guide_fn(task, list(s.members.values()), self.reproduction_config, guided_quota)
+                guided_children = self.guide_fn(list(s.members.values()), self.reproduction_config, guided_quota)
 
             for kid in guided_children:
                 gid = next(self.genome_indexer)
@@ -164,11 +164,157 @@ class GuidedReproduction(DefaultReproduction):
                         child_added = True
                         break
                     if not child_added:
+                        fallback_child = self._build_random_minimum_genome(config, cid)
+                        optimizer = None
+                        if hasattr(fallback_child, "compile_optimizer"):
+                            try:
+                                fallback_child.compile_optimizer(config.genome_config)
+                                optimizer = getattr(fallback_child, "optimizer", None)
+                            except Exception as exc:
+                                self.reporters.info(
+                                    f"Fallback minimum graph for species {s.key} failed to compile cleanly: {exc}"
+                                )
+                        validator = getattr(self, "optimizer_validator", None)
+                        if optimizer is not None and callable(validator):
+                            try:
+                                valid = bool(validator(optimizer))
+                            except Exception as exc:
+                                valid = False
+                                warn(
+                                    f"Fallback optimizer validation raised for species {s.key}: {exc}; keeping fallback child regardless."
+                                )
+                            if not valid:
+                                self.reporters.info(
+                                    f"Fallback optimizer for species {s.key} failed validation; proceeding to keep minimum graph child."
+                                )
+                        new_population[cid] = fallback_child
+                        self.ancestors[cid] = (p1_id, p2_id)
                         self.reporters.info(
-                            f"Failed to produce valid NEAT child for species {s.key} after {attempts} attempts; reducing spawn count."
+                            f"Inserted fallback minimum graph for species {s.key} after {attempts} unsuccessful attempts."
                         )
 
         return new_population
+
+    def _build_random_minimum_genome(self, config, key):
+        genome = config.genome_type(key)
+        if not hasattr(genome, "connections") or genome.connections is None:
+            genome.connections = {}
+        if not hasattr(genome, "nodes") or genome.nodes is None:
+            genome.nodes = {}
+
+        try:
+            genome.configure_new(config.genome_config)
+        except Exception:
+            if hasattr(genome, "create_node"):
+                for node_key in getattr(config.genome_config, "output_keys", []):
+                    try:
+                        genome.nodes[node_key] = genome.create_node(config.genome_config, node_key)
+                    except Exception:
+                        continue
+
+        input_keys = list(getattr(config.genome_config, "input_keys", []))
+        output_keys = list(getattr(config.genome_config, "output_keys", []))
+        rng = random.Random()
+        hidden_target = max(2, len(output_keys) or 1)
+        jitter = rng.randint(0, max(1, len(input_keys)))
+        required_hidden = max(2, min(hidden_target + jitter, hidden_target + 3))
+
+        def reserve_node_id():
+            next_id = getattr(genome, "next_node_id", None)
+            if isinstance(next_id, int):
+                candidate = next_id
+                genome.next_node_id = next_id + 1
+            else:
+                candidate = max([k for k in genome.nodes.keys() if isinstance(k, int)] or [-1]) + 1
+            while candidate in genome.nodes:
+                candidate += 1
+            if hasattr(genome, "next_node_id") and genome.next_node_id <= candidate:
+                genome.next_node_id = candidate + 1
+            return candidate
+
+        def ensure_connection(src, dst):
+            key = (src, dst)
+            conn = genome.connections.get(key)
+            if conn is not None:
+                conn.enabled = True
+                return conn
+            connection = None
+            if hasattr(genome, "create_connection"):
+                try:
+                    connection = genome.create_connection(config.genome_config, src, dst)
+                except Exception:
+                    connection = None
+            if connection is None:
+                connection = type("FallbackConnection", (), {})()
+                connection.key = key
+                connection.enabled = True
+            genome.connections[key] = connection
+            return connection
+
+        hidden_ids = []
+        while len(hidden_ids) < required_hidden:
+            hid = reserve_node_id()
+            node = genome.create_node(config.genome_config, hid)
+            if hasattr(node, "node_type") and not node.node_type:
+                node.node_type = "hidden"
+            genome.nodes[hid] = node
+            hidden_ids.append(hid)
+
+        if not output_keys:
+            setattr(genome, "_minimum_graph_fallback", True)
+            return genome
+
+        shuffled_inputs = input_keys[:]
+        rng.shuffle(shuffled_inputs)
+        shuffled_hiddens = hidden_ids[:]
+        rng.shuffle(shuffled_hiddens)
+
+        if input_keys:
+            for hid_idx, hid in enumerate(shuffled_hiddens):
+                src = shuffled_inputs[hid_idx % len(shuffled_inputs)]
+                ensure_connection(src, hid)
+            for input_key in shuffled_inputs:
+                dst = rng.choice(hidden_ids)
+                ensure_connection(input_key, dst)
+        else:
+            for idx, hid in enumerate(hidden_ids[1:], start=1):
+                ensure_connection(hidden_ids[idx - 1], hid)
+
+        shuffled_outputs = output_keys[:]
+        rng.shuffle(shuffled_outputs)
+        hidden_cycle = hidden_ids[:]
+        rng.shuffle(hidden_cycle)
+        for idx, out_key in enumerate(shuffled_outputs):
+            src = hidden_cycle[idx % len(hidden_cycle)]
+            ensure_connection(src, out_key)
+
+        extra_edges = rng.randint(0, len(hidden_ids))
+        for _ in range(extra_edges):
+            src = rng.choice(hidden_ids)
+            dst_pool = hidden_ids + output_keys
+            if not dst_pool:
+                break
+            dst = rng.choice(dst_pool)
+            if src == dst:
+                continue
+            ensure_connection(src, dst)
+
+        for hid in hidden_ids:
+            has_in = any(conn_key[1] == hid for conn_key in genome.connections.keys())
+            if not has_in and input_keys:
+                ensure_connection(shuffled_inputs[0], hid)
+            has_out = any(conn_key[0] == hid for conn_key in genome.connections.keys())
+            if not has_out and output_keys:
+                ensure_connection(hid, output_keys[0])
+
+        for out_key in output_keys:
+            has_incoming = any(conn_key[1] == out_key for conn_key in genome.connections.keys())
+            if not has_incoming:
+                ensure_connection(hidden_ids[0], out_key)
+
+        setattr(genome, "_minimum_graph_fallback", True)
+        setattr(genome, "hidden_node_ids", list(hidden_ids))
+        return genome
 
     def _log_species_metrics(self, species_list):
         for species in species_list:
