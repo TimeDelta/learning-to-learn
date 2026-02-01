@@ -7,6 +7,7 @@ import time
 import tracemalloc
 import weakref
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Sequence
 from warnings import warn
@@ -209,6 +210,97 @@ class GuidedPopulation(Population):
             graph_dict["slot_shapes"] = copy.deepcopy(slot_shapes)
         genome.graph_dict = graph_dict
         return Data(node_types=node_types, edge_index=edge_index, node_attributes=node_attributes)
+
+    @staticmethod
+    def _clone_graph_dict(graph_dict: dict | None) -> dict | None:
+        if not graph_dict:
+            return None
+        cloned = {}
+        node_types = graph_dict.get("node_types")
+        if node_types is not None:
+            cloned["node_types"] = node_types.clone().detach().cpu()
+        edge_index = graph_dict.get("edge_index")
+        if edge_index is not None:
+            cloned["edge_index"] = edge_index.clone().detach().cpu()
+        attributes = []
+        for attr in graph_dict.get("node_attributes", []) or []:
+            cloned_attr = {}
+            for key, value in attr.items():
+                if torch.is_tensor(value):
+                    cloned_attr[key] = value.clone().detach().cpu()
+                else:
+                    cloned_attr[key] = copy.deepcopy(value)
+            attributes.append(cloned_attr)
+        cloned["node_attributes"] = attributes
+        slot_shapes = graph_dict.get("slot_shapes")
+        if slot_shapes is not None:
+            cloned["slot_shapes"] = copy.deepcopy(slot_shapes)
+        return cloned
+
+    @staticmethod
+    def _fitness_value(genome) -> float:
+        value = getattr(genome, "fitness", None)
+        if value is None:
+            return float("-inf")
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float("-inf")
+
+    def snapshot_population(self) -> dict:
+        """Capture a serializable snapshot of the current population state."""
+        species_dict = getattr(self.species, "species", {}) or {}
+        species_assignments: Dict[int, int] = {}
+        for sid, species in species_dict.items():
+            members = getattr(species, "members", {}) or {}
+            if isinstance(members, dict):
+                member_ids = members.keys()
+            else:
+                member_ids = members
+            for gid in member_ids:
+                try:
+                    species_assignments[int(gid)] = sid
+                except (TypeError, ValueError):
+                    continue
+
+        entries = []
+        for gid in sorted(self.population.keys()):
+            genome = self.population[gid]
+            if getattr(genome, "graph_dict", None) is None:
+                try:
+                    self.genome_to_data(genome)
+                except Exception:
+                    pass
+            graph_dict = self._clone_graph_dict(getattr(genome, "graph_dict", None))
+            entry = {
+                "genome_id": gid,
+                "species_id": species_assignments.get(gid),
+                "fitness": getattr(genome, "fitness", None),
+                "fitnesses": copy.deepcopy(getattr(genome, "fitnesses", None)),
+                "invalid_graph": getattr(genome, "invalid_graph", False),
+                "invalid_reason": getattr(genome, "invalid_reason", None),
+                "optimizer_path": getattr(genome, "optimizer_path", None),
+                "graph": graph_dict,
+            }
+            entries.append(entry)
+
+        task_name = None
+        name_attr = getattr(self.task, "name", None)
+        if callable(name_attr):
+            try:
+                task_name = name_attr()
+            except Exception:
+                task_name = None
+
+        snapshot = {
+            "created_at_utc": datetime.utcnow().isoformat(timespec="seconds"),
+            "generation": int(getattr(self, "generation", -1)),
+            "population_size": len(self.population),
+            "species_count": len(species_dict),
+            "task": task_name,
+            "entries": entries,
+        }
+        return snapshot
 
     def generate_guided_offspring(
         self,
@@ -622,9 +714,9 @@ class GuidedPopulation(Population):
 
             # Termination check
             if not self.config.no_fitness_termination:
-                fv = self.fitness_criterion(g.fitness for g in self.population.values())
+                fv = self.fitness_criterion(self._fitness_value(g) for g in self.population.values())
                 if fv >= self.config.fitness_threshold:
-                    best = max(self.population.values(), key=lambda g: g.fitness)
+                    best = max(self.population.values(), key=self._fitness_value)
                     self.reporters.found_solution(self.config, self.generation, best)
                     return best
 
@@ -684,7 +776,7 @@ class GuidedPopulation(Population):
             self.generation += 1
 
         # if no_fitness_termination
-        best = max(self.population.values(), key=lambda g: g.fitness)
+        best = max(self.population.values(), key=self._fitness_value)
         self.reporters.found_solution(self.config, self.generation, best)
         return best
 

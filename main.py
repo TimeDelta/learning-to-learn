@@ -547,6 +547,15 @@ if __name__ == "__main__":
             metavar="N",
             help="Cap the number of task training epochs (optimizer evaluation steps) per generation.",
         )
+        parser.add_argument(
+            "--final-population-dir",
+            type=str,
+            default="artifacts/final_population",
+            help=(
+                "Directory where a TorchScript-friendly snapshot of the final population will be saved "
+                "(default: artifacts/final_population)."
+            ),
+        )
         return parser
 
     def _parse_args():
@@ -702,6 +711,20 @@ if __name__ == "__main__":
         winner = population.run(args.num_generations)
         print("\nBest genome:\n{!s}".format(winner))
 
+        snapshot_path = None
+        try:
+            population_snapshot = population.snapshot_population()
+            final_dir = Path(args.final_population_dir).expanduser()
+            final_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+            filename = f"population_gen{population.generation:05d}_{timestamp}.pt"
+            snapshot_path = final_dir / filename
+            torch.save(population_snapshot, snapshot_path)
+            print(f"Final population snapshot saved to {snapshot_path}")
+        except Exception as exc:
+            snapshot_path = None
+            print(f"WARNING: Failed to save final population snapshot: {exc}")
+
         if mlflow_run:
             num_nodes, num_connections = _genome_complexity(winner)
             final_metrics = {
@@ -715,3 +738,5 @@ if __name__ == "__main__":
             if _INVALID_REASON_COUNTER:
                 mlflow_run.log_dict(_INVALID_REASON_COUNTER, "invalid_offspring_summary.json")
             _log_trainer_history_artifacts(mlflow_run, trainer_metrics_history)
+            if snapshot_path and snapshot_path.exists():
+                mlflow_run.log_artifact(str(snapshot_path))
