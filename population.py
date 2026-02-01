@@ -97,6 +97,15 @@ class GuidedPopulation(Population):
         self.guided_stats_callback = None
         self._guided_offspring_stats = None
         self.dataset_stats_callback = None
+        max_evaluation_steps = getattr(config, "max_evaluation_steps", None)
+        if max_evaluation_steps is not None:
+            try:
+                max_evaluation_steps = int(max_evaluation_steps)
+            except (TypeError, ValueError):
+                max_evaluation_steps = None
+        if max_evaluation_steps is not None and max_evaluation_steps <= 0:
+            max_evaluation_steps = None
+        self.max_evaluation_steps = max_evaluation_steps
 
     def _reset_guided_offspring_stats(self):
         self._guided_offspring_stats = {
@@ -607,7 +616,7 @@ class GuidedPopulation(Population):
 
             # Evaluate real fitness. Using too few update steps makes every optimizer look identical,
             # so clamp to a minimum to expose behavioral differences early in the run.
-            eval_steps = max(2 * self.generation, 25)
+            eval_steps = self._generation_eval_steps()
             print(f"Evaluating genomes on {self.task.name()} for {eval_steps} steps")
             self.eval_genomes(list(self.population.items()), self.config, steps=eval_steps)
 
@@ -678,6 +687,12 @@ class GuidedPopulation(Population):
         best = max(self.population.values(), key=lambda g: g.fitness)
         self.reporters.found_solution(self.config, self.generation, best)
         return best
+
+    def _generation_eval_steps(self) -> int:
+        base_steps = max(2 * self.generation, 25)
+        if self.max_evaluation_steps is not None:
+            base_steps = min(base_steps, self.max_evaluation_steps)
+        return max(1, int(base_steps))
 
     def eval_genomes(self, genomes, config, steps=10, epsilon=1e-10):
         """

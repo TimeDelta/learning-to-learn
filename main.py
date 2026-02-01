@@ -540,6 +540,13 @@ if __name__ == "__main__":
             action="store_true",
             help="Log the run as a nested MLflow run.",
         )
+        parser.add_argument(
+            "--max-evaluation-steps",
+            type=int,
+            default=None,
+            metavar="N",
+            help="Cap the number of task training epochs (optimizer evaluation steps) per generation.",
+        )
         return parser
 
     def _parse_args():
@@ -556,6 +563,9 @@ if __name__ == "__main__":
     config = neat.Config(
         OptimizerGenome, GuidedReproduction, neat.DefaultSpeciesSet, RelativeRankStagnation, args.config_file
     )
+    if args.max_evaluation_steps is not None:
+        max_epochs = max(1, int(args.max_evaluation_steps))
+        setattr(config, "max_evaluation_steps", max_epochs)
     population = GuidedPopulation(config)
 
     override_initial_population(population, config)

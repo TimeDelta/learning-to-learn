@@ -99,6 +99,18 @@ def test_genome_to_data():
     assert "b" in pop.shared_attr_vocab.name_to_index
 
 
+def test_generation_eval_steps_respects_max_cap():
+    config = make_config()
+    config.max_evaluation_steps = 30
+    pop = GuidedPopulation(config)
+    pop.generation = 50
+    assert pop._generation_eval_steps() == 30
+
+    pop.max_regression_epochs = None
+    pop.generation = 5
+    assert pop._generation_eval_steps() == 25
+
+
 def test_graph_output_slot_precheck_detects_missing_slots():
     config = make_config()
     pop = GuidedPopulation(config)
