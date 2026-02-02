@@ -1297,10 +1297,10 @@ class OnlineTrainer:
         self.sorted_metrics = sort_metrics_by_name(metric_keys)
         self.num_metrics = len(self.sorted_metrics)
         self.task_metric_best_values = torch.as_tensor(
-            [float(getattr(metric, "best_value", 0.0)) for metric in self.sorted_metrics], dtype=torch.float
+            [metric.best_value for metric in self.sorted_metrics], dtype=torch.float
         )
         self.task_metric_guidance_weights = torch.as_tensor(
-            [float(getattr(metric, "guidance_weight", 1.0)) for metric in self.sorted_metrics], dtype=torch.float
+            [metric.guidance_weight for metric in self.sorted_metrics], dtype=torch.float
         )
 
     def _metric_name_for_index(self, idx: int) -> str:
@@ -1347,15 +1347,11 @@ class OnlineTrainer:
         generation=0,
     ):
         train_samples = list(self.dataset)
-        if self.invalid_dataset and train_samples:
-            ratio = min(self.invalid_target_ratio, generation / (generation + self.invalid_ratio_warmup))
-            invalid_count = max(1, int(len(train_samples) * ratio)) if ratio > 0 else 0
-            invalid_count = min(invalid_count, len(self.invalid_dataset))
-            if invalid_count > 0:
-                sampled_invalid = random.sample(self.invalid_dataset, invalid_count)
-                train_samples.extend(sampled_invalid)
-        elif self.invalid_dataset and not train_samples:
-            train_samples = list(self.invalid_dataset)
+        if self.invalid_dataset:
+            if train_samples:
+                train_samples.extend(self.invalid_dataset)
+            else:
+                train_samples = list(self.invalid_dataset)
         loader = DataLoader(train_samples, batch_size=batch_size, shuffle=True)
         dataset_size = len(train_samples)
         total_batches = len(loader)

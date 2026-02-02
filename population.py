@@ -164,12 +164,12 @@ class GuidedPopulation(Population):
         return sort_metrics_by_name(metrics)
 
     @staticmethod
-    def _metric_best_values(metric_keys: List[Metric]) -> List[float]:
-        return [metric_best_value(metric) for metric in metric_keys]
+    def _metric_best_values(metrics: List[Metric]) -> List[float]:
+        return [metric_best_value(metric) for metric in metrics]
 
     @staticmethod
-    def _metric_guidance_weights(metric_keys: List[Metric]) -> List[float]:
-        return [float(getattr(metric, "guidance_weight", 1.0)) for metric in metric_keys]
+    def _metric_guidance_weights(metrics: List[Metric]) -> List[float]:
+        return [float(getattr(metric, "guidance_weight", 1.0)) for metric in metrics]
 
     def genome_to_data(self, genome: OptimizerGenome):
         # always rebuild graph_dict so that new attributes are captured
@@ -755,7 +755,14 @@ class GuidedPopulation(Population):
                 self.trainer.train(epochs=50, batch_size=batch, generation=self.generation)
             else:
                 self.trainer.train(warmup_epochs=25, epochs=10, batch_size=batch, generation=self.generation)
-            self._emit_dataset_stats(len(self.trainer.dataset), len(self.trainer.invalid_dataset))
+            valid_size = len(self.trainer.dataset)
+            invalid_size = len(self.trainer.invalid_dataset)
+            total_size = valid_size + invalid_size
+            self.reporters.info(
+                f"Trainer dataset sizes (generation {self.generation}): "
+                f"valid={valid_size} invalid={invalid_size} total={total_size}"
+            )
+            self._emit_dataset_stats(valid_size, invalid_size)
 
             # Build next‐gen population by species
             self.population = self.reproduction.reproduce(
