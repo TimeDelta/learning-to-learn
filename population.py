@@ -87,6 +87,18 @@ class GuidedPopulation(Population):
         self.guide = SelfCompressingFitnessRegularizedDAGVAE(graph_encoder, decoder, predictor)
         self.optimizer = torch.optim.Adam(self.guide.parameters(), lr=0.001)
         self.trainer = OnlineTrainer(self.guide, self.optimizer, metric_keys=self.metric_keys)
+        beta_schedule = StagedBetaSchedule(
+            start_beta=0.0,
+            target_beta=0.08,
+            warmup_epochs=30,
+            ramp_epochs=60,
+            hold_epochs=20,
+            cycle_length=40,
+            cycle_floor=0.02,
+        )
+        # This staged β-VAE schedule delays KL pressure so the decoder/aux heads learn
+        # meaningful non-empty graphs before gently reintroducing structure for NEAT.
+        self.trainer.configure_kl_scheduler(beta_schedule, reset_state=True)
         stagnation = config.stagnation_type(config.stagnation_config, self.reporters)
         self.reproduction = GuidedReproduction(config.reproduction_config, self.reporters, stagnation)
         self.reproduction.guide_fn = self.generate_guided_offspring

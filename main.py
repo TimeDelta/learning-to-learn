@@ -618,6 +618,7 @@ if __name__ == "__main__":
                 total_epochs = kwargs.get("total_epochs")
                 total_loss = kwargs.get("total_loss")
                 loss_terms = kwargs.get("loss_terms", {})
+                kl_beta = kwargs.get("kl_beta")
                 per_metric_losses = kwargs.get("per_metric_losses") or {}
                 step = next(trainer_step_counter)
                 trainer_last_step["value"] = step
@@ -626,6 +627,8 @@ if __name__ == "__main__":
                     "trainer_epoch": epoch,
                     "trainer_generation": generation,
                 }
+                if kl_beta is not None:
+                    metrics["trainer_kl_beta"] = kl_beta
                 metrics.update({f"trainer_{name}": value for name, value in loss_terms.items()})
                 filtered_metrics = {k: v for k, v in metrics.items() if v is not None}
                 if filtered_metrics:

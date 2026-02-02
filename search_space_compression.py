@@ -8,6 +8,7 @@ import math
 import os
 import random
 import time
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from warnings import warn
 
@@ -1262,6 +1263,58 @@ class SelfCompressingFitnessRegularizedDAGVAE(nn.Module):
         print(f"Permanently resizing graph bottleneck: {old_graph_dim} → {new_graph_dim}")
 
 
+@dataclass
+class StagedBetaSchedule:
+    """Piecewise-linear β schedule with warmup, ramp, hold, and optional cycles."""
+
+    start_beta: float = 0.0
+    target_beta: float = 0.1
+    warmup_epochs: int = 0
+    ramp_epochs: int = 50
+    hold_epochs: int = 0
+    cycle_length: Optional[int] = None
+    cycle_floor: Optional[float] = None
+
+    def __post_init__(self):
+        if self.start_beta < 0 or self.target_beta < 0:
+            raise ValueError("β values must be non-negative")
+        for field in ("warmup_epochs", "ramp_epochs", "hold_epochs"):
+            value = getattr(self, field)
+            if value < 0:
+                raise ValueError(f"{field} must be >= 0")
+        if self.cycle_length is not None and self.cycle_length <= 0:
+            raise ValueError("cycle_length must be None or > 0")
+
+    def value(self, epoch_index: int) -> float:
+        """Return β for the provided (0-indexed) global epoch count."""
+
+        epoch = max(0, int(epoch_index))
+        if epoch < self.warmup_epochs:
+            return self.start_beta
+
+        epoch -= self.warmup_epochs
+        if self.ramp_epochs > 0 and epoch < self.ramp_epochs:
+            ratio = min(1.0, (epoch + 1) / max(1, self.ramp_epochs))
+            return self.start_beta + ratio * (self.target_beta - self.start_beta)
+
+        epoch -= max(self.ramp_epochs, 0)
+        if self.hold_epochs > 0:
+            if epoch < self.hold_epochs:
+                return self.target_beta
+            epoch -= self.hold_epochs
+
+        if not self.cycle_length:
+            return self.target_beta
+
+        floor = self.cycle_floor if self.cycle_floor is not None else self.start_beta
+        if self.target_beta <= floor:
+            return self.target_beta
+
+        phase = epoch % self.cycle_length
+        frac = phase / self.cycle_length
+        return floor + frac * (self.target_beta - floor)
+
+
 class OnlineTrainer:
     """
     Incremental trainer with ARD-KL + loss-thresholded iterative pruning,
@@ -1284,6 +1337,8 @@ class OnlineTrainer:
         self.loss_history = []
         self.initial_loss = None
         self.last_prune_epoch = 0
+        self.kl_scheduler: Optional[StagedBetaSchedule] = None
+        self._kl_global_epoch = 0
         if metric_keys is None:
             if task is None:
                 raise ValueError("OnlineTrainer requires either `task` or `metric_keys`.")
@@ -1312,6 +1367,18 @@ class OnlineTrainer:
     def set_progress_callback(self, callback):
         """Register a callable invoked after each epoch with loss summaries."""
         self.progress_callback = callback
+
+    def configure_kl_scheduler(self, scheduler: Optional[StagedBetaSchedule], reset_state: bool = False):
+        """Attach a KL scheduler; optionally reset the accumulated epoch counter."""
+
+        self.kl_scheduler = scheduler
+        if reset_state:
+            self._kl_global_epoch = 0
+
+    def _resolve_kl_weight(self, static_weight: float) -> float:
+        if self.kl_scheduler is None:
+            return float(static_weight)
+        return float(self.kl_scheduler.value(self._kl_global_epoch))
 
     def add_data(self, graphs, fitnesses, invalid_flags=None):
         if invalid_flags is None:
@@ -1385,6 +1452,7 @@ class OnlineTrainer:
             per_metric_error_sum = None
             per_metric_weight_sum = None
             self.model.train()
+            current_kl_weight = self._resolve_kl_weight(kl_weight)
             for batch_idx, batch in enumerate(loader, start=1):
                 batch_timer = time.perf_counter() if DEBUG_TRAINER else None
                 batch = batch.to(self.device)
@@ -1539,7 +1607,7 @@ class OnlineTrainer:
                 loss_terms = [
                     loss_adj,
                     loss_feat,
-                    kl_weight * graph_kl_loss,
+                    current_kl_weight * graph_kl_loss,
                     fitness_weight * loss_fitness,
                 ]
                 sum(loss_terms).backward()
@@ -1568,6 +1636,7 @@ class OnlineTrainer:
 
             if self.progress_callback is not None:
                 loss_metrics = {name: float(value) for name, value in zip(loss_term_labels, avg_loss_terms.tolist())}
+                loss_metrics["kl_beta"] = float(current_kl_weight)
                 self.progress_callback(
                     generation=generation,
                     epoch=epoch,
@@ -1575,12 +1644,14 @@ class OnlineTrainer:
                     total_loss=float(avg_loss_terms.sum().item()),
                     loss_terms=loss_metrics,
                     per_metric_losses=per_metric_losses,
+                    kl_beta=float(current_kl_weight),
                 )
 
             if verbose:
                 label_str = ", ".join(
                     f"{name}={value:.4g}" for name, value in zip(loss_term_labels, avg_loss_terms.tolist())
                 )
+                label_str = f"{label_str}, kl_beta={current_kl_weight:.4g}"
                 if not epochs:
                     print(f"Epoch {epoch}, Loss terms per batch: [{label_str}] (total={avg_loss_terms.sum():.4f})")
                 else:
@@ -1611,6 +1682,7 @@ class OnlineTrainer:
                     self.last_prune_epoch = epoch
                     self.initial_loss = avg_loss_terms.sum()  # reset baseline
 
+            self._kl_global_epoch += 1
             epoch += 1
         if DEBUG_TRAINER:
             logger.info(
@@ -1697,6 +1769,10 @@ if __name__ == "__main__":
     graphs, fitnesses, *_ = generate_data(50)
     metric_keys = sort_metrics_by_name(fitnesses[0].keys()) if fitnesses else []
     trainer = OnlineTrainer(model, optimizer, metric_keys=metric_keys)
+    trainer.configure_kl_scheduler(
+        StagedBetaSchedule(start_beta=0.0, target_beta=0.1, warmup_epochs=10, ramp_epochs=30, hold_epochs=10),
+        reset_state=True,
+    )
     trainer.add_data(graphs, fitnesses)
     print("Training")
     trainer.train(epochs=None, batch_size=8, kl_weight=0.1, warmup_epochs=10, stop_epsilon=1)
