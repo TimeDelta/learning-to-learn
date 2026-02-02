@@ -1,13 +1,16 @@
 import os
 import sys
+from types import SimpleNamespace
 
 import neat
 import numpy as np
+import pytest
 import torch
 from torch_geometric.data import Batch, Data
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
+import population as population_module
 from attributes import FloatAttribute, IntAttribute
 from genes import NODE_TYPE_TO_INDEX, ConnectionGene, NodeGene
 from genome import OptimizerGenome
@@ -57,6 +60,39 @@ class EmptyStateOptimizer:
         self.state = {}
 
 
+class DummyGuideModel(torch.nn.Module):
+    """Minimal module exposing shared_attr_vocab for OnlineTrainer tests."""
+
+    def __init__(self):
+        super().__init__()
+        self.shared_attr_vocab = SharedAttributeVocab([], embedding_dim=4)
+        self.dummy = torch.nn.Parameter(torch.zeros(1))
+
+
+class StubFitnessPredictor(torch.nn.Module):
+    output_dim = 1
+
+    def forward(self, z):  # pragma: no cover - simple stub
+        zeros = torch.zeros(z.size(0), self.output_dim, device=z.device, dtype=z.dtype)
+        return zeros, torch.zeros_like(zeros)
+
+
+class StubGuide:
+    def __init__(self, graph_factories, latent_dim=2):
+        self.graph_encoder = SimpleNamespace(latent_dim=latent_dim)
+        self.graph_latent_mask = torch.ones(latent_dim)
+        self.fitness_predictor = StubFitnessPredictor()
+        self.decoder = SimpleNamespace()
+        self._graph_factories = list(graph_factories)
+        self._decode_calls = 0
+
+    def decode(self, latent):
+        idx = min(self._decode_calls, len(self._graph_factories) - 1)
+        graph = self._graph_factories[idx]()
+        self._decode_calls += 1
+        return [graph]
+
+
 def make_config():
     config_path = os.path.join(os.path.dirname(__file__), os.pardir, "neat-config")
     return neat.Config(
@@ -84,6 +120,45 @@ def create_simple_genome(key=0):
     return genome
 
 
+def make_decoded_graph(bias):
+    node_types = torch.tensor([NODE_TYPE_TO_INDEX["aten::add"], NODE_TYPE_TO_INDEX["aten::mul"]], dtype=torch.long)
+    edge_index = torch.tensor([[0], [1]], dtype=torch.long)
+    node_attrs = [
+        {"node_type": "aten::add", "bias": torch.tensor([bias])},
+        {"node_type": "aten::mul", "bias": torch.tensor([bias * 2])},
+    ]
+    return {
+        "node_types": node_types,
+        "edge_index": edge_index,
+        "node_attributes": node_attrs,
+    }
+
+
+def make_graph_factory(bias):
+    def factory():
+        graph = make_decoded_graph(bias)
+        return {
+            "node_types": graph["node_types"].clone(),
+            "edge_index": graph["edge_index"].clone(),
+            "node_attributes": [dict(attrs) for attrs in graph["node_attributes"]],
+        }
+
+    return factory
+
+
+def configure_stub_population(graph_factories, monkeypatch):
+    config = make_config()
+    pop = GuidedPopulation(config)
+    pop.guide = StubGuide(graph_factories)
+    pop._optimizer_updates_parameters = lambda *args, **kwargs: True
+    monkeypatch.setattr(
+        population_module,
+        "rebuild_and_script",
+        lambda *args, **kwargs: DummyStatefulOptimizer(),
+    )
+    return pop, config
+
+
 def test_genome_to_data():
     config = make_config()
     pop = GuidedPopulation(config)
@@ -97,6 +172,68 @@ def test_genome_to_data():
     assert len(data.node_attributes) == 2
     assert "a" in pop.shared_attr_vocab.name_to_index
     assert "b" in pop.shared_attr_vocab.name_to_index
+
+
+def test_online_trainer_deduplicates_graphs():
+    model = DummyGuideModel()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    trainer = OnlineTrainer(model, optimizer, metric_keys=[AreaUnderTaskMetrics])
+
+    base_attrs = [
+        {"alpha": torch.tensor([1.0])},
+        {"beta": torch.tensor([-0.5, 0.25])},
+    ]
+    edge_index = torch.tensor([[0], [1]], dtype=torch.long)
+    graph = Data(node_types=torch.tensor([0, 1], dtype=torch.long), edge_index=edge_index, node_attributes=base_attrs)
+
+    trainer.add_data([graph], [{AreaUnderTaskMetrics: 0.1}])
+    trainer.add_data([graph.clone()], [{AreaUnderTaskMetrics: 0.2}])
+    assert len(trainer.dataset) == 1
+
+    variant_attrs = [
+        {"alpha": torch.tensor([1.0])},
+        {"beta": torch.tensor([-0.25, 0.5])},
+    ]
+    variant_graph = Data(
+        node_types=torch.tensor([0, 1], dtype=torch.long),
+        edge_index=edge_index,
+        node_attributes=variant_attrs,
+    )
+    trainer.add_data([variant_graph], [{AreaUnderTaskMetrics: 0.3}])
+    assert len(trainer.dataset) == 2
+
+    invalid_graph = Data(
+        node_types=torch.tensor([0, 1], dtype=torch.long),
+        edge_index=torch.tensor([[1], [0]], dtype=torch.long),
+        node_attributes=base_attrs,
+    )
+    trainer.add_data([invalid_graph], [{AreaUnderTaskMetrics: 0.0}], invalid_flags=[True])
+    assert len(trainer.invalid_dataset) == 1
+
+    trainer.add_data([invalid_graph.clone()], [{AreaUnderTaskMetrics: 0.0}], invalid_flags=[True])
+    assert len(trainer.invalid_dataset) == 1
+
+
+def test_generate_guided_offspring_skips_exact_duplicates(monkeypatch):
+    pop, config = configure_stub_population(
+        [make_graph_factory(0.1), make_graph_factory(0.1), make_graph_factory(0.2)],
+        monkeypatch,
+    )
+    offspring = pop.generate_guided_offspring(
+        [], config, n_offspring=3, latent_steps=1, max_decode_attempts=1, decode_jitter_std=0.0
+    )
+    assert len(offspring) == 2
+
+
+def test_generate_guided_offspring_allows_attribute_variants(monkeypatch):
+    pop, config = configure_stub_population(
+        [make_graph_factory(0.1), make_graph_factory(0.25)],
+        monkeypatch,
+    )
+    offspring = pop.generate_guided_offspring(
+        [], config, n_offspring=2, latent_steps=1, max_decode_attempts=1, decode_jitter_std=0.0
+    )
+    assert len(offspring) == 2
 
 
 def test_generation_eval_steps_respects_max_cap():
@@ -144,8 +281,8 @@ def test_generate_guided_offspring():
     pop.genome_to_data(g1)
     pop.genome_to_data(g2)
 
-    task = RegressionTask.random_init(num_samples=4, silent=True)
-    offspring = pop.generate_guided_offspring(task, [g1, g2], config, n_offspring=2, latent_steps=1)
+    RegressionTask.random_init(num_samples=4, silent=True)
+    offspring = pop.generate_guided_offspring([g1, g2], config, n_offspring=2, latent_steps=1)
 
     assert isinstance(offspring, list)
     assert 1 <= len(offspring) <= 4
@@ -179,9 +316,9 @@ def test_generate_guided_offspring_handles_missing_elites():
     pop.guide.decoder.max_nodes = 2
     pop.guide.decoder.max_attributes_per_node = 2
 
-    task = RegressionTask.random_init(num_samples=4, silent=True)
+    RegressionTask.random_init(num_samples=4, silent=True)
 
-    offspring = pop.generate_guided_offspring(task, [], config, n_offspring=3, latent_steps=1)
+    offspring = pop.generate_guided_offspring([], config, n_offspring=3, latent_steps=1)
 
     assert isinstance(offspring, list)
     assert len(offspring) >= 1

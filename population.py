@@ -9,7 +9,7 @@ import weakref
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, List, Sequence, Set
 from warnings import warn
 
 import torch
@@ -441,7 +441,7 @@ class GuidedPopulation(Population):
         debug_save_limit = 5
         debug_saved = 0
         generation_idx = getattr(self, "generation", -1)
-        seen_edge_sets = set()
+        seen_graph_signatures: Set[str] = set()
         total_requested = z_g.size(0)
         max_decode_attempts = max(1, max_decode_attempts)
         invalid_reason_counts: Counter = Counter()
@@ -463,6 +463,7 @@ class GuidedPopulation(Population):
                 genome = genome_from_graph_dict(graph_dict, self.config.genome_config, key=i)
                 num_edges = len(genome.connections)
                 num_params = len(genome.connections)
+                graph_signature = graph_signature_from_dict(graph_dict)
 
                 if num_edges > 0:
                     best_nonempty_latent = latent.detach().clone()
@@ -485,12 +486,13 @@ class GuidedPopulation(Population):
                     genome.graph_dict = graph_dict
                     self._assign_penalty(genome, reason="empty_graph", skip_evaluation=True)
                     invalid_reason_counts["empty_graph"] += 1
+                    if graph_signature:
+                        seen_graph_signatures.add(graph_signature)
                     new_genomes.append(genome)
                     accepted = True
                     break
 
-                edge_key = tuple(sorted(genome.connections.keys()))
-                if edge_key in seen_edge_sets:
+                if graph_signature in seen_graph_signatures:
                     duplicate_count += 1
                     if attempt < max_decode_attempts:
                         base = best_nonempty_latent if best_nonempty_latent is not None else latent
@@ -523,6 +525,8 @@ class GuidedPopulation(Population):
                     genome.graph_dict = graph_dict
                     self._assign_penalty(genome, reason="missing_output_slots", skip_evaluation=True)
                     invalid_reason_counts["missing_output_slots"] += 1
+                    if graph_signature:
+                        seen_graph_signatures.add(graph_signature)
                     new_genomes.append(genome)
                     break
 
@@ -541,14 +545,17 @@ class GuidedPopulation(Population):
                         genome.graph_dict = graph_dict
                         self._assign_penalty(genome, reason="inactive_optimizer", skip_evaluation=True)
                         invalid_reason_counts["inactive_optimizer"] += 1
+                        if graph_signature:
+                            seen_graph_signatures.add(graph_signature)
                         new_genomes.append(genome)
                         break
 
                     genome.optimizer = optimizer
                     genome.graph_dict = graph_dict
+                    if graph_signature:
+                        seen_graph_signatures.add(graph_signature)
                     new_genomes.append(genome)
                     stats.append((i, num_edges, num_params))
-                    seen_edge_sets.add(edge_key)
                     accepted = True
                     break
 
