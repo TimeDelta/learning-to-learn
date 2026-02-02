@@ -483,7 +483,7 @@ class GuidedPopulation(Population):
                         "Guided offspring decoder produced an empty graph (no edges); assigning penalty fitness and skipping evaluation."
                     )
                     genome.graph_dict = graph_dict
-                    self._assign_penalty(genome, self.task, reason="empty_graph", skip_evaluation=True)
+                    self._assign_penalty(genome, reason="empty_graph", skip_evaluation=True)
                     invalid_reason_counts["empty_graph"] += 1
                     new_genomes.append(genome)
                     accepted = True
@@ -521,7 +521,7 @@ class GuidedPopulation(Population):
                         continue
                     warn(message + "; assigning penalty fitness.")
                     genome.graph_dict = graph_dict
-                    self._assign_penalty(genome, self.task, reason="missing_output_slots", skip_evaluation=True)
+                    self._assign_penalty(genome, reason="missing_output_slots", skip_evaluation=True)
                     invalid_reason_counts["missing_output_slots"] += 1
                     new_genomes.append(genome)
                     break
@@ -539,7 +539,7 @@ class GuidedPopulation(Population):
                             "Guided offspring optimizer failed to modify model parameters; skipping child after retries."
                         )
                         genome.graph_dict = graph_dict
-                        self._assign_penalty(genome, self.task, reason="inactive_optimizer", skip_evaluation=True)
+                        self._assign_penalty(genome, reason="inactive_optimizer", skip_evaluation=True)
                         invalid_reason_counts["inactive_optimizer"] += 1
                         new_genomes.append(genome)
                         break
@@ -801,7 +801,6 @@ class GuidedPopulation(Population):
             if getattr(genome, "skip_evaluation", False):
                 self._assign_penalty(
                     genome_map[genome_id],
-                    self.task,
                     reason=getattr(genome, "invalid_reason", "empty_graph"),
                     skip_evaluation=True,
                 )
