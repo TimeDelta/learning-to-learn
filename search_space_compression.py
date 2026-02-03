@@ -1347,6 +1347,7 @@ class OnlineTrainer:
         self.invalid_target_ratio = 0.2
         self.invalid_ratio_warmup = 5
         self.progress_callback = None
+        self.prune_callback = None
 
     def _update_metric_metadata(self, metric_keys: Sequence):
         self.sorted_metrics = sort_metrics_by_name(metric_keys)
@@ -1367,6 +1368,10 @@ class OnlineTrainer:
     def set_progress_callback(self, callback):
         """Register a callable invoked after each epoch with loss summaries."""
         self.progress_callback = callback
+
+    def set_prune_callback(self, callback):
+        """Register a callable invoked whenever latent dims are pruned."""
+        self.prune_callback = callback
 
     def configure_kl_scheduler(self, scheduler: Optional[StagedBetaSchedule], reset_state: bool = False):
         """Attach a KL scheduler; optionally reset the accumulated epoch counter."""
@@ -1678,7 +1683,31 @@ class OnlineTrainer:
             ):
                 active_count = int(self.model.graph_latent_mask.sum().item())
                 if active_count > min_active_dims:
+                    active_before = active_count
                     self.model.prune_latent_dims(num_prune=prune_amount)
+                    active_after = int(self.model.graph_latent_mask.sum().item())
+                    pruned_dims = active_before - active_after
+                    logger.info(
+                        "Latent mask pruning triggered | generation=%s epoch=%s active_before=%s "
+                        "active_after=%s pruned=%s",
+                        generation,
+                        epoch,
+                        active_before,
+                        active_after,
+                        pruned_dims,
+                    )
+                    if self.prune_callback is not None:
+                        try:
+                            self.prune_callback(
+                                generation=generation,
+                                epoch=epoch,
+                                global_epoch=self._kl_global_epoch,
+                                active_before=active_before,
+                                active_after=active_after,
+                                pruned_dims=pruned_dims,
+                            )
+                        except Exception:  # pragma: no cover - defensive logging
+                            logger.exception("Latent prune callback failed")
                     self.last_prune_epoch = epoch
                     self.initial_loss = avg_loss_terms.sum()  # reset baseline
 

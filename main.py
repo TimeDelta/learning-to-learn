@@ -711,6 +711,29 @@ if __name__ == "__main__":
 
             population.dataset_stats_callback = _log_dataset_stats
 
+            def _log_latent_prune_event(event: dict):
+                if not event:
+                    return
+                step = trainer_last_step.get("value", 0)
+                metrics = {
+                    "latent_active_dims": event.get("active_after"),
+                    "latent_pruned_dims": event.get("pruned_dims"),
+                    "latent_prune_epoch": event.get("epoch"),
+                    "latent_prune_generation": event.get("generation"),
+                }
+                metrics = {k: v for k, v in metrics.items() if v is not None}
+                if metrics:
+                    mlflow_run.log_metrics(metrics, step=step)
+                summary = (
+                    f"Latent pruning gen {event.get('generation')} epoch {event.get('epoch')}: "
+                    f"active_before={event.get('active_before')}, active_after={event.get('active_after')}, "
+                    f"pruned={event.get('pruned_dims')}"
+                )
+                mlflow_run.append_log_line(summary)
+                mlflow_run.flush_log()
+
+            population.trainer.set_prune_callback(_log_latent_prune_event)
+
         winner = population.run(args.num_generations)
         print("\nBest genome:\n{!s}".format(winner))
 
