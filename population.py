@@ -766,7 +766,7 @@ class GuidedPopulation(Population):
             elif self.generation < gen_for_full_train_resize:
                 self.trainer.train(epochs=50, batch_size=batch, generation=self.generation)
             else:
-                self.trainer.train(warmup_epochs=25, epochs=10, batch_size=batch, generation=self.generation)
+                self.trainer.train(epochs=10, batch_size=batch, generation=self.generation)
             valid_size = len(self.trainer.dataset)
             invalid_size = len(self.trainer.invalid_dataset)
             total_size = valid_size + invalid_size
