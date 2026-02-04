@@ -152,7 +152,12 @@ def train_model(encoder_cls, full_dataset, random_seed, val_ratio=0.2):
     attr_encoder = NodeAttributeDeepSetEncoder(shared_attr_vocab, 10, 20, 20)
     graph_encoder = encoder_cls(num_node_types, attr_encoder, graph_latent_dim, hidden_dims=[16])
     decoder = GraphDecoder(num_node_types, graph_latent_dim, shared_attr_vocab)
-    predictor = FitnessPredictor(latent_dim=graph_latent_dim, hidden_dim=32, fitness_dim=fitness_dim)
+    predictor = FitnessPredictor(
+        latent_dim=graph_latent_dim,
+        hidden_dim=32,
+        fitness_dim=fitness_dim,
+        icnn_hidden_dims=(graph_latent_dim, graph_latent_dim // 2 or 1),
+    )
     model = SelfCompressingFitnessRegularizedDAGVAE(graph_encoder, decoder, predictor)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     metric_keys = sort_metrics_by_name(train_fitnesses[0].keys()) if train_fitnesses else []

@@ -1111,37 +1111,113 @@ class GraphDecoder(nn.Module):
         self.latent_dim = kept_idx.numel()
 
 
-class FitnessPredictor(nn.Module):
-    """Single-head heteroscedastic fitness predictor operating directly on graph latents."""
+class InputConvexLayer(nn.Module):
+    """Single ICNN layer enforcing non-negative weights on the z-term."""
 
-    def __init__(self, latent_dim, hidden_dim=64, fitness_dim=4):
+    def __init__(self, input_dim: int, z_dim: int, out_dim: int, activation=F.softplus):
+        super().__init__()
+        self.activation = activation
+        self.x_linear = nn.Linear(input_dim, out_dim)
+        if z_dim > 0:
+            self.z_weight = nn.Parameter(torch.empty(out_dim, z_dim))
+            nn.init.xavier_uniform_(self.z_weight)
+        else:
+            self.z_weight = None
+        self.bias = nn.Parameter(torch.zeros(out_dim))
+
+    def forward(self, x: torch.Tensor, z_prev: Optional[torch.Tensor]):
+        z_term = 0.0
+        if self.z_weight is not None and z_prev is not None:
+            z_term = F.linear(z_prev, F.softplus(self.z_weight), bias=None)
+        return self.activation(self.x_linear(x) + z_term + self.bias)
+
+    def prune_input(self, kept_idx: torch.LongTensor):
+        kept = kept_idx.to(self.x_linear.weight.device)
+        new_linear = nn.Linear(len(kept), self.x_linear.out_features).to(self.x_linear.weight.device)
+        new_linear.weight.data.copy_(self.x_linear.weight.data[:, kept])
+        new_linear.bias.data.copy_(self.x_linear.bias.data)
+        self.x_linear = new_linear
+
+
+class InputConvexNN(nn.Module):
+    """Input Convex Neural Network surrogate f(z)."""
+
+    def __init__(self, input_dim: int, hidden_dims: Sequence[int], output_dim: int, activation=F.softplus):
+        super().__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.layers = nn.ModuleList()
+        prev_dim = 0
+        for hidden_dim in hidden_dims:
+            self.layers.append(InputConvexLayer(input_dim, prev_dim, hidden_dim, activation=activation))
+            prev_dim = hidden_dim
+        self.final_bias = nn.Parameter(torch.zeros(output_dim))
+        if prev_dim > 0:
+            self.final_z_weight = nn.Parameter(torch.empty(output_dim, prev_dim))
+            nn.init.xavier_uniform_(self.final_z_weight)
+        else:
+            self.final_z_weight = None
+        self.final_linear = nn.Linear(input_dim, output_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        z = None
+        for layer in self.layers:
+            z = layer(x, z)
+        z_term = 0.0
+        if z is not None and self.final_z_weight is not None:
+            z_term = F.linear(z, F.softplus(self.final_z_weight), bias=None)
+        return z_term + self.final_linear(x) + self.final_bias
+
+    def prune_latent_dims(self, kept_idx: torch.LongTensor):
+        for layer in self.layers:
+            layer.prune_input(kept_idx)
+        kept = kept_idx.to(self.final_linear.weight.device)
+        new_final = nn.Linear(len(kept), self.final_linear.out_features).to(self.final_linear.weight.device)
+        new_final.weight.data.copy_(self.final_linear.weight.data[:, kept])
+        new_final.bias.data.copy_(self.final_linear.bias.data)
+        self.final_linear = new_final
+
+
+class FitnessPredictor(nn.Module):
+    """
+    Heteroscedastic predictor paired with an optional ICNN convex surrogate
+    (see "Input Convex Neural Networks" by Brandon Amos, Lei Xu, J. Zico Kolter [2017]).
+    """
+
+    def __init__(
+        self,
+        latent_dim,
+        hidden_dim=64,
+        fitness_dim=4,
+        icnn_hidden_dims: Optional[Sequence[int]] = None,
+        icnn_activation=F.softplus,
+    ):
         super().__init__()
         self.fc1 = nn.Linear(latent_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, fitness_dim)
         self.output_dim = fitness_dim
         self.latent_dim = latent_dim
-        # Learnable log-variance per metric to balance gradients without per-generation normalization
         self.log_metric_scale = nn.Parameter(torch.zeros(fitness_dim))
+        if icnn_hidden_dims:
+            self.icnn = InputConvexNN(latent_dim, icnn_hidden_dims, fitness_dim, activation=icnn_activation)
+        else:
+            self.icnn = None
 
     def forward(self, z_graph: torch.Tensor):
         pred = self.fc2(F.relu(self.fc1(z_graph)))
         log_scales = self.log_metric_scale.unsqueeze(0).expand(pred.size(0), -1)
-        return pred, log_scales
+        convex_pred = self.icnn(z_graph) if self.icnn is not None else None
+        return pred, log_scales, convex_pred
 
     def prune_latent_dims(self, kept_idx: torch.LongTensor):
-        """
-        Keep only the latent dims in `kept_idx` for predictor.fc1.
-        fc2 stays the same.
-        """
-        device = self.fc1.weight.device
-
-        def prune_lin(old):
-            layer = nn.Linear(old.in_features, kept_idx.numel()).to(old.weight.device)
-            layer.weight.data = old.weight.data[kept_idx]
-            layer.bias.data = old.bias.data[kept_idx]
-            return layer
-
-        self.fc1 = prune_lin(self.fc1)
+        kept = kept_idx.to(self.fc1.weight.device)
+        new_fc1 = nn.Linear(len(kept), self.fc1.out_features).to(self.fc1.weight.device)
+        new_fc1.weight.data.copy_(self.fc1.weight.data[:, kept])
+        new_fc1.bias.data.copy_(self.fc1.bias.data)
+        self.fc1 = new_fc1
+        if self.icnn is not None:
+            self.icnn.prune_latent_dims(kept_idx)
+        self.latent_dim = len(kept_idx)
 
 
 class SelfCompressingFitnessRegularizedDAGVAE(nn.Module):
@@ -1217,11 +1293,12 @@ class SelfCompressingFitnessRegularizedDAGVAE(nn.Module):
             decoded_graphs, decoder_aux = decoded
         else:
             decoded_graphs, decoder_aux = decoded, None
-        fitness_pred, metric_log_scales = self.fitness_predictor(graph_latent)
+        fitness_pred, metric_log_scales, convex_pred = self.fitness_predictor(graph_latent)
         return (
             decoded_graphs,
             fitness_pred,
             metric_log_scales,
+            convex_pred,
             graph_latent,
             mu_g,
             lv_g,
@@ -1409,6 +1486,7 @@ class OnlineTrainer:
         batch_size=16,
         kl_weight=10.0,
         fitness_weight=1.5,
+        convex_weight=0.5,
         warmup_epochs=None,
         loss_threshold=0.9,
         min_prune_break=5,
@@ -1441,6 +1519,7 @@ class OnlineTrainer:
             "attribute_recon",
             "graph_kl",
             "fitness",
+            "convex_surrogate",
         ]
         num_loss_terms = len(loss_term_labels)
         prev_loss_terms = torch.zeros(num_loss_terms)
@@ -1479,6 +1558,7 @@ class OnlineTrainer:
                     decoded_graphs,
                     fitness_pred,
                     metric_log_scales,
+                    convex_pred,
                     graph_latent,
                     mu_g,
                     lv_g,
@@ -1608,12 +1688,20 @@ class OnlineTrainer:
                 per_metric_error_sum += raw_weighted_error.detach().sum(dim=0).cpu()
                 per_metric_weight_sum += weight_expand.detach().sum(dim=0).cpu()
 
+                loss_convex = torch.tensor(0.0, device=self.device)
+                if convex_pred is not None:
+                    convex_canonical = canonical_log_distance(convex_pred, best)
+                    convex_error = (convex_canonical - target_canonical).pow(2)
+                    convex_weighted = convex_error * weight_expand
+                    loss_convex = convex_weighted.sum() / denom
+
                 # --- 5) total & backward ---
                 loss_terms = [
                     loss_adj,
                     loss_feat,
                     current_kl_weight * graph_kl_loss,
                     fitness_weight * loss_fitness,
+                    convex_weight * loss_convex,
                 ]
                 sum(loss_terms).backward()
                 self.optimizer.step()
@@ -1744,7 +1832,11 @@ if __name__ == "__main__":
 
     graph_encoder = GraphEncoder(num_node_types, attr_encoder, graph_latent_dim, hidden_dims=[32, 32])
     decoder = GraphDecoder(num_node_types, graph_latent_dim, shared_attr_vocab)
-    predictor = FitnessPredictor(latent_dim=graph_latent_dim, hidden_dim=64)
+    predictor = FitnessPredictor(
+        latent_dim=graph_latent_dim,
+        hidden_dim=64,
+        icnn_hidden_dims=(graph_latent_dim, graph_latent_dim // 2 or 1),
+    )
     model = SelfCompressingFitnessRegularizedDAGVAE(graph_encoder, decoder, predictor)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 

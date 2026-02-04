@@ -82,11 +82,23 @@ class GuidedPopulation(Population):
             len(NODE_TYPE_OPTIONS), attr_encoder, latent_dim=graph_latent_dim, hidden_dims=[32, 32]
         )
         decoder = GraphDecoder(len(NODE_TYPE_OPTIONS), graph_latent_dim, self.shared_attr_vocab)
-        predictor = FitnessPredictor(latent_dim=graph_latent_dim, hidden_dim=64, fitness_dim=len(self.metric_keys))
+        icnn_hidden_dims = getattr(config, "latent_icnn_hidden_dims", (64, 32))
+        if isinstance(icnn_hidden_dims, str):
+            icnn_hidden_dims = [int(part) for part in icnn_hidden_dims.split(",") if part.strip()]
+        if isinstance(icnn_hidden_dims, (int, float)):
+            icnn_hidden_dims = [int(icnn_hidden_dims)]
+        icnn_hidden_dims = tuple(int(dim) for dim in icnn_hidden_dims if int(dim) > 0)
+        predictor = FitnessPredictor(
+            latent_dim=graph_latent_dim,
+            hidden_dim=64,
+            fitness_dim=len(self.metric_keys),
+            icnn_hidden_dims=icnn_hidden_dims or None,
+        )
 
         self.guide = SelfCompressingFitnessRegularizedDAGVAE(graph_encoder, decoder, predictor)
         self.optimizer = torch.optim.Adam(self.guide.parameters(), lr=0.001)
         self.trainer = OnlineTrainer(self.guide, self.optimizer, metric_keys=self.metric_keys)
+        self.convex_surrogate_weight = float(getattr(config, "convex_surrogate_weight", 0.5))
         beta_schedule = StagedBetaSchedule(
             start_beta=0.0,
             target_beta=0.08,
@@ -421,8 +433,9 @@ class GuidedPopulation(Population):
         opt_params.extend(tether_params)
         opt = torch.optim.Adam(opt_params, lr=latent_lr)
         for _ in range(latent_steps):
-            pred, _ = self.guide.fitness_predictor(z_g)
-            canonical = canonical_log_distance(pred, best_tensor)
+            pred, _, convex_pred = self.guide.fitness_predictor(z_g)
+            guiding_pred = convex_pred if convex_pred is not None else pred
+            canonical = canonical_log_distance(guiding_pred, best_tensor)
             weighted = canonical.pow(2) * weight_tensor
             loss = weighted.sum(dim=1).mean()
             per_latent_tether = F.mse_loss(z_g, z_g_initial, reduction="none").mean(dim=1)
@@ -762,11 +775,26 @@ class GuidedPopulation(Population):
             batch = max(1, len(self.trainer.dataset))
             if self.generation == 0:
                 self.reporters.info("Running initial SCAE warmup (100 epochs)")
-                self.trainer.train(epochs=100, batch_size=batch, generation=self.generation)
+                self.trainer.train(
+                    epochs=100,
+                    batch_size=batch,
+                    generation=self.generation,
+                    convex_weight=self.convex_surrogate_weight,
+                )
             elif self.generation < gen_for_full_train_resize:
-                self.trainer.train(epochs=50, batch_size=batch, generation=self.generation)
+                self.trainer.train(
+                    epochs=50,
+                    batch_size=batch,
+                    generation=self.generation,
+                    convex_weight=self.convex_surrogate_weight,
+                )
             else:
-                self.trainer.train(epochs=10, batch_size=batch, generation=self.generation)
+                self.trainer.train(
+                    epochs=10,
+                    batch_size=batch,
+                    generation=self.generation,
+                    convex_weight=self.convex_surrogate_weight,
+                )
             valid_size = len(self.trainer.dataset)
             invalid_size = len(self.trainer.invalid_dataset)
             total_size = valid_size + invalid_size

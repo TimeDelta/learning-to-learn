@@ -145,6 +145,12 @@ It is **regularized with fitness prediction**: part of the VAE's objective is to
 This means the VAE is encouraged to organize the latent space such that important features (those that correlate with high fitness) are captured in the representation.
 Dimensions of the latent vector that do not contribute to explaining variation in performance tend to be pruned out automatically (using techniques like Automatic Relevance Determination).
 The result is a compressed, fitness-informed search space: a smooth landscape where distances reflect meaningful differences in network capability.
+* **Convex ICNN Guidance:**
+To keep latent descent smooth without losing the heteroscedastic fitness predictor, the guide model includes an Input Convex Neural Network (ICNN) surrogate inspired by the convexity regularized latent space optimization (CR-LSO) paper ([56](#references)).
+The ICNN enforces non-negative skip weights so the latent-to-fitness surface stays convex, which is exploited in two places.
+Generation of guided offspring follows the ICNN gradient when refining latent codes, falling back to the MLP head if the ICNN is disabled.
+This reduces empty or duplicate decodes caused by jagged surrogate landscapes.
+The ICNN head is jointly trained alongside the rest of the signals (reconstruction from decoder, KL divergence, and learned L2 log-variancefrom the heteroscedastic fitness head).
 * **Cross-Species Mating via Latent Interpolation:**
 Once networks are encoded in this latent space, **any two networks** can be recombined by interpolating or randomly mixing their latent vectors and then decoding the result.
 In other words, the VAE enables **cross-species crossover**-two parent networks from entirely different niches or architectures can produce an offspring network.
@@ -270,6 +276,10 @@ This lets “trust region” radii expand for confident tasks and tighten whenev
 
 ---
 
+## Abbreviations
+- CR-LSO: Convexity Regularized Latent Space Optimization
+- ICNN: Input Convex Neural Network
+
 ## References
 1. [An Empirical Review of Automated Machine Learning](https://www.mdpi.com/2073-431X/10/1/11#sec3-computers-10-00011)
 2. [AutoML: A survey of the state-of-the-art](https://arxiv.org/pdf/1908.00709.pdf?arxiv.org)
@@ -326,3 +336,4 @@ This lets “trust region” radii expand for confident tasks and tighten whenev
 53. [A Fast and Elitist Multiobjective Genetic Algorithm: NSGA-II](https://sci2s.ugr.es/sites/default/files/files/Teaching/OtherPostGraduateCourses/Metaheuristicas/Deb_NSGAII.pdf)
 54. [GraphVAE: Towards Generation of Small Graphs Using Variational Autoencoders](https://arxiv.org/pdf/1802.03480.pdf)
 55. [Modeling by shortest data description](https://doi.org/10.1016/0005-1098(78)90005-5)
+56. [X. Rao, B. Zhao, and D. Liu, “CR-LSO: Convex Neural Architecture Optimization in the Latent Space of Graph Variational Autoencoder with Input Convex Neural Networks,” arXiv, Nov. 2022, doi: 10.48550/arXiv.2211.05950.](https://arxiv.org/abs/2211.05950)
