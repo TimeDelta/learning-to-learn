@@ -197,6 +197,12 @@ class GuidedPopulation(Population):
 
     def genome_to_data(self, genome: OptimizerGenome):
         # always rebuild graph_dict so that new attributes are captured
+        # but preserve any richer metadata (graph_ir/module_state) from prior exports
+        existing_graph = getattr(genome, "graph_dict", None) or {}
+        preserved_ir = copy.deepcopy(existing_graph.get("graph_ir")) if existing_graph else None
+        preserved_state = copy.deepcopy(existing_graph.get("module_state")) if existing_graph else None
+        preserved_type = existing_graph.get("module_type") if existing_graph else None
+
         # sort by node id so positions line up
         node_ids = sorted(genome.nodes.keys())
         node_types = []
@@ -232,6 +238,14 @@ class GuidedPopulation(Population):
         slot_shapes = getattr(genome, "slot_shapes", None)
         if slot_shapes is not None:
             graph_dict["slot_shapes"] = copy.deepcopy(slot_shapes)
+        if getattr(genome, "serialized_module", None) is not None:
+            graph_dict["serialized_module"] = genome.serialized_module
+        if preserved_ir is not None:
+            graph_dict["graph_ir"] = preserved_ir
+        if preserved_state is not None:
+            graph_dict["module_state"] = preserved_state
+        if preserved_type is not None:
+            graph_dict["module_type"] = preserved_type
         genome.graph_dict = graph_dict
         return Data(node_types=node_types, edge_index=edge_index, node_attributes=node_attributes)
 
@@ -259,6 +273,18 @@ class GuidedPopulation(Population):
         slot_shapes = graph_dict.get("slot_shapes")
         if slot_shapes is not None:
             cloned["slot_shapes"] = copy.deepcopy(slot_shapes)
+        serialized = graph_dict.get("serialized_module")
+        if serialized is not None:
+            cloned["serialized_module"] = bytes(serialized)
+        graph_ir = graph_dict.get("graph_ir")
+        if graph_ir is not None:
+            cloned["graph_ir"] = copy.deepcopy(graph_ir)
+        module_state = graph_dict.get("module_state")
+        if module_state is not None:
+            cloned["module_state"] = copy.deepcopy(module_state)
+        module_type = graph_dict.get("module_type")
+        if module_type is not None:
+            cloned["module_type"] = module_type
         return cloned
 
     @staticmethod

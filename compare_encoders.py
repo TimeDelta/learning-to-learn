@@ -12,6 +12,7 @@ from torch_geometric.loader import DataLoader
 import mlflow
 from attributes import BoolAttribute, FloatAttribute, IntAttribute, StringAttribute
 from genes import NODE_TYPE_TO_INDEX
+from graph_ir import export_script_module_to_graph_ir
 from metrics import MSELoss, sort_metrics_by_name
 from models import ManyLossMinimaModel
 from search_space_compression import (
@@ -25,6 +26,7 @@ from search_space_compression import (
     SharedAttributeVocab,
 )
 from tasks import TASK_TYPE_TO_CLASS
+from torchscript_utils import serialize_script_module
 
 # default until dataset generation sets real number of fitness dimensions
 fitness_dim = 1
@@ -67,6 +69,20 @@ def optimizer_to_data(opt):
         edge_index = torch.empty((2, 0), dtype=torch.long)
     node_types = torch.tensor(node_types, dtype=torch.long)
     return Data(node_types=node_types, edge_index=edge_index, node_attributes=node_attrs)
+
+
+def optimizer_to_graph_dict(opt):
+    data = optimizer_to_data(opt)
+    graph_ir, module_state = export_script_module_to_graph_ir(opt)
+    return {
+        "node_types": data.node_types,
+        "edge_index": data.edge_index,
+        "node_attributes": data.node_attributes,
+        "serialized_module": serialize_script_module(opt),
+        "graph_ir": graph_ir,
+        "module_state": module_state,
+        "module_type": opt._c._type().qualified_name() if hasattr(opt._c._type(), "qualified_name") else None,
+    }
 
 
 def evaluate_optimizer(optimizer, model, task, steps=5):

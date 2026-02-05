@@ -140,6 +140,7 @@ class OptimizerGenome(object):
         self.optimizer = None
         self.optimizer_path = None
         self.graph_dict = None
+        self.serialized_module: bytes | None = None
 
     def __deepcopy__(self, memo):
         # Create a blank instance
@@ -194,6 +195,8 @@ class OptimizerGenome(object):
 
     def mutate(self, config):
         """Mutates this genome."""
+        # Any structural mutation invalidates previously serialized TorchScript payloads.
+        self.serialized_module = None
 
         if config.single_structural_mutation:
             div = max(
@@ -447,6 +450,8 @@ class OptimizerGenome(object):
                 "edge_index": edge_index,
                 "node_attributes": node_attributes,
             }
+            if self.serialized_module is not None:
+                self.graph_dict["serialized_module"] = self.serialized_module
 
         self.optimizer = rebuild_and_script(self.graph_dict, genome_config, key=self.key)
         self.optimizer_path = None

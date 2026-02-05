@@ -11,7 +11,7 @@ from torch.fx.passes.utils.matcher_utils import SubgraphMatcher
 # allow imports from repo root
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from compare_encoders import optimizer_to_data
+from compare_encoders import optimizer_to_graph_dict
 from genome import OptimizerGenome
 from graph_builder import genome_from_graph_dict, rebuild_and_script
 from relative_rank_stagnation import RelativeRankStagnation
@@ -29,7 +29,8 @@ def make_config():
     )
 
 
-def get_node_signature(node):
+def get_node_signature(node, type_overrides=None):
+    type_overrides = type_overrides or {}
     """Return a simplified structural signature for a JIT node."""
     # simple signature includes kind (operator name), types of inputs, and output type
     input_kinds = [inp.node().kind() for inp in node.inputs()]
@@ -66,17 +67,28 @@ def get_node_signature(node):
                 const_val = const_val.tolist()
             attributes["const_value"] = const_val
         except Exception:
-            pass
+            if "name" in attributes:
+                attributes["const_value"] = None
 
+    output_types = []
+    for out in node.outputs():
+        override = type_overrides.get(out.debugName())
+        if override is not None:
+            output_types.append(override)
+        else:
+            output_types.append(str(out.type()))
+    output_types = tuple(output_types)
     return (
         node.kind(),
         tuple(input_kinds),
-        str(node.output().type()),
+        output_types,
         tuple(sorted(attributes.items())),
     )
 
 
 def compare_jit_graphs_structural(original: torch.jit.ScriptModule, rebuilt: torch.jit.ScriptModule) -> bool:
+    original_overrides = getattr(original, "graph_builder_type_overrides", {})
+    rebuilt_overrides = getattr(rebuilt, "graph_builder_type_overrides", {})
     original_inputs = list(original.graph.inputs())
     rebuilt_inputs = list(rebuilt.graph.inputs())
     original_outputs = list(original.graph.outputs())
@@ -103,8 +115,8 @@ def compare_jit_graphs_structural(original: torch.jit.ScriptModule, rebuilt: tor
     original_node_map = {}
     rebuilt_node_map = {}
     for i, (original_node, rebuilt_node) in enumerate(zip(original_nodes, rebuilt_nodes)):
-        original_signature = get_node_signature(original_node)
-        rebuilt_signature = get_node_signature(rebuilt_node)
+        original_signature = get_node_signature(original_node, original_overrides)
+        rebuilt_signature = get_node_signature(rebuilt_node, rebuilt_overrides)
 
         if original_signature != rebuilt_signature:
             print(f"Signatures differ at node {i}:", file=sys.stderr)
@@ -169,32 +181,42 @@ def compare_custom_data(original: torch.jit.ScriptModule, rebuilt: torch.jit.Scr
     return True
 
 
+@pytest.mark.parametrize("strip_serialized", [False, True])
 @pytest.mark.parametrize("pt_path", glob.glob(os.path.join("computation_graphs", "optimizers", "*.pt")))
-def test_graph_builder_rebuilds_pt(pt_path):
+def test_graph_builder_rebuilds_pt(pt_path, strip_serialized):
     original = torch.jit.load(pt_path)
-    data = optimizer_to_data(original)
-    graph_dict = {
-        "node_types": data.node_types,
-        "edge_index": data.edge_index,
-        "node_attributes": data.node_attributes,
-    }
+    graph_dict = dict(optimizer_to_graph_dict(original))
+    if strip_serialized:
+        graph_dict.pop("serialized_module", None)
 
     config = make_config()
     rebuilt = rebuild_and_script(graph_dict, config.genome_config, key=0)
 
     assert isinstance(rebuilt, torch.jit.ScriptModule)
 
-    expected_edges = set(map(tuple, data.edge_index.t().tolist()))
+    edge_index = graph_dict["edge_index"]
+    expected_edges = set()
+    if isinstance(edge_index, torch.Tensor) and edge_index.numel() > 0:
+        expected_edges = set(map(tuple, edge_index.t().tolist()))
     assert set(rebuilt.edges) == expected_edges
 
     assert rebuilt.input_keys == config.genome_config.input_keys
     assert rebuilt.output_keys == config.genome_config.output_keys
 
-    assert len(list(rebuilt.parameters())) == len(expected_edges)
-    assert len(rebuilt.node_types) == len(data.node_types)
+    assert rebuilt.edge_parameter_count == len(expected_edges)
+    assert len(rebuilt.node_types) == len(graph_dict["node_types"])
 
     # Verify that the rebuilt computation graph is structurally identical to the original
     assert compare_jit_graphs_structural(original, rebuilt)
+
+    if strip_serialized:
+        for name, value in (graph_dict.get("module_state") or {}).items():
+            assert hasattr(rebuilt, name)
+            rebuilt_value = getattr(rebuilt, name)
+            if torch.is_tensor(value):
+                assert torch.equal(rebuilt_value, value)
+            else:
+                assert rebuilt_value == value
 
 
 def test_genome_from_graph_dict_hydrates_structure():
@@ -216,3 +238,18 @@ def test_genome_from_graph_dict_hydrates_structure():
     assert genome.nodes[1].node_type == "aten::mul"
     assert (0, 1) in genome.connections
     assert genome.connections[(0, 1)].enabled
+
+
+def test_optimizer_to_graph_dict_includes_graph_ir():
+    original = torch.jit.load(os.path.join("computation_graphs", "optimizers", "adam_backprop.pt"))
+    graph_dict = optimizer_to_graph_dict(original)
+
+    graph_ir = graph_dict.get("graph_ir")
+    module_state = graph_dict.get("module_state")
+
+    assert isinstance(graph_ir, dict)
+    assert "inputs" in graph_ir and len(graph_ir["inputs"]) > 0
+    assert "nodes" in graph_ir and len(graph_ir["nodes"]) > 0
+    assert isinstance(module_state, dict)
+    # Expect at least the "step" attribute for Adam
+    assert "step" in module_state

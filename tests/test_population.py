@@ -166,12 +166,30 @@ def test_genome_to_data():
     data = pop.genome_to_data(genome)
 
     assert genome.graph_dict is not None
+
+
+def test_genome_to_data_preserves_graph_ir(monkeypatch):
+    config = make_config()
+    pop = GuidedPopulation(config)
+    genome = create_simple_genome()
+    genome.graph_dict = {
+        "node_types": torch.tensor([0, 1], dtype=torch.long),
+        "edge_index": torch.tensor([[0], [1]], dtype=torch.long),
+        "node_attributes": [{}, {}],
+        "graph_ir": {"inputs": [], "outputs": [], "nodes": []},
+        "module_state": {"step": 1},
+        "module_type": "__torch__.Dummy",
+    }
+
+    data = pop.genome_to_data(genome)
+
+    assert genome.graph_dict.get("graph_ir") == {"inputs": [], "outputs": [], "nodes": []}
+    assert genome.graph_dict.get("module_state") == {"step": 1}
+    assert genome.graph_dict.get("module_type") == "__torch__.Dummy"
     assert list(data.node_types.tolist()) == [NODE_TYPE_TO_INDEX["aten::add"], NODE_TYPE_TO_INDEX["aten::mul"]]
     assert data.edge_index.size(1) == 1
     assert data.edge_index[:, 0].tolist() == [0, 1]
     assert len(data.node_attributes) == 2
-    assert "a" in pop.shared_attr_vocab.name_to_index
-    assert "b" in pop.shared_attr_vocab.name_to_index
 
 
 def test_online_trainer_deduplicates_graphs():

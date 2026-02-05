@@ -27,6 +27,7 @@ from population import *
 from population import _INVALID_REASON_COUNTER
 from relative_rank_stagnation import RelativeRankStagnation
 from reproduction import *
+from torchscript_utils import serialize_script_module
 
 
 def _encode_string_sequence(values):
@@ -83,6 +84,7 @@ def create_initial_genome(config, optimizer):
     Creates an initial genome that mirrors the structure of the provided TorchScript optimizer computation graph.
     """
     genome = config.genome_type(0)
+    genome.serialized_module = serialize_script_module(optimizer)
 
     node_mapping = {}  # from TorchScript nodes to genome node keys
     next_node_id = 0
