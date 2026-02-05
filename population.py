@@ -806,6 +806,9 @@ class GuidedPopulation(Population):
                     batch_size=batch,
                     generation=self.generation,
                     convex_weight=self.convex_surrogate_weight,
+                    warmup_epochs=10,
+                    loss_threshold=0.97,
+                    baseline_window=5,
                 )
             elif self.generation < gen_for_full_train_resize:
                 self.trainer.train(
@@ -813,6 +816,9 @@ class GuidedPopulation(Population):
                     batch_size=batch,
                     generation=self.generation,
                     convex_weight=self.convex_surrogate_weight,
+                    warmup_epochs=5,
+                    loss_threshold=0.98,
+                    baseline_window=5,
                 )
             else:
                 self.trainer.train(
@@ -820,6 +826,9 @@ class GuidedPopulation(Population):
                     batch_size=batch,
                     generation=self.generation,
                     convex_weight=self.convex_surrogate_weight,
+                    warmup_epochs=3,
+                    loss_threshold=0.99,
+                    baseline_window=3,
                 )
             valid_size = len(self.trainer.dataset)
             invalid_size = len(self.trainer.invalid_dataset)

@@ -8,6 +8,7 @@ import math
 import os
 import random
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from warnings import warn
@@ -1495,7 +1496,14 @@ class OnlineTrainer:
         stop_epsilon=1e-3,
         verbose=True,
         generation=0,
+        baseline_window=5,
     ):
+        if warmup_epochs is None:
+            warmup_epochs = 0
+        warmup_epochs = max(0, int(warmup_epochs))
+        baseline_window = max(1, int(baseline_window))
+        recent_loss_window = deque(maxlen=baseline_window)
+
         train_samples = list(self.dataset)
         if self.invalid_dataset:
             if train_samples:
@@ -1716,6 +1724,9 @@ class OnlineTrainer:
                     )
             avg_loss_terms = total_loss_terms / len(loader)
             self.loss_history.append(avg_loss_terms.cpu().numpy())
+            total_loss = float(avg_loss_terms.sum().item())
+            recent_loss_window.append(total_loss)
+            smoothed_loss = sum(recent_loss_window) / len(recent_loss_window)
 
             per_metric_losses = {}
             if per_metric_weight_sum is not None and per_metric_weight_sum.numel() > 0:
@@ -1734,7 +1745,7 @@ class OnlineTrainer:
                     generation=generation,
                     epoch=epoch,
                     total_epochs=epochs,
-                    total_loss=float(avg_loss_terms.sum().item()),
+                    total_loss=total_loss,
                     loss_terms=loss_metrics,
                     per_metric_losses=per_metric_losses,
                     kl_beta=float(current_kl_weight),
@@ -1746,27 +1757,25 @@ class OnlineTrainer:
                 )
                 label_str = f"{label_str}, kl_beta={current_kl_weight:.4g}"
                 if not epochs:
-                    print(f"Epoch {epoch}, Loss terms per batch: [{label_str}] (total={avg_loss_terms.sum():.4f})")
+                    print(f"Epoch {epoch}, Loss terms per batch: [{label_str}] (total={total_loss:.4f})")
                 else:
-                    print(
-                        f"Epoch {epoch}/{epochs}, Loss terms per batch: [{label_str}] (total={avg_loss_terms.sum():.4f})"
-                    )
+                    print(f"Epoch {epoch}/{epochs}, Loss terms per batch: [{label_str}] (total={total_loss:.4f})")
             if DEBUG_TRAINER and epoch_timer is not None:
                 logger.info(
                     "Trainer epoch %d complete | duration=%.3fs loss=%.4f",
                     epoch,
                     time.perf_counter() - epoch_timer,
-                    avg_loss_terms.sum().item(),
+                    total_loss,
                 )
 
             # warm-up baseline
-            if epoch == warmup_epochs:
-                self.initial_loss = avg_loss_terms.sum().item()
+            if self.initial_loss is None and epoch >= warmup_epochs:
+                self.initial_loss = smoothed_loss
 
             # pruning condition
             if (
                 self.initial_loss is not None
-                and avg_loss_terms.sum().item() <= loss_threshold * self.initial_loss
+                and total_loss <= loss_threshold * self.initial_loss
                 and (epoch - self.last_prune_epoch) >= min_prune_break
             ):
                 active_count = int(self.model.graph_latent_mask.sum().item())
@@ -1787,17 +1796,19 @@ class OnlineTrainer:
                     if self.prune_callback is not None:
                         try:
                             self.prune_callback(
-                                generation=generation,
-                                epoch=epoch,
-                                global_epoch=self._kl_global_epoch,
-                                active_before=active_before,
-                                active_after=active_after,
-                                pruned_dims=pruned_dims,
+                                {
+                                    "generation": generation,
+                                    "epoch": epoch,
+                                    "global_epoch": self._kl_global_epoch,
+                                    "active_before": active_before,
+                                    "active_after": active_after,
+                                    "pruned_dims": pruned_dims,
+                                }
                             )
                         except Exception:  # pragma: no cover - defensive logging
                             logger.exception("Latent prune callback failed")
                     self.last_prune_epoch = epoch
-                    self.initial_loss = avg_loss_terms.sum()  # reset baseline
+                    self.initial_loss = smoothed_loss  # reset baseline with smoothed value
 
             self._kl_global_epoch += 1
             epoch += 1
