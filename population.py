@@ -9,7 +9,7 @@ import weakref
 from collections import Counter, deque
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Sequence, Set
+from typing import Any, Dict, List, Sequence, Set, Tuple
 from warnings import warn
 
 import torch
@@ -441,8 +441,8 @@ class GuidedPopulation(Population):
         empty_feedback = self._guided_empty_ratio()
         latent_steps = max(5, int(latent_steps * (1.0 - 0.5 * empty_feedback)))
         latent_lr = float(latent_lr) * (0.5 + 0.5 * (1.0 - empty_feedback))
-        decode_jitter_std = float(decode_jitter_std) * (0.5 + 0.5 * (1.0 - empty_feedback))
         latent_tether_init = float(latent_tether_init) * (1.0 + empty_feedback)
+        _ = decode_jitter_std  # legacy arg retained; repair hook replaces jitter retries
 
         metric_keys = self.metric_keys
         metric_best_values = self.metric_best_values
@@ -558,9 +558,9 @@ class GuidedPopulation(Population):
         empty_graph_count = 0
         duplicate_count = 0
         rebuild_failures = 0
-        resample_attempts = 0
         inactive_optimizer_count = 0
         missing_slot_rejections = 0
+        repair_failures = 0
         debug_dir = Path("debug_guided_offspring")
         debug_dir.mkdir(parents=True, exist_ok=True)
         debug_save_limit = 5
@@ -568,145 +568,106 @@ class GuidedPopulation(Population):
         generation_idx = getattr(self, "generation", -1)
         seen_graph_signatures: Set[str] = set()
         total_requested = z_g.size(0)
-        max_decode_attempts = max(1, max_decode_attempts)
         invalid_reason_counts: Counter = Counter()
+        last_nonempty_graph_dict = None
 
         for i in range(total_requested):
             latent = z_g[i].unsqueeze(0).clone()
-            attempt = 0
-            accepted = False
-            best_nonempty_latent = None
-            last_nonempty_graph_dict = None
-            while attempt < max_decode_attempts:
-                attempt += 1
-                with torch.no_grad():
-                    decoded = self.guide.decode(latent)
-                if isinstance(decoded, tuple):
-                    decoded_graphs, _ = decoded
-                else:
-                    decoded_graphs = decoded
-                graph_dict = decoded_graphs[0]
-                genome = genome_from_graph_dict(graph_dict, self.config.genome_config, key=i)
-                num_edges = len(genome.connections)
-                num_params = len(genome.connections)
-                graph_signature = graph_signature_from_dict(graph_dict)
+            with torch.no_grad():
+                decoded = self.guide.decode(latent)
+            if isinstance(decoded, tuple):
+                decoded_graphs, _ = decoded
+            else:
+                decoded_graphs = decoded
+            graph_dict = decoded_graphs[0]
+            repaired = self._repair_graph_dict(graph_dict)
+            if repaired is False:
+                repair_failures += 1
+            genome = genome_from_graph_dict(graph_dict, self.config.genome_config, key=i)
+            num_edges = len(genome.connections)
+            num_params = len(genome.connections)
+            graph_signature = graph_signature_from_dict(graph_dict)
 
-                if num_edges > 0:
-                    best_nonempty_latent = latent.detach().clone()
-                    last_nonempty_graph_dict = self._clone_graph_dict(graph_dict)
+            if num_edges > 0:
+                last_nonempty_graph_dict = self._clone_graph_dict(graph_dict)
 
-                if num_edges == 0 or debug_saved < debug_save_limit:
-                    debug_path = debug_dir / f"gen{generation_idx}_child{i}_attempt{attempt}_edges{num_edges}.pt"
-                    torch.save(graph_dict, debug_path)
-                    debug_saved += 1
+            if num_edges == 0 or debug_saved < debug_save_limit:
+                debug_path = debug_dir / f"gen{generation_idx}_child{i}_edges{num_edges}.pt"
+                torch.save(graph_dict, debug_path)
+                debug_saved += 1
 
-                if num_edges == 0:
-                    empty_graph_count += 1
-                    if attempt < max_decode_attempts:
-                        base = best_nonempty_latent if best_nonempty_latent is not None else latent
-                        latent = base + torch.randn_like(base) * decode_jitter_std
-                        resample_attempts += 1
-                        continue
-                    warn(
-                        "Guided offspring decoder produced an empty graph (no edges); assigning penalty fitness and skipping evaluation."
-                    )
+            if num_edges == 0:
+                empty_graph_count += 1
+                warn("Guided offspring decoder produced an empty graph (no edges); assigning penalty fitness.")
+                genome.graph_dict = graph_dict
+                self._assign_penalty(genome, reason="empty_graph", skip_evaluation=True)
+                if last_nonempty_graph_dict is not None:
+                    self._buffer_decoder_replay_dict(last_nonempty_graph_dict)
+                invalid_reason_counts["empty_graph"] += 1
+                if graph_signature:
+                    seen_graph_signatures.add(graph_signature)
+                new_genomes.append(genome)
+                continue
+
+            if graph_signature in seen_graph_signatures:
+                duplicate_count += 1
+                warn("Guided offspring decoder produced a duplicate graph; skipping to preserve diversity.")
+                if last_nonempty_graph_dict is not None:
+                    self._buffer_decoder_replay_dict(last_nonempty_graph_dict)
+                continue
+
+            slot_ok, slot_details = self._graph_output_slot_coverage(graph_dict)
+            if not slot_ok:
+                missing_slot_rejections += 1
+                detail_parts = []
+                missing_slots = slot_details.get("missing_slots", [])
+                slot_attrs = slot_details.get("attributes", {})
+                for slot_idx in missing_slots:
+                    attr_names = slot_attrs.get(slot_idx) or []
+                    attrs_summary = ",".join(attr_names) if attr_names else "<none>"
+                    detail_parts.append(f"slot{slot_idx}[attrs={attrs_summary}]")
+                message = "Guided offspring graph never routed into optimizer outputs; " + (
+                    "; ".join(detail_parts) if detail_parts else "no slot metadata available"
+                )
+                warn(message + "; assigning penalty fitness.")
+                genome.graph_dict = graph_dict
+                self._assign_penalty(genome, reason="missing_output_slots", skip_evaluation=True)
+                self._buffer_decoder_replay_dict(last_nonempty_graph_dict or graph_dict)
+                invalid_reason_counts["missing_output_slots"] += 1
+                if graph_signature:
+                    seen_graph_signatures.add(graph_signature)
+                new_genomes.append(genome)
+                continue
+
+            optimizer = rebuild_and_script(graph_dict, self.config.genome_config, key=i, genome=genome)
+            if optimizer:
+                if not self._optimizer_updates_parameters(optimizer, check_steps=2):
+                    inactive_optimizer_count += 1
+                    warn("Guided offspring optimizer failed to modify model parameters; assigning penalty fitness.")
                     genome.graph_dict = graph_dict
-                    self._assign_penalty(genome, reason="empty_graph", skip_evaluation=True)
-                    if last_nonempty_graph_dict is not None:
-                        self._buffer_decoder_replay_dict(last_nonempty_graph_dict)
-                    invalid_reason_counts["empty_graph"] += 1
-                    if graph_signature:
-                        seen_graph_signatures.add(graph_signature)
-                    new_genomes.append(genome)
-                    accepted = True
-                    break
-
-                if graph_signature in seen_graph_signatures:
-                    duplicate_count += 1
-                    if attempt < max_decode_attempts:
-                        base = best_nonempty_latent if best_nonempty_latent is not None else latent
-                        latent = base + torch.randn_like(base) * decode_jitter_std
-                        resample_attempts += 1
-                        continue
-                    warn("Guided offspring decoder produced a duplicate graph; skipping to preserve diversity.")
-                    if last_nonempty_graph_dict is not None:
-                        self._buffer_decoder_replay_dict(last_nonempty_graph_dict)
-                    break
-
-                slot_ok, slot_details = self._graph_output_slot_coverage(graph_dict)
-                if not slot_ok:
-                    missing_slot_rejections += 1
-                    detail_parts = []
-                    missing_slots = slot_details.get("missing_slots", [])
-                    slot_attrs = slot_details.get("attributes", {})
-                    for slot_idx in missing_slots:
-                        attr_names = slot_attrs.get(slot_idx) or []
-                        attrs_summary = ",".join(attr_names) if attr_names else "<none>"
-                        detail_parts.append(f"slot{slot_idx}[attrs={attrs_summary}]")
-                    message = "Guided offspring graph never routed into optimizer outputs; " + (
-                        "; ".join(detail_parts) if detail_parts else "no slot metadata available"
-                    )
-                    if attempt < max_decode_attempts:
-                        self.reporters.info(message + " -- resampling latent")
-                        base = best_nonempty_latent if best_nonempty_latent is not None else latent
-                        latent = base + torch.randn_like(base) * decode_jitter_std
-                        resample_attempts += 1
-                        continue
-                    warn(message + "; assigning penalty fitness.")
-                    genome.graph_dict = graph_dict
-                    self._assign_penalty(genome, reason="missing_output_slots", skip_evaluation=True)
+                    self._assign_penalty(genome, reason="inactive_optimizer", skip_evaluation=True)
                     self._buffer_decoder_replay_dict(last_nonempty_graph_dict or graph_dict)
-                    invalid_reason_counts["missing_output_slots"] += 1
+                    invalid_reason_counts["inactive_optimizer"] += 1
                     if graph_signature:
                         seen_graph_signatures.add(graph_signature)
                     new_genomes.append(genome)
-                    break
-
-                optimizer = rebuild_and_script(graph_dict, self.config.genome_config, key=i, genome=genome)
-                if optimizer:
-                    if not self._optimizer_updates_parameters(optimizer, self.task, check_steps=2):
-                        inactive_optimizer_count += 1
-                        if attempt < max_decode_attempts:
-                            base = best_nonempty_latent if best_nonempty_latent is not None else latent
-                            latent = base + torch.randn_like(base) * decode_jitter_std
-                            resample_attempts += 1
-                            continue
-                        warn(
-                            "Guided offspring optimizer failed to modify model parameters; skipping child after retries."
-                        )
-                        genome.graph_dict = graph_dict
-                        self._assign_penalty(genome, reason="inactive_optimizer", skip_evaluation=True)
-                        self._buffer_decoder_replay_dict(last_nonempty_graph_dict or graph_dict)
-                        invalid_reason_counts["inactive_optimizer"] += 1
-                        if graph_signature:
-                            seen_graph_signatures.add(graph_signature)
-                        new_genomes.append(genome)
-                        break
-
-                    genome.optimizer = optimizer
-                    genome.graph_dict = graph_dict
-                    if graph_signature:
-                        seen_graph_signatures.add(graph_signature)
-                    new_genomes.append(genome)
-                    stats.append((i, num_edges, num_params))
-                    accepted = True
-                    break
-
-                rebuild_failures += 1
-                if attempt < max_decode_attempts:
-                    base = best_nonempty_latent if best_nonempty_latent is not None else latent
-                    latent = base + torch.randn_like(base) * decode_jitter_std
-                    resample_attempts += 1
                     continue
-                warn("Guided offspring decoder failed to rebuild a valid optimizer; skipping child.")
-                self._buffer_decoder_replay_dict(last_nonempty_graph_dict)
-                break
 
-            # move to next latent whether or not we accepted anything
+                genome.optimizer = optimizer
+                genome.graph_dict = graph_dict
+                if graph_signature:
+                    seen_graph_signatures.add(graph_signature)
+                new_genomes.append(genome)
+                stats.append((i, num_edges, num_params))
+                continue
+
+            rebuild_failures += 1
+            warn("Guided offspring decoder failed to rebuild a valid optimizer; skipping child.")
+            self._buffer_decoder_replay_dict(last_nonempty_graph_dict)
 
         if empty_graph_count:
             warn(
-                f"Guided offspring decoder generated {empty_graph_count} empty graphs across {total_requested * max_decode_attempts} decode attempts."
+                f"Guided offspring decoder generated {empty_graph_count} empty graphs across {total_requested} decode attempts."
             )
         if duplicate_count:
             warn(
@@ -718,6 +679,8 @@ class GuidedPopulation(Population):
             warn(f"Guided offspring decoder graphs missing optimizer output coverage: {missing_slot_rejections}")
         if inactive_optimizer_count:
             warn(f"Guided offspring optimizers with no parameter updates: {inactive_optimizer_count}")
+        if repair_failures:
+            warn(f"Guided offspring repair hook could not rescue {repair_failures} decoded graphs.")
 
         if stats:
             sample = ", ".join(f"child {idx}: edges={edges}, params={params}" for idx, edges, params in stats[:10])
@@ -725,7 +688,7 @@ class GuidedPopulation(Population):
 
         if total_requested:
             self.reporters.info(
-                "Guided offspring summary: %d/%d survived (duplicates=%d, empty=%d, rebuild_failures=%d, inactive=%d, resamples=%d)"
+                "Guided offspring summary: %d/%d survived (duplicates=%d, empty=%d, rebuild_failures=%d, inactive=%d)"
                 % (
                     len(stats),
                     total_requested,
@@ -733,7 +696,6 @@ class GuidedPopulation(Population):
                     empty_graph_count,
                     rebuild_failures,
                     inactive_optimizer_count,
-                    resample_attempts,
                 )
             )
 
@@ -785,6 +747,182 @@ class GuidedPopulation(Population):
 
         details = {"missing_slots": missing, "attributes": attr_lookup, "referenced_slots": sorted(referenced)}
         return len(missing) == 0, details
+
+    @staticmethod
+    def _edge_list_from_index(edge_index, node_count: int) -> List[Tuple[int, int]]:
+        if edge_index is None:
+            return []
+        if isinstance(edge_index, torch.Tensor):
+            tensor = edge_index.clone().detach().long()
+        else:
+            tensor = torch.as_tensor(edge_index, dtype=torch.long)
+        if tensor.dim() == 1:
+            tensor = tensor.view(2, -1)
+        edges: List[Tuple[int, int]] = []
+        if tensor.numel() > 0:
+            for src, dst in tensor.t().tolist():
+                if 0 <= int(src) < node_count and 0 <= int(dst) < node_count:
+                    edges.append((int(src), int(dst)))
+        return edges
+
+    @staticmethod
+    def _normalize_node_attributes(node_attrs: List[dict] | None, node_count: int) -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
+        node_attrs = node_attrs or []
+        for idx in range(node_count):
+            attrs = node_attrs[idx] if idx < len(node_attrs) else {}
+            normalized_dict: Dict[str, Any] = {}
+            if isinstance(attrs, dict):
+                for key, value in attrs.items():
+                    normalized_dict[attribute_key_to_name(key)] = value
+            normalized.append(normalized_dict)
+        return normalized
+
+    def _repair_graph_dict(self, graph_dict) -> bool:
+        node_types = graph_dict.get("node_types")
+        if node_types is None:
+            graph_dict["edge_index"] = torch.empty((2, 0), dtype=torch.long)
+            return False
+        if isinstance(node_types, torch.Tensor):
+            node_count = int(node_types.numel())
+        else:
+            node_count = len(node_types)
+        if node_count <= 0:
+            graph_dict["edge_index"] = torch.empty((2, 0), dtype=torch.long)
+            return False
+
+        edges = self._edge_list_from_index(graph_dict.get("edge_index"), node_count)
+        edge_set = set(edges)
+        adjacency_out = {idx: [] for idx in range(node_count)}
+        adjacency_in = {idx: [] for idx in range(node_count)}
+        for src, dst in edges:
+            adjacency_out[src].append(dst)
+            adjacency_in[dst].append(src)
+
+        normalized_attrs = self._normalize_node_attributes(graph_dict.get("node_attributes"), node_count)
+        input_nodes = [idx for idx, attrs in enumerate(normalized_attrs) if attrs.get("node_type") == "input"]
+        output_nodes = [idx for idx, attrs in enumerate(normalized_attrs) if attrs.get("node_type") == "output"]
+        configured_inputs = list(getattr(self.config.genome_config, "input_keys", []))
+        configured_outputs = list(getattr(self.config.genome_config, "output_keys", []))
+        if configured_inputs and len(input_nodes) < len(configured_inputs):
+            graph_dict["edge_index"] = torch.empty((2, 0), dtype=torch.long)
+            return False
+        if configured_outputs and len(output_nodes) < len(configured_outputs):
+            graph_dict["edge_index"] = torch.empty((2, 0), dtype=torch.long)
+            return False
+        if not input_nodes:
+            input_nodes = list(range(min(2, node_count))) or [0]
+        valid_outputs = [int(ok) for ok in configured_outputs if 0 <= int(ok) < node_count]
+        if output_nodes and valid_outputs:
+            # merge decoded tags with configured slots without duplicates
+            merged = list(dict.fromkeys(output_nodes + valid_outputs))
+            output_nodes = merged
+        elif not output_nodes:
+            output_nodes = valid_outputs or [node_count - 1]
+
+        hidden_nodes = [idx for idx in range(node_count) if idx not in input_nodes and idx not in output_nodes]
+        output_set = set(output_nodes)
+
+        def add_edge(src: int, dst: int) -> bool:
+            if src == dst or src < 0 or dst < 0 or src >= node_count or dst >= node_count:
+                return False
+            key = (int(src), int(dst))
+            if key in edge_set:
+                return False
+            edge_set.add(key)
+            edges.append(key)
+            adjacency_out[src].append(dst)
+            adjacency_in[dst].append(src)
+            return True
+
+        target_pool = hidden_nodes or [node for node in range(node_count) if node not in input_nodes]
+        if not target_pool:
+            target_pool = output_nodes
+
+        for idx, node in enumerate(input_nodes):
+            if adjacency_out[node]:
+                continue
+            candidate = target_pool[idx % len(target_pool)] if target_pool else node
+            if candidate == node and node_count > 1:
+                candidate = (node + 1) % node_count
+            add_edge(node, candidate)
+
+        for idx, node in enumerate(output_nodes):
+            if adjacency_in[node]:
+                continue
+            sources = input_nodes + hidden_nodes
+            if not sources:
+                sources = [node]
+            candidate = sources[idx % len(sources)]
+            if candidate == node and node_count > 1:
+                candidate = (node - 1) % node_count
+            add_edge(candidate, node)
+
+        def input_reaches_output(src: int) -> bool:
+            if src not in adjacency_out:
+                return False
+            visited: Set[int] = {src}
+            queue = deque([src])
+            while queue:
+                current = queue.popleft()
+                if current in output_set:
+                    return True
+                for dst in adjacency_out.get(current, []):
+                    if dst not in visited:
+                        visited.add(dst)
+                        queue.append(dst)
+            return False
+
+        for idx, inp in enumerate(input_nodes):
+            if not output_nodes:
+                break
+            if input_reaches_output(inp):
+                continue
+            candidate = output_nodes[idx % len(output_nodes)]
+            if candidate == inp and node_count > 1:
+                candidate = (candidate + 1) % node_count
+            added = add_edge(inp, candidate)
+            if not added and hidden_nodes:
+                hub = hidden_nodes[idx % len(hidden_nodes)]
+                add_edge(inp, hub)
+                add_edge(hub, candidate)
+
+        def reachable_nodes() -> Set[int]:
+            reachable: Set[int] = set(input_nodes)
+            queue = deque(input_nodes)
+            while queue:
+                current = queue.popleft()
+                for dst in adjacency_out.get(current, []):
+                    if dst not in reachable:
+                        reachable.add(dst)
+                        queue.append(dst)
+            return reachable
+
+        reachable = reachable_nodes()
+        for node in output_nodes:
+            if node in reachable:
+                continue
+            sources = [src for src in reachable if src != node]
+            if not sources:
+                sources = input_nodes
+            if not sources:
+                break
+            add_edge(sources[0], node)
+            reachable = reachable_nodes()
+
+        if not edges:
+            default_src = input_nodes[0] if input_nodes else 0
+            default_dst = output_nodes[0] if output_nodes else (0 if node_count == 1 else 1)
+            if default_src == default_dst and node_count > 1:
+                default_dst = (default_dst + 1) % node_count
+            add_edge(default_src, default_dst)
+
+        if edges:
+            tensor = torch.as_tensor(edges, dtype=torch.long).t().contiguous()
+        else:
+            tensor = torch.empty((2, 0), dtype=torch.long)
+        graph_dict["edge_index"] = tensor
+        return bool(edges)
 
     def _optimizer_updates_parameters(self, optimizer, check_steps=2, delta_eps=1e-12):
         """Run a short dry-run to ensure the optimizer changes model weights."""

@@ -1,5 +1,6 @@
 import os
 import sys
+from collections import deque
 from types import SimpleNamespace
 
 import neat
@@ -343,6 +344,94 @@ def test_generate_guided_offspring_handles_missing_elites():
     assert len(offspring) <= 3
     for child in offspring:
         assert isinstance(child, OptimizerGenome)
+
+
+def _make_empty_graph_dict(node_count: int, node_attrs):
+    return {
+        "node_types": torch.zeros(node_count, dtype=torch.long),
+        "edge_index": torch.empty((2, 0), dtype=torch.long),
+        "node_attributes": node_attrs,
+    }
+
+
+def test_repair_requires_configured_io_nodes():
+    config = make_config()
+    pop = GuidedPopulation(config)
+    num_inputs = len(config.genome_config.input_keys)
+    num_outputs = len(config.genome_config.output_keys)
+
+    # Omit one required input label.
+    node_attrs = []
+    for idx in range(max(1, num_inputs + num_outputs)):
+        if idx < max(0, num_inputs - 1):
+            node_attrs.append({"node_type": "input"})
+        elif idx < max(0, num_inputs + num_outputs - 1):
+            node_attrs.append({"node_type": "output"})
+        else:
+            node_attrs.append({"node_type": "hidden"})
+    graph = _make_empty_graph_dict(len(node_attrs), node_attrs)
+    assert not pop._repair_graph_dict(graph)
+    assert graph["edge_index"].numel() == 0
+
+    # Omit one required output label.
+    node_attrs = []
+    for idx in range(max(1, num_inputs + num_outputs)):
+        if idx < num_inputs:
+            node_attrs.append({"node_type": "input"})
+        elif idx < num_inputs + max(0, num_outputs - 1):
+            node_attrs.append({"node_type": "output"})
+        else:
+            node_attrs.append({"node_type": "hidden"})
+    graph = _make_empty_graph_dict(len(node_attrs), node_attrs)
+    assert not pop._repair_graph_dict(graph)
+    assert graph["edge_index"].numel() == 0
+
+
+def test_repair_connects_each_input_to_output():
+    config = make_config()
+    pop = GuidedPopulation(config)
+    num_inputs = len(config.genome_config.input_keys)
+    num_outputs = len(config.genome_config.output_keys)
+
+    node_attrs = []
+    for _ in range(num_inputs):
+        node_attrs.append({"node_type": "input"})
+    for _ in range(num_outputs):
+        node_attrs.append({"node_type": "output"})
+    node_attrs.append({"node_type": "hidden"})
+
+    graph = _make_empty_graph_dict(len(node_attrs), node_attrs)
+    assert pop._repair_graph_dict(graph)
+    edge_index = graph["edge_index"]
+    assert edge_index.numel() > 0
+
+    edges = edge_index.t().tolist() if edge_index.numel() else []
+    adjacency = {idx: [] for idx in range(len(node_attrs))}
+    for src, dst in edges:
+        adjacency[src].append(dst)
+
+    output_nodes = [idx for idx, attrs in enumerate(node_attrs) if attrs.get("node_type") == "output"]
+    input_nodes = [idx for idx, attrs in enumerate(node_attrs) if attrs.get("node_type") == "input"]
+
+    def reachables_from(source):
+        seen = {source}
+        queue = deque([source])
+        while queue:
+            current = queue.popleft()
+            for dst in adjacency.get(current, []):
+                if dst not in seen:
+                    seen.add(dst)
+                    queue.append(dst)
+        return seen
+
+    reachable_union = set()
+    for inp in input_nodes:
+        seen = reachables_from(inp)
+        reachable_union.update(seen)
+        assert any(out in seen for out in output_nodes)
+
+    for out in output_nodes:
+        assert out in reachable_union
 
 
 def test_fitness_predictor_returns_per_metric_log_scales():

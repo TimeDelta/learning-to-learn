@@ -95,6 +95,11 @@ To keep these failures from overwhelming the surrogate model:
 
 This subsampling keeps the decoder from collapsing onto invalid DAGs while still providing a clear gradient signal to steer it back toward feasible graphs.
 
+**Deterministic Repair.** The post-decoding phase is treated as a constrained graph-repair problem: every decoded adjacency  is first passed through an analytical repair operator (`GuidedPopulation._repair_graph_dict`).
+The operator only executes when every required input and output node is present in the decoded graph; otherwise the sample is rejected immediately and a graph containing all required input and output nodes such that each input has a path to at least one output and each output has a path from some input.
+It reconstructs role labels for nodes using decoded attributes plus the configured IO slot set, runs forward/backward reachability to detect outputs lacking an ancestral input, and injects the minimal set of additional edges required so that **each input has a path to at least one output and each output has a path from some input**, all while leaving previously enabled connections intact.
+Otherwise, the repaired graph replaces the original latent sample for evaluation.
+
 ### Stabilizing Graph Attribute Decoding
 
 To avoid decoder stalls from attr-name loops that never received a termination signal, teacher forcing is used for those sequences:
