@@ -507,6 +507,12 @@ if __name__ == "__main__":
             help="Number of generations to evolve (default: 1000)",
         )
         parser.add_argument(
+            "--test",
+            dest="test_mode",
+            action="store_true",
+            help=("Reduce trainer epochs per generation for quick smoke tests or continuous integration runs."),
+        )
+        parser.add_argument(
             "--enable-mlflow",
             action="store_true",
             help="Enable MLflow tracking for this run.",
@@ -574,6 +580,8 @@ if __name__ == "__main__":
     config = neat.Config(
         OptimizerGenome, GuidedReproduction, neat.DefaultSpeciesSet, RelativeRankStagnation, args.config_file
     )
+    if getattr(args, "test_mode", False):
+        setattr(config, "test_mode", True)
     if args.max_evaluation_steps is not None:
         max_epochs = max(1, int(args.max_evaluation_steps))
         setattr(config, "max_evaluation_steps", max_epochs)

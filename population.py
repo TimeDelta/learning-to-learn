@@ -1,5 +1,6 @@
 import atexit
 import copy
+import math
 import random
 import re
 import signal
@@ -98,6 +99,17 @@ class GuidedPopulation(Population):
         self.guide = SelfCompressingFitnessRegularizedDAGVAE(graph_encoder, decoder, predictor)
         self.optimizer = torch.optim.Adam(self.guide.parameters(), lr=0.001)
         self.trainer = OnlineTrainer(self.guide, self.optimizer, metric_keys=self.metric_keys)
+        self.full_train_resize_generation = int(getattr(config, "full_train_resize_generation", 25))
+        self.test_mode = bool(getattr(config, "test_mode", False))
+        if self.test_mode:
+            raw_scale = getattr(config, "test_epoch_scale", 0.1)
+            try:
+                scale = float(raw_scale)
+            except (TypeError, ValueError):
+                scale = 0.1
+            self.test_epoch_scale = max(0.01, min(1.0, scale))
+        else:
+            self.test_epoch_scale = None
         self.decoder_teacher_epochs_base = int(getattr(config, "decoder_teacher_epochs", 5))
         self.decoder_teacher_epochs_max = int(
             getattr(config, "decoder_teacher_epochs_max", max(5, self.decoder_teacher_epochs_base * 3))
@@ -217,6 +229,49 @@ class GuidedPopulation(Population):
         epochs = max(self.decoder_teacher_epochs_base, min(self.decoder_teacher_epochs_max, epochs))
         weight = max(self.decoder_teacher_force_weight_base, min(self.decoder_teacher_force_weight_max, weight))
         return epochs, weight
+
+    def _trainer_epoch_schedule(self) -> Dict[str, float]:
+        """Return the epoch/warmup schedule for the current generation."""
+        if self.generation == 0:
+            schedule = {
+                "epochs": 100,
+                "warmup_epochs": 10,
+                "loss_threshold": 0.97,
+                "baseline_window": 5,
+            }
+        elif self.generation < self.full_train_resize_generation:
+            schedule = {
+                "epochs": 50,
+                "warmup_epochs": 5,
+                "loss_threshold": 0.98,
+                "baseline_window": 5,
+            }
+        else:
+            schedule = {
+                "epochs": 10,
+                "warmup_epochs": 3,
+                "loss_threshold": 0.99,
+                "baseline_window": 3,
+            }
+        return self._apply_test_epoch_reduction(schedule)
+
+    def _apply_test_epoch_reduction(self, schedule: Dict[str, float]) -> Dict[str, float]:
+        if not self.test_mode:
+            return schedule
+        scaled = dict(schedule)
+        scale = self.test_epoch_scale or 0.1
+        scaled_epochs = max(1, int(math.ceil(schedule["epochs"] * scale)))
+        scaled["epochs"] = scaled_epochs
+        scaled["warmup_epochs"] = min(
+            scaled_epochs,
+            max(1, int(math.ceil(schedule["warmup_epochs"] * scale))),
+        )
+        scaled["baseline_window"] = min(
+            scaled_epochs,
+            max(1, int(math.ceil(schedule["baseline_window"] * scale))),
+        )
+        scaled["loss_threshold"] = min(schedule["loss_threshold"], 0.9)
+        return scaled
 
     def _buffer_decoder_replay_dict(self, graph_dict: dict | None):
         if not graph_dict or self.decoder_replay_max <= 0:
@@ -980,7 +1035,6 @@ class GuidedPopulation(Population):
             raise RuntimeError("Cannot have no generational limit with no fitness termination")
 
         self.generation = 0
-        gen_for_full_train_resize = 25
         while n is None or self.generation < n:
             self.reporters.start_generation(self.generation)
             self._reset_guided_offspring_stats()
@@ -1020,37 +1074,19 @@ class GuidedPopulation(Population):
                 )
 
             batch = max(1, len(self.trainer.dataset))
+            schedule = self._trainer_epoch_schedule()
             if self.generation == 0:
-                self.reporters.info("Running initial SCAE warmup (100 epochs)")
-                self.trainer.train(
-                    epochs=100,
-                    batch_size=batch,
-                    generation=self.generation,
-                    convex_weight=self.convex_surrogate_weight,
-                    warmup_epochs=10,
-                    loss_threshold=0.97,
-                    baseline_window=5,
-                )
-            elif self.generation < gen_for_full_train_resize:
-                self.trainer.train(
-                    epochs=50,
-                    batch_size=batch,
-                    generation=self.generation,
-                    convex_weight=self.convex_surrogate_weight,
-                    warmup_epochs=5,
-                    loss_threshold=0.98,
-                    baseline_window=5,
-                )
-            else:
-                self.trainer.train(
-                    epochs=10,
-                    batch_size=batch,
-                    generation=self.generation,
-                    convex_weight=self.convex_surrogate_weight,
-                    warmup_epochs=3,
-                    loss_threshold=0.99,
-                    baseline_window=3,
-                )
+                mode_note = " (test mode)" if self.test_mode else ""
+                self.reporters.info(f"Running initial SCAE warmup ({schedule['epochs']} epochs{mode_note})")
+            self.trainer.train(
+                epochs=schedule["epochs"],
+                batch_size=batch,
+                generation=self.generation,
+                convex_weight=self.convex_surrogate_weight,
+                warmup_epochs=schedule["warmup_epochs"],
+                loss_threshold=schedule["loss_threshold"],
+                baseline_window=schedule["baseline_window"],
+            )
             decoder_epochs, decoder_weight = self._decoder_refresh_schedule()
             replay_payload = self._consume_decoder_replay_graphs()
             if decoder_epochs > 0 and (self.trainer.dataset or replay_payload):

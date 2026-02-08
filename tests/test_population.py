@@ -267,6 +267,23 @@ def test_generation_eval_steps_respects_max_cap():
     assert pop._generation_eval_steps() == 25
 
 
+def test_test_mode_reduces_trainer_epochs():
+    config = make_config()
+    config.test_mode = True
+    config.test_epoch_scale = 0.1
+    pop = GuidedPopulation(config)
+
+    pop.generation = 0
+    warmup_schedule = pop._trainer_epoch_schedule()
+    assert warmup_schedule["epochs"] < 100
+    assert warmup_schedule["warmup_epochs"] <= warmup_schedule["epochs"]
+
+    pop.generation = pop.full_train_resize_generation + 5
+    steady_schedule = pop._trainer_epoch_schedule()
+    assert steady_schedule["epochs"] <= 1
+    assert steady_schedule["loss_threshold"] <= 0.9
+
+
 def test_graph_output_slot_precheck_detects_missing_slots():
     config = make_config()
     pop = GuidedPopulation(config)
