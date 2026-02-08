@@ -1866,6 +1866,32 @@ class OnlineTrainer:
             recent_loss_window.append(total_loss)
             smoothed_loss = sum(recent_loss_window) / len(recent_loss_window)
 
+            wl_idx = loss_term_labels.index("wl_structural")
+            wl_value = float(avg_loss_terms[wl_idx].item())
+            non_wl_total = float((avg_loss_terms.sum() - avg_loss_terms[wl_idx]).item())
+            if self.wl_loss_weight > 0 and wl_value > 0 and non_wl_total > 0:
+                ratio = wl_value / max(non_wl_total, 1e-8)
+                if ratio > 0.5:
+                    logger.warning(
+                        "WL structural loss is %.2f%% of total; consider lowering wl_kernel_loss_weight to avoid overpowering reconstruction/fitness terms.",
+                        ratio * 100.0,
+                    )
+
+            convex_idx = loss_term_labels.index("convex_surrogate")
+            convex_value = float(avg_loss_terms[convex_idx].item())
+            if (
+                self.wl_loss_weight > 0
+                and convex_weight > 0
+                and wl_value > 0
+                and convex_value > 0
+                and (wl_value / max(convex_value, 1e-8)) > 2.0
+            ):
+                logger.warning(
+                    "WL structural loss (%.4f) dominates convex surrogate loss (%.4f); the two regularizers may be fighting—try reducing wl_kernel_loss_weight or convex_surrogate_weight.",
+                    wl_value,
+                    convex_value,
+                )
+
             per_metric_losses = {}
             if per_metric_weight_sum is not None and per_metric_weight_sum.numel() > 0:
                 metric_values = per_metric_error_sum / per_metric_weight_sum.clamp_min(1.0)
