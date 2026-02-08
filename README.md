@@ -198,6 +198,25 @@ When MLflow is enabled, the run logs population best/mean/worst fitnesses, speci
 
 This mirrors what shows up in stdout while giving you a permanent experiment record.
 
+## Visualizing Final Population Snapshots
+Once `main.py` finishes, it saves a serialized population snapshot under `artifacts/final_population/`.
+You can turn those `.pt` files into Graphviz diagrams via `scripts/visualize_final_population.py`:
+
+```
+python3 scripts/visualize_final_population.py \
+  --snapshot artifacts/final_population/population_gen00050_20260128-020455.pt \
+  --top-k 12 --format svg
+```
+
+Key behaviors:
+
+- If `--snapshot` is omitted, the script grabs the newest `.pt` file under `--snapshot-dir` (default `artifacts/final_population`).
+- For each selected genome it writes a `*.dot` file plus an optional rendered image (`--format png|pdf|svg`). Pass `--skip-render` or `--format dot` when Graphviz binaries are unavailable.
+- `--genome-id` (repeatable) filters by exact ids, `--include-invalid` keeps individuals flagged as invalid, and `--rankdir` flips between left-to-right and top-to-bottom layouts.
+- A JSON manifest (default `summary.json`) is emitted alongside the figures so you can correlate filenames back to genome/fitness metadata.
+
+Make sure Graphviz (`dot`, `neato`, etc.) is on your `PATH` when requesting raster/vector formats; otherwise the script will fall back to DOT-only output while warning once per run.
+
 ## Other Papers that Might be Useful
 - [On the Relationship Between Variational Inference and Auto-Associative Memory](https://arxiv.org/pdf/2210.08013.pdf)
   - "In order to improve the memory capacity, modern Hopfield networks [22, 21, 8] propose several variants of the energy function using polynomial or exponential interactions.
