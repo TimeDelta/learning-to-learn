@@ -99,6 +99,10 @@ class GuidedPopulation(Population):
         self.guide = SelfCompressingFitnessRegularizedDAGVAE(graph_encoder, decoder, predictor)
         self.optimizer = torch.optim.Adam(self.guide.parameters(), lr=0.001)
         self.trainer = OnlineTrainer(self.guide, self.optimizer, metric_keys=self.metric_keys)
+        self.wl_kernel_iterations = int(getattr(config, "wl_kernel_iterations", 2))
+        self.wl_kernel_loss_weight = float(getattr(config, "wl_kernel_loss_weight", 0.0))
+        self.trainer.wl_kernel_iterations = self.wl_kernel_iterations
+        self.trainer.wl_loss_weight = self.wl_kernel_loss_weight
         self.full_train_resize_generation = int(getattr(config, "full_train_resize_generation", 25))
         self.test_mode = bool(getattr(config, "test_mode", False))
         if self.test_mode:

@@ -1,11 +1,13 @@
 import pytest
 import torch
+from torch_geometric.data import Batch, Data
 
 from metrics import AreaUnderTaskMetrics
 from search_space_compression import (
     OnlineTrainer,
     SharedAttributeVocab,
     StagedBetaSchedule,
+    _weisfeiler_lehman_histograms,
 )
 
 
@@ -50,3 +52,47 @@ def test_online_trainer_resolves_dynamic_kl_weight():
     assert trainer._resolve_kl_weight(0.1) == pytest.approx(0.5)
     trainer.configure_kl_scheduler(schedule, reset_state=True)
     assert trainer._kl_global_epoch == 0
+
+
+def _make_graph(node_count, edges):
+    node_types = torch.zeros(node_count, dtype=torch.long)
+    node_attributes = [{} for _ in range(node_count)]
+    if edges:
+        edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
+    else:
+        edge_index = torch.empty((2, 0), dtype=torch.long)
+    return Data(node_types=node_types, edge_index=edge_index, node_attributes=node_attributes)
+
+
+def test_wl_histograms_distinguish_graphs():
+    g_chain = _make_graph(3, [(0, 1), (1, 2)])
+    g_star = _make_graph(3, [(0, 1), (0, 2)])
+    batch = Batch.from_data_list([g_chain, g_star])
+    hist = _weisfeiler_lehman_histograms(
+        batch.node_types,
+        batch.edge_index,
+        batch.batch,
+        batch.num_graphs,
+        iterations=2,
+    )
+    assert hist is not None
+    assert hist.shape[0] == 2
+    assert not torch.allclose(hist[0], hist[1])
+
+
+def test_structural_alignment_loss_handles_present_batches():
+    model = MinimalGuide()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    trainer = OnlineTrainer(model, optimizer, metric_keys=[AreaUnderTaskMetrics])
+    trainer.wl_loss_weight = 1.0
+    trainer.wl_kernel_iterations = 1
+    g1 = _make_graph(3, [(0, 1), (1, 2)])
+    g2 = _make_graph(3, [(0, 2), (2, 1)])
+    batch = Batch.from_data_list([g1, g2])
+    latents = torch.randn(batch.num_graphs, 4)
+    loss = trainer._structural_alignment_loss(batch, latents)
+    assert loss >= 0
+    # Single graph batches skip the loss entirely.
+    single_batch = Batch.from_data_list([g1])
+    single_loss = trainer._structural_alignment_loss(single_batch, latents[:1])
+    assert single_loss.item() == pytest.approx(0.0)

@@ -8,7 +8,7 @@ import math
 import os
 import random
 import time
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from warnings import warn
@@ -74,6 +74,63 @@ def flatten_task_features(task_features, expected_len: Optional[int] = None) -> 
         elif flat.size > expected_len:
             flat = flat[:expected_len]
     return flat
+
+
+def _weisfeiler_lehman_histograms(
+    node_types: torch.Tensor,
+    edge_index: torch.Tensor,
+    batch: torch.Tensor,
+    num_graphs: int,
+    iterations: int = 2,
+) -> Optional[torch.Tensor]:
+    """Compute WL subtree histogram per graph (NASGEM-style topology regularizer [58])."""
+
+    if num_graphs <= 1 or node_types.numel() == 0:
+        return None
+
+    node_types_cpu = node_types.detach().cpu().view(-1)
+    edge_index_cpu = edge_index.detach().cpu()
+    batch_cpu = batch.detach().cpu().view(-1)
+    num_nodes = node_types_cpu.numel()
+    adjacency: List[List[int]] = [[] for _ in range(num_nodes)]
+    for src, dst in edge_index_cpu.t().tolist():
+        adjacency[src].append(dst)
+        adjacency[dst].append(src)
+
+    colors = [f"t{int(label)}" for label in node_types_cpu.tolist()]
+    for _ in range(max(1, iterations)):
+        new_colors = []
+        for idx in range(num_nodes):
+            neighbors = adjacency[idx]
+            if neighbors:
+                neigh_colors = sorted(colors[n] for n in neighbors)
+                combo = colors[idx] + "|" + "|".join(neigh_colors)
+            else:
+                combo = colors[idx] + "|"
+            hashed = hashlib.sha256(combo.encode("utf-8")).hexdigest()[:16]
+            new_colors.append(hashed)
+        colors = new_colors
+
+    vocab: Dict[str, int] = {}
+    hist = torch.zeros((num_graphs, 0), dtype=torch.float32)
+    counters: List[Counter] = [Counter() for _ in range(num_graphs)]
+    for node_idx, color in enumerate(colors):
+        graph_idx = int(batch_cpu[node_idx])
+        counters[graph_idx][color] += 1
+        if color not in vocab:
+            vocab[color] = len(vocab)
+
+    if not vocab:
+        return None
+
+    hist = torch.zeros((num_graphs, len(vocab)), dtype=torch.float32)
+    for graph_idx, counter in enumerate(counters):
+        for color, count in counter.items():
+            col_idx = vocab[color]
+            hist[graph_idx, col_idx] = float(count)
+    row_sums = hist.sum(dim=1, keepdim=True).clamp_min(1e-6)
+    hist = hist / row_sums
+    return hist
 
 
 class DAGAttention(MessagePassing):
@@ -1427,6 +1484,8 @@ class OnlineTrainer:
         self.progress_callback = None
         self.prune_callback = None
         self.decoder_empty_penalty = 0.0
+        self.wl_kernel_iterations = 2
+        self.wl_loss_weight = 0.0
 
     def _update_metric_metadata(self, metric_keys: Sequence):
         self.sorted_metrics = sort_metrics_by_name(metric_keys)
@@ -1539,6 +1598,35 @@ class OnlineTrainer:
             loss_adj = loss_adj + empty_penalty
         return loss_adj, loss_feat
 
+    def _structural_alignment_loss(self, batch, graph_latent) -> torch.Tensor:
+        if self.wl_loss_weight <= 0 or graph_latent is None or batch.num_graphs <= 1:
+            return torch.tensor(0.0, device=self.device)
+        hist = _weisfeiler_lehman_histograms(
+            batch.node_types,
+            batch.edge_index,
+            batch.batch,
+            batch.num_graphs,
+            iterations=max(1, int(getattr(self, "wl_kernel_iterations", 2) or 1)),
+        )
+        if hist is None or hist.numel() == 0:
+            return torch.tensor(0.0, device=self.device)
+        hist = hist.to(self.device)
+        latent = graph_latent
+        if latent.dim() != 2 or latent.size(0) != batch.num_graphs:
+            return torch.tensor(0.0, device=self.device)
+        wl_dist = torch.cdist(hist, hist, p=2)
+        latent_dist = torch.cdist(latent, latent, p=2)
+        if wl_dist.numel() == 0:
+            return torch.tensor(0.0, device=self.device)
+        triu_mask = torch.triu(torch.ones_like(wl_dist, dtype=torch.bool), diagonal=1)
+        if triu_mask.sum() <= 0:
+            return torch.tensor(0.0, device=self.device)
+        wl_vals = wl_dist[triu_mask]
+        latent_vals = latent_dist[triu_mask]
+        wl_vals = wl_vals / wl_vals.max().clamp_min(1e-6)
+        latent_vals = latent_vals / latent_vals.max().clamp_min(1e-6)
+        return F.mse_loss(latent_vals, wl_vals)
+
     def _graph_dict_to_data(self, graph_dict: dict | None) -> Data | None:
         if not graph_dict:
             return None
@@ -1647,6 +1735,7 @@ class OnlineTrainer:
             "graph_kl",
             "fitness",
             "convex_surrogate",
+            "wl_structural",
         ]
         num_loss_terms = len(loss_term_labels)
         prev_loss_terms = torch.zeros(num_loss_terms)
@@ -1749,6 +1838,8 @@ class OnlineTrainer:
                     convex_weighted = convex_error * weight_expand
                     loss_convex = convex_weighted.sum() / denom
 
+                wl_loss = self._structural_alignment_loss(batch, graph_latent)
+
                 # --- 5) total & backward ---
                 loss_terms = [
                     loss_adj,
@@ -1756,6 +1847,7 @@ class OnlineTrainer:
                     current_kl_weight * graph_kl_loss,
                     fitness_weight * loss_fitness,
                     convex_weight * loss_convex,
+                    self.wl_loss_weight * wl_loss,
                 ]
                 sum(loss_terms).backward()
                 self.optimizer.step()

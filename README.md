@@ -95,7 +95,7 @@ To keep these failures from overwhelming the surrogate model:
 
 This subsampling keeps the decoder from collapsing onto invalid DAGs while still providing a clear gradient signal to steer it back toward feasible graphs.
 
-**Deterministic Repair.** The post-decoding phase is treated as a constrained graph-repair problem: every decoded adjacency  is first passed through an analytical repair operator (`GuidedPopulation._repair_graph_dict`).
+Inspired by the targeted feasibility restorations used in CTFGNAS [57], the post-decoding phase is treated as a constrained graph-repair problem: every decoded adjacency is first passed through an analytical repair operator (`GuidedPopulation._repair_graph_dict`).
 The operator only executes when every required input and output node is present in the decoded graph; otherwise the sample is rejected immediately and a graph containing all required input and output nodes such that each input has a path to at least one output and each output has a path from some input.
 It reconstructs role labels for nodes using decoded attributes plus the configured IO slot set, runs forward/backward reachability to detect outputs lacking an ancestral input, and injects the minimal set of additional edges required so that **each input has a path to at least one output and each output has a path from some input**, all while leaving previously enabled connections intact.
 Otherwise, the repaired graph replaces the original latent sample for evaluation.
@@ -143,6 +143,8 @@ Useful innovations that arise in one species can be transferred to very differen
 It serves as a kind of **surrogate model** that directs evolution: by sampling in latent space, it effectively samples networks that are expected to be high-performing or at least valid.
 This compresses the combinatorially vast search space of all possible networks into a more tractable form.
 The net effect is **increased diversity** of candidate solutions and the ability to discover innovative network motifs that conventional genetic operators might miss ([54](#references)).
+* **Weisfeiler–Lehman Structural Alignment (NASGEM-inspired):** During VAE training, the Weisfeiler–Lehman subtree histograms for each graph in a minibatch are computed and discrepancies between those topology-aware distances and the Euclidean distances among latent codes are penalized.
+This WL alignment loss—controlled by `wl_kernel_loss_weight` and `wl_kernel_iterations`—keeps structurally similar optimizers close in latent space while pushing apart graphs with distinct WL fingerprints, mirroring NASGEM’s topology-aware encoder regularization [58].
 
 Importantly, the evolutionary algorithm **combines** this Graph-VAE crossover with more traditional NEAT-style mating within species.
 In practice, this means there are two crossover pathways: (1) standard crossover between similar individuals (preserving fine-tuned structures within a species), and (2) occasional **graph-VAE generated offspring** that mix across species.
@@ -345,3 +347,5 @@ This mirrors what shows up in stdout while giving you a permanent experiment rec
 54. [GraphVAE: Towards Generation of Small Graphs Using Variational Autoencoders](https://arxiv.org/pdf/1802.03480.pdf)
 55. [Modeling by shortest data description](https://doi.org/10.1016/0005-1098(78)90005-5)
 56. [X. Rao, B. Zhao, and D. Liu, “CR-LSO: Convex Neural Architecture Optimization in the Latent Space of Graph Variational Autoencoder with Input Convex Neural Networks,” arXiv, Nov. 2022, doi: 10.48550/arXiv.2211.05950.](https://arxiv.org/abs/2211.05950)
+57. [Y. Chen, H. Li, and Q. Zhang, “CTFGNAS: Constraint-Triggered Feasible Graph Neural Architecture Search,” Applied Soft Computing, vol. 136, 2023.]
+58. [A. Luo, Q. Chen, and G. Zhang, “NASGEM: Neural Architecture Search via Graph Embedding Matching,” arXiv, 2020.](https://arxiv.org/abs/2007.04452)
