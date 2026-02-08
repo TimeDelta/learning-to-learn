@@ -6,9 +6,10 @@
 - [Proposed Solution](#proposed-solution)
   - [Multi-Objective Fitness (Pareto Optimization)](#multi-objective-fitness--pareto-optimization-)
   - [Canonicalized Metrics for Surrogate Guidance](#canonicalized-metrics-for-surrogate-guidance)
-  - [Stabilizing Graph Attribute Decoding](#stabilizing-graph-attribute-decoding)
   - [Handling Invalid Guided Offspring](#handling-invalid-guided-offspring)
+  - [Stabilizing Graph Attribute Decoding](#stabilizing-graph-attribute-decoding)
   - [Generative Cross-Species Crossover (Graph-VAE)](#generative-cross-species-crossover--graph-vae-)
+- [Experiment Tracking and CLI options](#experiment-tracking-and-cli-options)
 - [Other Papers that Might be Useful](#other-papers-that-might-be-useful)
 - [Future Ideas](#future-ideas)
 - [Maybe Ideas](#maybe-ideas)
@@ -41,34 +42,6 @@
 - Resilient backprop family: `rprop_backprop.py`, `irprop_plus_backprop.py`
 
 To generate the corresponding .pt files, run this command in the main directory: `find computation_graphs/optimizers -name '*.py' -print0 | xargs -0 -n1 python3.10`
-
-### Experiment Tracking and CLI options
-Run `main.py` directly to evolve optimizers. The script now exposes switches for MLflow tracking and general configuration, so you can keep experiments reproducible:
-
-```
-python3 main.py \
-  --config-file neat-config \
-  --num-generations 250 \
-  --enable-mlflow \
-  --mlflow-experiment learning-to-learn \
-  --mlflow-run-name warmup_run \
-  --mlflow-tag stage=warmup --mlflow-tag dataset=cifar10
-```
-
-Key flags:
-
-- `--config-file`: choose an alternate NEAT config.
-- `--num-generations`: change the evolutionary horizon (default 1000).
-- `--enable-mlflow`: turn on MLflow streaming. Pair it with `--mlflow-tracking-uri`, `--mlflow-experiment`, `--mlflow-run-name`, `--mlflow-tag KEY=VALUE`, and `--mlflow-nested` to match your tracking server layout.
-
-When MLflow is enabled, the run logs population best/mean/worst fitnesses, species counts, genome complexity per generation, final winner metrics, the NEAT config artifact, and a JSON summary of invalid guided-offspring reasons. It now also captures:
-
-- OnlineTrainer epoch summaries (adjacency/attribute reconstruction, KL terms, fitness loss, and totals) so the `Epoch … Loss terms per batch` lines end up in the MLflow run as metrics + `logs/progress.log` text.
-- Per-metric fitness predictor losses (`trainer_metric_<metric_name>` metrics plus the CSV/HTML artifacts) so you can see which task objectives dominate each epoch.
-- Guided offspring production stats (`guided_children_*` metrics for requested/created totals and invalid counts per reason) logged once per generation alongside your trainer curves.
-- Genetic-distance statistics, compatibility-threshold changes, and a per-generation species table (same columns as the NEAT stdout reporter) under `species/generation_*.json`.
-
-This mirrors what shows up in stdout while giving you a permanent experiment record.
 
 ### Multi-Objective Fitness (Pareto Optimization)
 
@@ -111,10 +84,14 @@ Pareto ranking remains unbiased; weights only affect how the surrogate prioritiz
 ### Handling Invalid Guided Offspring
 
 The guided decoder sometimes samples latent points that produce unusable computation graphs (e.g., no edges or incompatible tensor shapes), particularly in the first few generations.
+To prevent these invalid or non-operative graphs from biasing the surrogate or inflating Pareto scores, every genome passes explicit validity filters before it is evaluated.
+Any sample that fails (decodes to an empty DAG, cannot be rebuilt, or produces an optimizer that leaves model parameters unchanged) is assigned a deterministic penalty vector: each fitness metric is set to ±10^6 depending on its objective direction.
+These penalties propagate into the population’s fitness log.
+Invalid graphs are omitted from normalizations for pareto fronts, etc.
 To keep these failures from overwhelming the surrogate model:
 
-* Store invalid graph/metric pairs separately from the valid ones with a fixed penalty.
-* Mix only a small, generation-proportional fraction of the invalid graphs into each training epoch (capped at 20% of the valid graphs), so early generations focus on valid data while later ones still learn which latent regions to avoid
+* Invalid graph/metric pairs are stored separately from the valid ones with a fixed penalty.
+* Only a small, generation-proportional fraction of the invalid graphs are mixed into each training epoch (capped at 20% of the valid graphs), so early generations focus on valid data while later ones still learn which latent regions to avoid
 
 This subsampling keeps the decoder from collapsing onto invalid DAGs while still providing a clear gradient signal to steer it back toward feasible graphs.
 
@@ -166,13 +143,6 @@ Importantly, the evolutionary algorithm **combines** this Graph-VAE crossover wi
 In practice, this means there are two crossover pathways: (1) standard crossover between similar individuals (preserving fine-tuned structures within a species), and (2) occasional **graph-VAE generated offspring** that mix across species.
 This balance ensures both **exploitation and exploration**: the population can refine known good solutions while still injecting radically new variations.
 
-### Penalization of Invalid Offspring
-
-To prevent invalid or non-operative graphs from biasing the surrogate or inflating Pareto scores, every genome passes explicit validity filters before it is evaluated.
-Any sample that fails (decodes to an empty DAG, cannot be rebuilt, or produces an optimizer that leaves model parameters unchanged) is assigned a deterministic penalty vector: each fitness metric is set to ±10^6 depending on its objective direction.
-These penalties propagate into the population’s fitness log.
-Invalid graphs are omitted from normalizations for pareto fronts, etc.
-
 ### Other explanations to incoporate (!!TODO)
 *Guided latent retries.* To keep promising latents alive, the decoder retains a non-empty graph seen during each child’s decode attempts if available and jitters subsequent retries around that anchor rather than restarting from the original latent.
 Empirically this turns “almost valid” intermediate graphs into stepping stones, increasing the likelihood that at least one decode per latent survives the structural filters (implementation: [`population.py:260-340`](population.py)).
@@ -192,6 +162,34 @@ This lets “trust region” radii expand for confident tasks and tighten whenev
 This stage replays ground-truth node/attribute sequences for a few extra epochs (`decoder_teacher_epochs`, default 5) with an amplified cross-entropy weight (`decoder_teacher_force_weight`, default 2.0) so the decoder keeps producing non-empty graphs even as the latent mask prunes dimensions.
 The refresh automatically ramps up to more epochs/weight when the previous generation reported many `empty_graph` failures and also mixes in “near-miss” decoder outputs (graphs that decoded with edges but failed later slot/optimizer checks) plus an explicit penalty whenever a decode terminates before creating edges.
 That combination keeps the decoder anchored to the latent manifold that actually yields usable optimizers.
+
+## Experiment Tracking and CLI options
+Run `main.py` directly to evolve optimizers. The script now exposes switches for MLflow tracking and general configuration, so you can keep experiments reproducible:
+
+```
+python3 main.py \
+  --config-file neat-config \
+  --num-generations 250 \
+  --enable-mlflow \
+  --mlflow-experiment learning-to-learn \
+  --mlflow-run-name warmup_run \
+  --mlflow-tag stage=warmup --mlflow-tag dataset=cifar10
+```
+
+Key flags:
+
+- `--config-file`: choose an alternate NEAT config.
+- `--num-generations`: change the evolutionary horizon (default 1000).
+- `--enable-mlflow`: turn on MLflow streaming. Pair it with `--mlflow-tracking-uri`, `--mlflow-experiment`, `--mlflow-run-name`, `--mlflow-tag KEY=VALUE`, and `--mlflow-nested` to match your tracking server layout.
+
+When MLflow is enabled, the run logs population best/mean/worst fitnesses, species counts, genome complexity per generation, final winner metrics, the NEAT config artifact, and a JSON summary of invalid guided-offspring reasons. It now also captures:
+
+- OnlineTrainer epoch summaries (adjacency/attribute reconstruction, KL terms, fitness loss, and totals) so the `Epoch … Loss terms per batch` lines end up in the MLflow run as metrics + `logs/progress.log` text.
+- Per-metric fitness predictor losses (`trainer_metric_<metric_name>` metrics plus the CSV/HTML artifacts) so you can see which task objectives dominate each epoch.
+- Guided offspring production stats (`guided_children_*` metrics for requested/created totals and invalid counts per reason) logged once per generation alongside your trainer curves.
+- Genetic-distance statistics, compatibility-threshold changes, and a per-generation species table (same columns as the NEAT stdout reporter) under `species/generation_*.json`.
+
+This mirrors what shows up in stdout while giving you a permanent experiment record.
 
 ## Other Papers that Might be Useful
 - [On the Relationship Between Variational Inference and Auto-Associative Memory](https://arxiv.org/pdf/2210.08013.pdf)
