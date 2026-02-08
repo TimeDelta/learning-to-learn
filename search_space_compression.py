@@ -1426,6 +1426,7 @@ class OnlineTrainer:
         self.invalid_ratio_warmup = 5
         self.progress_callback = None
         self.prune_callback = None
+        self.decoder_empty_penalty = 0.0
 
     def _update_metric_metadata(self, metric_keys: Sequence):
         self.sorted_metrics = sort_metrics_by_name(metric_keys)
@@ -1436,6 +1437,124 @@ class OnlineTrainer:
         self.task_metric_guidance_weights = torch.as_tensor(
             [metric.guidance_weight for metric in self.sorted_metrics], dtype=torch.float
         )
+
+    def _compute_reconstruction_losses(
+        self,
+        batch,
+        decoded_graphs,
+        decoder_aux,
+        target_graph_attrs,
+        teacher_force_weight: float = 1.0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        dense_adj = to_dense_adj(batch.edge_index, batch.batch, max_num_nodes=None)
+        num_target_graphs = dense_adj.size(0)
+        graphs_to_compare = min(len(decoded_graphs), num_target_graphs, len(target_graph_attrs))
+
+        loss_adj = torch.tensor(0.0, device=self.device)
+        loss_feat = torch.tensor(0.0, device=self.device)
+        empty_penalty = float(getattr(self, "decoder_empty_penalty", 0.0) or 0.0)
+        empty_hits = 0
+
+        for i in range(graphs_to_compare):
+            dg = decoded_graphs[i]
+            pred_edges = dg["edge_index"]
+            pred_attrs = dg["node_attributes"]
+            target_attrs = target_graph_attrs[i] if i < len(target_graph_attrs) else []
+            num_target_nodes = len(target_attrs)
+            num_pred_nodes = len(pred_attrs)
+            num_nodes = min(num_pred_nodes, num_target_nodes)
+            if num_nodes == 0:
+                empty_hits += 1
+                continue
+            adj_true = dense_adj[i, :num_target_nodes, :num_target_nodes]
+            adj_true = adj_true[:num_nodes, :num_nodes].to(self.device)
+
+            # build binary adjacency preds/targets on 0..num_nodes-1
+            no_pred_edges = True
+            adj_pred = torch.zeros((num_nodes, num_nodes), device=self.device)
+            for s, d in pred_edges.t().tolist():
+                if s < num_nodes and d < num_nodes:
+                    adj_pred[s, d] = 1.0
+                    no_pred_edges = False
+
+            upper_mask = torch.triu(torch.ones_like(adj_pred), diagonal=1).bool()
+            if adj_pred[upper_mask].size(0) > 0 and adj_true[upper_mask].size(0) > 0:
+                loss_adj += F.binary_cross_entropy_with_logits(adj_pred[upper_mask], adj_true[upper_mask])
+            elif adj_pred[upper_mask].size(0) > 0:
+                loss_adj += adj_pred[upper_mask].sum()
+            else:
+                loss_adj += adj_true[upper_mask].sum()
+
+            # node feature loss
+            def convert_string(value):
+                if isinstance(value, str):
+                    value = self.model.attr_encoder.get_value_tensor(value)
+                return value
+
+            def to_tensor(value):
+                value = convert_string(value)
+                if isinstance(value, torch.Tensor):
+                    tensor = value.detach()
+                else:
+                    tensor = torch.as_tensor([value], dtype=torch.float)
+                return tensor.reshape(-1).float().to(self.device)
+
+            def attribute_value_loss(value):
+                tensor = to_tensor(value)
+                return tensor.abs().sum()
+
+            def mse_aligned(pred_tensor, target_tensor):
+                if pred_tensor.numel() == target_tensor.numel():
+                    return F.mse_loss(pred_tensor, target_tensor)
+                size = min(pred_tensor.numel(), target_tensor.numel())
+                loss = F.mse_loss(pred_tensor[:size], target_tensor[:size])
+                if pred_tensor.numel() > size:
+                    loss = loss + pred_tensor[size:].abs().sum()
+                if target_tensor.numel() > size:
+                    loss = loss + target_tensor[size:].abs().sum()
+                return loss
+
+            for node_idx in range(num_nodes):
+                all_attr_names = set(pred_attrs[node_idx].keys()) | set(target_attrs[node_idx].keys())
+                for attr_name in all_attr_names:
+                    pred_value = pred_attrs[node_idx].get(attr_name)
+                    target_value = target_attrs[node_idx].get(attr_name)
+                    if (pred_value is not None) and (target_value is not None):
+                        loss_feat += mse_aligned(to_tensor(pred_value), to_tensor(target_value))
+                    elif target_value is not None:
+                        loss_feat += attribute_value_loss(target_value)
+                    else:
+                        loss_feat += attribute_value_loss(pred_value)
+
+        if decoder_aux is not None and decoder_aux.get("tokens", 0) > 0:
+            ce_loss = decoder_aux["loss"] / float(decoder_aux["tokens"])
+            loss_feat = loss_feat + float(teacher_force_weight) * ce_loss.to(loss_feat.device)
+
+        denom = max(1, int(batch.num_graphs))
+        if empty_penalty > 0 and empty_hits:
+            loss_adj = loss_adj + empty_penalty * empty_hits
+        loss_adj = loss_adj / denom
+        loss_feat = loss_feat / denom
+        if graphs_to_compare == 0 and empty_penalty > 0:
+            loss_adj = loss_adj + empty_penalty
+        return loss_adj, loss_feat
+
+    def _graph_dict_to_data(self, graph_dict: dict | None) -> Data | None:
+        if not graph_dict:
+            return None
+        node_types = graph_dict.get("node_types")
+        edge_index = graph_dict.get("edge_index")
+        node_attributes = graph_dict.get("node_attributes")
+        if node_types is None or edge_index is None or node_attributes is None:
+            return None
+        node_types = node_types.clone().detach().long()
+        if isinstance(edge_index, torch.Tensor):
+            edge_index = edge_index.clone().detach().long()
+        else:
+            edge_index = torch.as_tensor(edge_index, dtype=torch.long)
+        data = Data(node_types=node_types, edge_index=edge_index, node_attributes=node_attributes)
+        data.y = torch.zeros(self.num_metrics)
+        return data
 
     def _metric_name_for_index(self, idx: int) -> str:
         if 0 <= idx < self.num_metrics:
@@ -1532,10 +1651,12 @@ class OnlineTrainer:
         num_loss_terms = len(loss_term_labels)
         prev_loss_terms = torch.zeros(num_loss_terms)
         avg_loss_terms = torch.zeros(num_loss_terms)
+        last_loss_term_change = float("inf")
 
         def stop():
-            max_loss_term_change = (avg_loss_terms - prev_loss_terms).abs().max().item()
-            return (epochs is not None and epoch == epochs + 1) or (epoch > 1 and max_loss_term_change < stop_epsilon)
+            if epochs is not None:
+                return epoch > epochs
+            return epoch > 1 and last_loss_term_change < stop_epsilon
 
         while not stop():
             epoch_timer = time.perf_counter() if DEBUG_TRAINER else None
@@ -1582,88 +1703,13 @@ class OnlineTrainer:
                 target_y = batch.y
 
                 # --- 2) reconstruction losses ---
-                dense_adj = to_dense_adj(batch.edge_index, batch.batch, max_num_nodes=None)
-                num_target_graphs = dense_adj.size(0)
-                graphs_to_compare = min(len(decoded_graphs), num_target_graphs, len(target_graph_attrs))
-
-                loss_adj = torch.tensor(0.0, device=self.device)
-                loss_feat = torch.tensor(0.0, device=self.device)
-                for i in range(graphs_to_compare):
-                    dg = decoded_graphs[i]
-                    pred_edges = dg["edge_index"]
-                    pred_attrs = dg["node_attributes"]
-                    target_attrs = target_graph_attrs[i] if i < len(target_graph_attrs) else []
-                    num_target_nodes = len(target_attrs)
-                    num_pred_nodes = len(pred_attrs)
-                    num_nodes = min(num_pred_nodes, num_target_nodes)
-                    if num_nodes == 0:
-                        continue
-                    adj_true = dense_adj[i, :num_target_nodes, :num_target_nodes]
-                    adj_true = adj_true[:num_nodes, :num_nodes].to(self.device)
-
-                    # build binary adjacency preds/targets on 0..num_nodes-1
-                    no_pred_edges = True
-                    adj_pred = torch.zeros((num_nodes, num_nodes), device=self.device)
-                    for s, d in pred_edges.t().tolist():
-                        if s < num_nodes and d < num_nodes:
-                            adj_pred[s, d] = 1.0
-                            no_pred_edges = False
-
-                    upper_mask = torch.triu(torch.ones_like(adj_pred), diagonal=1).bool()
-                    if adj_pred[upper_mask].size(0) > 0 and adj_true[upper_mask].size(0) > 0:
-                        loss_adj += F.binary_cross_entropy_with_logits(adj_pred[upper_mask], adj_true[upper_mask])
-                    elif adj_pred[upper_mask].size(0) > 0:
-                        loss_adj += adj_pred[upper_mask].sum()
-                    else:
-                        loss_adj += adj_true[upper_mask].sum()
-
-                    # node feature loss
-                    def convert_string(value):
-                        if isinstance(value, str):
-                            value = self.model.attr_encoder.get_value_tensor(value)
-                        return value
-
-                    def to_tensor(value):
-                        value = convert_string(value)
-                        if isinstance(value, torch.Tensor):
-                            tensor = value.detach()
-                        else:
-                            tensor = torch.as_tensor([value], dtype=torch.float)
-                        return tensor.reshape(-1).float().to(self.device)
-
-                    def attribute_value_loss(value):
-                        tensor = to_tensor(value)
-                        return tensor.abs().sum()
-
-                    def mse_aligned(pred_tensor, target_tensor):
-                        if pred_tensor.numel() == target_tensor.numel():
-                            return F.mse_loss(pred_tensor, target_tensor)
-                        size = min(pred_tensor.numel(), target_tensor.numel())
-                        loss = F.mse_loss(pred_tensor[:size], target_tensor[:size])
-                        if pred_tensor.numel() > size:
-                            loss = loss + pred_tensor[size:].abs().sum()
-                        if target_tensor.numel() > size:
-                            loss = loss + target_tensor[size:].abs().sum()
-                        return loss
-
-                    for node_idx in range(num_nodes):
-                        all_attr_names = set(pred_attrs[node_idx].keys()) | set(target_attrs[node_idx].keys())
-                        for attr_name in all_attr_names:
-                            pred_value = pred_attrs[node_idx].get(attr_name)
-                            target_value = target_attrs[node_idx].get(attr_name)
-                            if (pred_value is not None) and (target_value is not None):
-                                loss_feat += mse_aligned(to_tensor(pred_value), to_tensor(target_value))
-                            elif target_value is not None:
-                                loss_feat += attribute_value_loss(target_value)
-                            else:
-                                loss_feat += attribute_value_loss(pred_value)
-
-                if decoder_aux is not None and decoder_aux.get("tokens", 0) > 0:
-                    ce_loss = decoder_aux["loss"] / float(decoder_aux["tokens"])
-                    loss_feat = loss_feat + ce_loss.to(loss_feat.device)
-
-                loss_adj /= batch.num_graphs
-                loss_feat /= batch.num_graphs
+                loss_adj, loss_feat = self._compute_reconstruction_losses(
+                    batch,
+                    decoded_graphs,
+                    decoder_aux,
+                    target_graph_attrs,
+                    teacher_force_weight=1.0,
+                )
 
                 # --- 3) ARD-KL losses ---
                 def calc_kl_div_per_dim(log_alpha, logvar, mu):
@@ -1768,11 +1814,11 @@ class OnlineTrainer:
                     total_loss,
                 )
 
-            # warm-up baseline
+            # Track convergence of reconstruction terms for adaptive pruning.
+            last_loss_term_change = (avg_loss_terms - prev_loss_terms).abs().max().item()
             if self.initial_loss is None and epoch >= warmup_epochs:
                 self.initial_loss = smoothed_loss
 
-            # pruning condition
             if (
                 self.initial_loss is not None
                 and total_loss <= loss_threshold * self.initial_loss
@@ -1819,6 +1865,90 @@ class OnlineTrainer:
                 time.perf_counter() - train_start,
             )
         return self.loss_history
+
+    def decoder_teacher_force_pass(
+        self,
+        epochs: int,
+        batch_size: int,
+        teacher_force_weight: float = 2.0,
+        generation: int = 0,
+        verbose: bool = True,
+        extra_graphs: Optional[Sequence[dict]] = None,
+    ):
+        epochs = max(0, int(epochs))
+        if epochs == 0:
+            return
+        batch_size = max(1, int(batch_size))
+        refresh_samples = list(self.dataset)
+        if extra_graphs:
+            for graph_dict in extra_graphs:
+                data = self._graph_dict_to_data(graph_dict)
+                if data is not None:
+                    refresh_samples.append(data)
+        if not refresh_samples:
+            return
+        loader = DataLoader(refresh_samples, batch_size=batch_size, shuffle=True)
+        if verbose:
+            print(
+                f"Decoder teacher-forcing pass: epochs={epochs} batch_size={batch_size} weight={teacher_force_weight}"
+            )
+        for epoch in range(1, epochs + 1):
+            self.model.train()
+            epoch_adj = 0.0
+            epoch_feat = 0.0
+            batches = 0
+            for batch in loader:
+                batch = batch.to(self.device)
+                self.optimizer.zero_grad()
+                target_graph_attrs = group_node_attributes(batch.node_attributes, batch.batch)
+                teacher_attr_targets = build_teacher_attr_targets(
+                    target_graph_attrs, None, self.model.shared_attr_vocab
+                )
+                (
+                    decoded_graphs,
+                    _fitness_pred,
+                    _metric_log_scales,
+                    _convex_pred,
+                    _graph_latent,
+                    _mu_g,
+                    _lv_g,
+                    decoder_aux,
+                ) = self.model(
+                    batch.node_types,
+                    batch.edge_index,
+                    batch.node_attributes,
+                    batch.batch,
+                    teacher_attr_targets=teacher_attr_targets,
+                    num_graphs=batch.num_graphs,
+                )
+                loss_adj, loss_feat = self._compute_reconstruction_losses(
+                    batch,
+                    decoded_graphs,
+                    decoder_aux,
+                    target_graph_attrs,
+                    teacher_force_weight=teacher_force_weight,
+                )
+                loss = loss_adj + loss_feat
+                loss.backward()
+                self.optimizer.step()
+                epoch_adj += float(loss_adj.detach().item())
+                epoch_feat += float(loss_feat.detach().item())
+                batches += 1
+
+            avg_adj = epoch_adj / max(1, batches)
+            avg_feat = epoch_feat / max(1, batches)
+            if verbose:
+                print(f"Decoder epoch {epoch}/{epochs}: adj_loss={avg_adj:.4f} attr_loss={avg_feat:.4f}")
+            if self.progress_callback is not None:
+                self.progress_callback(
+                    generation=generation,
+                    epoch=epoch,
+                    total_epochs=epochs,
+                    total_loss=avg_adj + avg_feat,
+                    loss_terms={"decoder_adj": avg_adj, "decoder_attr": avg_feat},
+                    per_metric_losses={},
+                    kl_beta=0.0,
+                )
 
     def resize_bottleneck(self):
         """Rebuild all modules to permanently prune inactive dims."""

@@ -188,6 +188,11 @@ This keeps gradients for wildly different metrics (e.g., memory cost vs. AU task
 *Learnable latent tether.* Guided decoding now keeps each latent within the encoder’s posterior by penalizing `||z_g - z_g^0||_2` with a softplus-parameterized weight that is optimized alongside the latents (and softly regularized toward a prior).
 This lets “trust region” radii expand for confident tasks and tighten whenever the decoder starts collapsing to empty graphs.
 
+*Decoder reconstruction refresh.* After every generation, the self-compressing autoencoder now runs an additional decoder-only teacher-forcing pass on the valid graph replay buffer.
+This stage replays ground-truth node/attribute sequences for a few extra epochs (`decoder_teacher_epochs`, default 5) with an amplified cross-entropy weight (`decoder_teacher_force_weight`, default 2.0) so the decoder keeps producing non-empty graphs even as the latent mask prunes dimensions.
+The refresh automatically ramps up to more epochs/weight when the previous generation reported many `empty_graph` failures and also mixes in “near-miss” decoder outputs (graphs that decoded with edges but failed later slot/optimizer checks) plus an explicit penalty whenever a decode terminates before creating edges.
+That combination keeps the decoder anchored to the latent manifold that actually yields usable optimizers.
+
 ## Other Papers that Might be Useful
 - [On the Relationship Between Variational Inference and Auto-Associative Memory](https://arxiv.org/pdf/2210.08013.pdf)
   - "In order to improve the memory capacity, modern Hopfield networks [22, 21, 8] propose several variants of the energy function using polynomial or exponential interactions.

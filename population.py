@@ -6,7 +6,7 @@ import signal
 import time
 import tracemalloc
 import weakref
-from collections import Counter
+from collections import Counter, deque
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Sequence, Set
@@ -98,6 +98,21 @@ class GuidedPopulation(Population):
         self.guide = SelfCompressingFitnessRegularizedDAGVAE(graph_encoder, decoder, predictor)
         self.optimizer = torch.optim.Adam(self.guide.parameters(), lr=0.001)
         self.trainer = OnlineTrainer(self.guide, self.optimizer, metric_keys=self.metric_keys)
+        self.decoder_teacher_epochs_base = int(getattr(config, "decoder_teacher_epochs", 5))
+        self.decoder_teacher_epochs_max = int(
+            getattr(config, "decoder_teacher_epochs_max", max(5, self.decoder_teacher_epochs_base * 3))
+        )
+        self.decoder_teacher_force_weight_base = float(getattr(config, "decoder_teacher_force_weight", 2.0))
+        self.decoder_teacher_force_weight_max = float(
+            getattr(config, "decoder_teacher_force_weight_max", max(2.0, self.decoder_teacher_force_weight_base * 2))
+        )
+        self.decoder_teacher_verbose = bool(getattr(config, "decoder_teacher_verbose", True))
+        self.decoder_replay_max = int(getattr(config, "decoder_replay_max", 256))
+        self.decoder_empty_penalty = float(getattr(config, "decoder_empty_penalty", 0.05))
+        self._decoder_replay_cache: deque[dict] = (
+            deque(maxlen=self.decoder_replay_max) if self.decoder_replay_max > 0 else deque()
+        )
+        self.trainer.decoder_empty_penalty = self.decoder_empty_penalty
         self.convex_surrogate_weight = float(getattr(config, "convex_surrogate_weight", 0.5))
         beta_schedule = StagedBetaSchedule(
             start_beta=0.0,
@@ -121,6 +136,7 @@ class GuidedPopulation(Population):
         self._enable_initial_compression = getattr(config, "enable_initial_compression", False)
         self.guided_stats_callback = None
         self._guided_offspring_stats = None
+        self._prev_guided_offspring_stats = None
         self.dataset_stats_callback = None
         max_evaluation_steps = getattr(config, "max_evaluation_steps", None)
         if max_evaluation_steps is not None:
@@ -133,6 +149,8 @@ class GuidedPopulation(Population):
         self.max_evaluation_steps = max_evaluation_steps
 
     def _reset_guided_offspring_stats(self):
+        if self._guided_offspring_stats is not None:
+            self._prev_guided_offspring_stats = self._guided_offspring_stats
         self._guided_offspring_stats = {
             "generation": self.generation,
             "requested": 0,
@@ -180,6 +198,39 @@ class GuidedPopulation(Population):
         }
         summary["total"] = summary["valid"] + summary["invalid"]
         self.dataset_stats_callback(summary)
+
+    def _guided_empty_ratio(self) -> float:
+        stats = self._prev_guided_offspring_stats or {}
+        requested = float(stats.get("requested", 0) or 0)
+        invalid = stats.get("invalid_by_reason", {}) or {}
+        empties = float(invalid.get("empty_graph", 0) or 0)
+        if requested <= 0:
+            return 0.0
+        return max(0.0, min(1.0, empties / requested))
+
+    def _decoder_refresh_schedule(self) -> tuple[int, float]:
+        ratio = self._guided_empty_ratio()
+        epochs_span = max(0, self.decoder_teacher_epochs_max - self.decoder_teacher_epochs_base)
+        weight_span = max(0.0, self.decoder_teacher_force_weight_max - self.decoder_teacher_force_weight_base)
+        epochs = int(round(self.decoder_teacher_epochs_base + epochs_span * ratio))
+        weight = float(self.decoder_teacher_force_weight_base + weight_span * ratio)
+        epochs = max(self.decoder_teacher_epochs_base, min(self.decoder_teacher_epochs_max, epochs))
+        weight = max(self.decoder_teacher_force_weight_base, min(self.decoder_teacher_force_weight_max, weight))
+        return epochs, weight
+
+    def _buffer_decoder_replay_dict(self, graph_dict: dict | None):
+        if not graph_dict or self.decoder_replay_max <= 0:
+            return
+        cloned = self._clone_graph_dict(graph_dict)
+        if cloned is not None:
+            self._decoder_replay_cache.append(cloned)
+
+    def _consume_decoder_replay_graphs(self) -> list[dict]:
+        if not self._decoder_replay_cache:
+            return []
+        payload = list(self._decoder_replay_cache)
+        self._decoder_replay_cache.clear()
+        return payload
 
     @staticmethod
     def _evaluation_metric_keys(task) -> List[Metric]:
@@ -288,6 +339,23 @@ class GuidedPopulation(Population):
         return cloned
 
     @staticmethod
+    def _graph_dict_to_data(graph_dict: dict | None) -> Data | None:
+        if not graph_dict:
+            return None
+        node_types = graph_dict.get("node_types")
+        edge_index = graph_dict.get("edge_index")
+        node_attributes = graph_dict.get("node_attributes")
+        if node_types is None or edge_index is None or node_attributes is None:
+            return None
+        node_types = node_types.clone().detach().long()
+        if isinstance(edge_index, torch.Tensor):
+            edge_index = edge_index.clone().detach().long()
+        else:
+            edge_index = torch.as_tensor(edge_index, dtype=torch.long)
+        data = Data(node_types=node_types, edge_index=edge_index, node_attributes=node_attributes)
+        return data
+
+    @staticmethod
     def _fitness_value(genome) -> float:
         value = getattr(genome, "fitness", None)
         if value is None:
@@ -370,6 +438,12 @@ class GuidedPopulation(Population):
         the surrogate predictor, decode each optimized z_g back into a DAG, then
         convert those DAGs into new NEAT genomes.
         """
+        empty_feedback = self._guided_empty_ratio()
+        latent_steps = max(5, int(latent_steps * (1.0 - 0.5 * empty_feedback)))
+        latent_lr = float(latent_lr) * (0.5 + 0.5 * (1.0 - empty_feedback))
+        decode_jitter_std = float(decode_jitter_std) * (0.5 + 0.5 * (1.0 - empty_feedback))
+        latent_tether_init = float(latent_tether_init) * (1.0 + empty_feedback)
+
         metric_keys = self.metric_keys
         metric_best_values = self.metric_best_values
         metric_guidance_weights = self.metric_guidance_weights
@@ -502,6 +576,7 @@ class GuidedPopulation(Population):
             attempt = 0
             accepted = False
             best_nonempty_latent = None
+            last_nonempty_graph_dict = None
             while attempt < max_decode_attempts:
                 attempt += 1
                 with torch.no_grad():
@@ -518,6 +593,7 @@ class GuidedPopulation(Population):
 
                 if num_edges > 0:
                     best_nonempty_latent = latent.detach().clone()
+                    last_nonempty_graph_dict = self._clone_graph_dict(graph_dict)
 
                 if num_edges == 0 or debug_saved < debug_save_limit:
                     debug_path = debug_dir / f"gen{generation_idx}_child{i}_attempt{attempt}_edges{num_edges}.pt"
@@ -536,6 +612,8 @@ class GuidedPopulation(Population):
                     )
                     genome.graph_dict = graph_dict
                     self._assign_penalty(genome, reason="empty_graph", skip_evaluation=True)
+                    if last_nonempty_graph_dict is not None:
+                        self._buffer_decoder_replay_dict(last_nonempty_graph_dict)
                     invalid_reason_counts["empty_graph"] += 1
                     if graph_signature:
                         seen_graph_signatures.add(graph_signature)
@@ -551,6 +629,8 @@ class GuidedPopulation(Population):
                         resample_attempts += 1
                         continue
                     warn("Guided offspring decoder produced a duplicate graph; skipping to preserve diversity.")
+                    if last_nonempty_graph_dict is not None:
+                        self._buffer_decoder_replay_dict(last_nonempty_graph_dict)
                     break
 
                 slot_ok, slot_details = self._graph_output_slot_coverage(graph_dict)
@@ -575,6 +655,7 @@ class GuidedPopulation(Population):
                     warn(message + "; assigning penalty fitness.")
                     genome.graph_dict = graph_dict
                     self._assign_penalty(genome, reason="missing_output_slots", skip_evaluation=True)
+                    self._buffer_decoder_replay_dict(last_nonempty_graph_dict or graph_dict)
                     invalid_reason_counts["missing_output_slots"] += 1
                     if graph_signature:
                         seen_graph_signatures.add(graph_signature)
@@ -595,6 +676,7 @@ class GuidedPopulation(Population):
                         )
                         genome.graph_dict = graph_dict
                         self._assign_penalty(genome, reason="inactive_optimizer", skip_evaluation=True)
+                        self._buffer_decoder_replay_dict(last_nonempty_graph_dict or graph_dict)
                         invalid_reason_counts["inactive_optimizer"] += 1
                         if graph_signature:
                             seen_graph_signatures.add(graph_signature)
@@ -617,6 +699,7 @@ class GuidedPopulation(Population):
                     resample_attempts += 1
                     continue
                 warn("Guided offspring decoder failed to rebuild a valid optimizer; skipping child.")
+                self._buffer_decoder_replay_dict(last_nonempty_graph_dict)
                 break
 
             # move to next latent whether or not we accepted anything
@@ -829,6 +912,23 @@ class GuidedPopulation(Population):
                     warmup_epochs=3,
                     loss_threshold=0.99,
                     baseline_window=3,
+                )
+            decoder_epochs, decoder_weight = self._decoder_refresh_schedule()
+            replay_payload = self._consume_decoder_replay_graphs()
+            if decoder_epochs > 0 and (self.trainer.dataset or replay_payload):
+                decoder_batch = min(batch, max(1, len(self.trainer.dataset)))
+                empty_ratio = self._guided_empty_ratio()
+                self.reporters.info(
+                    f"Decoder refresh: epochs={decoder_epochs} weight={decoder_weight:.3f} "
+                    f"empty_ratio={empty_ratio:.3f} replay_graphs={len(replay_payload)}"
+                )
+                self.trainer.decoder_teacher_force_pass(
+                    epochs=decoder_epochs,
+                    batch_size=decoder_batch,
+                    teacher_force_weight=decoder_weight,
+                    generation=self.generation,
+                    verbose=self.decoder_teacher_verbose,
+                    extra_graphs=replay_payload,
                 )
             valid_size = len(self.trainer.dataset)
             invalid_size = len(self.trainer.invalid_dataset)
