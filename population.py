@@ -98,7 +98,15 @@ class GuidedPopulation(Population):
 
         self.guide = SelfCompressingFitnessRegularizedDAGVAE(graph_encoder, decoder, predictor)
         self.optimizer = torch.optim.Adam(self.guide.parameters(), lr=0.001)
-        self.trainer = OnlineTrainer(self.guide, self.optimizer, metric_keys=self.metric_keys)
+        self.decoder_empty_penalty = float(getattr(config, "decoder_empty_penalty", 0.05))
+        self.decoder_missing_node_penalty = float(getattr(config, "decoder_missing_node_penalty", 0.25))
+        self.trainer = OnlineTrainer(
+            self.guide,
+            self.optimizer,
+            metric_keys=self.metric_keys,
+            decoder_empty_penalty=self.decoder_empty_penalty,
+            decoder_missing_node_penalty=self.decoder_missing_node_penalty,
+        )
         slice_ratio = getattr(config, "kl_partial_slice_ratio", None)
         if slice_ratio is None and hasattr(config, "reproduction_config"):
             slice_ratio = getattr(config.reproduction_config, "kl_partial_slice_ratio", None)
@@ -155,11 +163,9 @@ class GuidedPopulation(Population):
         )
         self.decoder_teacher_verbose = bool(getattr(config, "decoder_teacher_verbose", True))
         self.decoder_replay_max = int(getattr(config, "decoder_replay_max", 256))
-        self.decoder_empty_penalty = float(getattr(config, "decoder_empty_penalty", 0.05))
         self._decoder_replay_cache: deque[dict] = (
             deque(maxlen=self.decoder_replay_max) if self.decoder_replay_max > 0 else deque()
         )
-        self.trainer.decoder_empty_penalty = self.decoder_empty_penalty
         self.trainer.configure_module_freeze_cycle(getattr(config, "trainer_freeze_cycle", None))
         self.trainer.module_freeze_verbose = bool(getattr(config, "trainer_freeze_verbose", False))
         self.convex_surrogate_weight = float(getattr(config, "convex_surrogate_weight", 0.5))

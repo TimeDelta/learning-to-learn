@@ -462,6 +462,30 @@ def build_teacher_attr_targets(
     return sequences
 
 
+def build_teacher_adj_targets(
+    edge_index: torch.Tensor,
+    batch_vec: torch.Tensor,
+    per_graph_node_counts: Sequence[int],
+) -> List[Optional[torch.Tensor]]:
+    """Slice dense adjacency targets per graph for decoder supervision."""
+
+    if edge_index.numel() == 0:
+        return [None for _ in per_graph_node_counts]
+
+    dense_adj = to_dense_adj(edge_index, batch_vec, max_num_nodes=None).float()
+    per_graph_targets: List[Optional[torch.Tensor]] = []
+    max_graphs = min(len(per_graph_node_counts), dense_adj.size(0))
+    for idx in range(max_graphs):
+        node_count = int(per_graph_node_counts[idx])
+        if node_count <= 0:
+            per_graph_targets.append(None)
+            continue
+        per_graph_targets.append(dense_adj[idx, :node_count, :node_count])
+    for _ in range(len(per_graph_node_counts) - max_graphs):
+        per_graph_targets.append(None)
+    return per_graph_targets
+
+
 class NodeAttributeDeepSetEncoder(nn.Module):
     """
     Permutation‐invariant encoder for a dictionary of arbitrary node attributes.
@@ -729,7 +753,12 @@ class GraphDecoder(nn.Module):
         self.attr_eos_bias_base = 0.0
         self.attr_eos_bias_slope = 0.1
 
-    def forward(self, latent, teacher_attr_targets: Optional[List[List[List[int]]]] = None):
+    def forward(
+        self,
+        latent,
+        teacher_attr_targets: Optional[List[List[List[int]]]] = None,
+        teacher_adj_targets: Optional[List[Optional[torch.Tensor]]] = None,
+    ):
         """
         (num_graphs, latent_dim)
         returns: list of graphs, each {'node_types': LongTensor[1, N],
@@ -741,10 +770,13 @@ class GraphDecoder(nn.Module):
         try:
             device = latent.device
             all_graphs = []
-            attr_teacher_loss = None
+            attr_teacher_loss = latent.new_tensor(0.0)
             attr_teacher_tokens = 0
+            node_teacher_loss = latent.new_tensor(0.0)
+            node_teacher_tokens = 0
+            edge_teacher_loss = latent.new_tensor(0.0)
+            edge_teacher_tokens = 0
             if teacher_attr_targets is not None:
-                attr_teacher_loss = latent.new_tensor(0.0)
                 # ensure decoder caps accommodate teacher supervision
                 max_teacher_nodes = 0
                 max_teacher_attrs = 0
@@ -780,83 +812,108 @@ class GraphDecoder(nn.Module):
                         graph_teacher_targets = teacher_attr_targets[l]
                         if graph_teacher_targets is not None:
                             target_node_count = len(graph_teacher_targets)
-                try:
-                    latent_norm = float(latent[l].detach().norm().item())
-                except Exception:
-                    latent_norm = float("nan")
-                logger.info("Decoder graph %d start | latent_norm=%.4f", l, latent_norm)
-                hidden_node = F.relu(self.node_hidden_state_init(latent[l])).unsqueeze(0)  # (hidden_dim,)
-                node_embeddings = []
-                edges = []
-                node_types = []
-                t = 0
-                node_loop_timer = time.perf_counter()
-                node_loop_iters = 0
-                with torch.autograd.profiler.record_function("GraphDecoder.node_loop"):
-                    while True:
-                        node_loop_iters += 1
-                        if t > self.max_nodes:
-                            warn("max nodes reached")
-                            if DEBUG_DECODER and decode_stats is not None:
-                                decode_stats["node_loop_exit"] = decode_stats["node_loop_exit"] or "max_nodes_pre"
-                            break
-                        if target_node_count is not None and t >= target_node_count:
-                            if DEBUG_DECODER and decode_stats is not None:
-                                decode_stats["node_loop_exit"] = decode_stats["node_loop_exit"] or "teacher_nodes"
-                            break
-                        hidden_node = self.node_rnn(torch.zeros(hidden_node.shape[0], 0, device=device), hidden_node)
-
-                        # clamp for precision errors
-                        p_stop = 1 - torch.sigmoid(self.stop_head(hidden_node))
-                        p_stop = torch.nan_to_num(p_stop, nan=1.0).clamp(0.0, 1.0)
-                        if DEBUG_DECODER and decode_stats is not None:
-                            decode_stats["node_stop_samples"].append(float(p_stop.item()))
-                        if torch.bernoulli(p_stop).item() == 0:
-                            if t == 0:
-                                # ensure at least one node
-                                p_stop = torch.ones_like(p_stop)
-                            else:
+                    graph_adj_target = None
+                    if teacher_adj_targets is not None and l < len(teacher_adj_targets):
+                        graph_adj_target = teacher_adj_targets[l]
+                        if graph_adj_target is not None:
+                            graph_adj_target = graph_adj_target.to(device)
+                            if target_node_count is None:
+                                target_node_count = int(graph_adj_target.size(0))
+                    if target_node_count is not None:
+                        target_node_count = max(1, int(target_node_count))
+                    try:
+                        latent_norm = float(latent[l].detach().norm().item())
+                    except Exception:
+                        latent_norm = float("nan")
+                    logger.debug("Decoder graph %d start | latent_norm=%.4f", l, latent_norm)
+                    hidden_node = F.relu(self.node_hidden_state_init(latent[l])).unsqueeze(0)  # (hidden_dim,)
+                    node_embeddings = []
+                    edges = []
+                    node_types = []
+                    t = 0
+                    node_loop_timer = time.perf_counter()
+                    node_loop_iters = 0
+                    teacher_force_nodes = self.training and (target_node_count is not None)
+                    with torch.autograd.profiler.record_function("GraphDecoder.node_loop"):
+                        while True:
+                            node_loop_iters += 1
+                            if t > self.max_nodes:
+                                warn("max nodes reached")
+                                if DEBUG_DECODER and decode_stats is not None:
+                                    decode_stats["node_loop_exit"] = decode_stats["node_loop_exit"] or "max_nodes_pre"
                                 break
-                        if t > self.max_nodes:
-                            warn("max nodes reached")
-                            if DEBUG_DECODER and decode_stats is not None:
-                                decode_stats["node_loop_exit"] = decode_stats["node_loop_exit"] or "max_nodes_post"
-                            break
-                        new_node = self.node_head(hidden_node).squeeze(0)
-                        node_embeddings.append(new_node)
-                        node_types.append(self.type_head(new_node).argmax(dim=-1).cpu().tolist())
+                            hidden_node = self.node_rnn(
+                                torch.zeros(hidden_node.shape[0], 0, device=device), hidden_node
+                            )
 
-                        # edge generation to previous nodes
-                        hidden_edge = hidden_node
-                        edge_in = torch.zeros(1, 1, device=device)
-                        for i in range(t):
-                            hidden_edge = self.edge_rnn(edge_in, hidden_edge)
-                            p_edge = torch.sigmoid(self.edge_head(hidden_edge)).view(-1)
-                            p_edge = torch.nan_to_num(p_edge, nan=0.0).clamp(0.0, 1.0)
-                            if bool((p_edge > self.edge_threshold).item()):
-                                edges.append([i, t])
-                            edge_in = p_edge.unsqueeze(0)
-                        t += 1
-                        if target_node_count is not None and t >= target_node_count:
-                            if DEBUG_DECODER and decode_stats is not None:
-                                decode_stats["node_loop_exit"] = decode_stats["node_loop_exit"] or "teacher_nodes"
-                            break
-                        if DEBUG_DECODER and t % 50 == 0:
-                            elapsed = time.perf_counter() - node_loop_timer
-                            logger.info(
-                                "Decoder graph %d node generation progress: %d nodes (max=%d) elapsed=%.2fs",
-                                decode_stats["graph_index"],
-                                t,
-                                self.max_nodes,
-                                elapsed,
-                            )
-                        if DEBUG_DECODER and node_loop_iters % 200 == 0:
-                            logger.info(
-                                "Decoder graph %d node loop iterations=%d (nodes=%d)",
-                                decode_stats["graph_index"],
-                                node_loop_iters,
-                                t,
-                            )
+                            stop_logit = self.stop_head(hidden_node)
+                            stop_prob = torch.sigmoid(stop_logit)
+                            stop_prob = torch.nan_to_num(stop_prob, nan=1.0).clamp(0.0, 1.0)
+                            continue_prob = (1.0 - stop_prob).clamp(0.0, 1.0)
+                            if teacher_force_nodes:
+                                target_stop = 1.0 if (target_node_count is not None and t >= target_node_count) else 0.0
+                                node_teacher_loss = node_teacher_loss + F.binary_cross_entropy_with_logits(
+                                    stop_logit, torch.full_like(stop_logit, target_stop)
+                                )
+                                node_teacher_tokens += 1
+                                if target_stop >= 0.5:
+                                    if DEBUG_DECODER and decode_stats is not None:
+                                        decode_stats["node_loop_exit"] = (
+                                            decode_stats["node_loop_exit"] or "teacher_nodes"
+                                        )
+                                    break
+                            else:
+                                if DEBUG_DECODER and decode_stats is not None:
+                                    decode_stats["node_stop_samples"].append(float(continue_prob.item()))
+                                if torch.bernoulli(continue_prob).item() == 0:
+                                    if t == 0:
+                                        continue_prob = torch.ones_like(continue_prob)
+                                    else:
+                                        break
+                            if t > self.max_nodes:
+                                warn("max nodes reached")
+                                if DEBUG_DECODER and decode_stats is not None:
+                                    decode_stats["node_loop_exit"] = decode_stats["node_loop_exit"] or "max_nodes_post"
+                                break
+                            new_node = self.node_head(hidden_node).squeeze(0)
+                            node_embeddings.append(new_node)
+                            node_types.append(self.type_head(new_node).argmax(dim=-1).cpu().tolist())
+
+                            # edge generation to previous nodes
+                            hidden_edge = hidden_node
+                            edge_in = torch.zeros(1, 1, device=device)
+                            for i in range(t):
+                                hidden_edge = self.edge_rnn(edge_in, hidden_edge)
+                                edge_logit = self.edge_head(hidden_edge).view(-1)
+                                p_edge = torch.sigmoid(edge_logit)
+                                p_edge = torch.nan_to_num(p_edge, nan=0.0).clamp(0.0, 1.0)
+                                if teacher_force_nodes and graph_adj_target is not None:
+                                    if i < graph_adj_target.size(0) and t < graph_adj_target.size(1):
+                                        target_edge = graph_adj_target[i, t].view(-1)
+                                        edge_teacher_loss = edge_teacher_loss + F.binary_cross_entropy_with_logits(
+                                            edge_logit, target_edge
+                                        )
+                                        edge_teacher_tokens += 1
+                                if bool((p_edge > self.edge_threshold).item()):
+                                    edges.append([i, t])
+                                edge_in = p_edge.unsqueeze(0)
+                            t += 1
+                            if DEBUG_DECODER and t % 50 == 0:
+                                elapsed = time.perf_counter() - node_loop_timer
+                                logger.info(
+                                    "Decoder graph %d node generation progress: %d nodes (max=%d) elapsed=%.2fs",
+                                    decode_stats["graph_index"],
+                                    t,
+                                    self.max_nodes,
+                                    elapsed,
+                                )
+                            if DEBUG_DECODER and node_loop_iters % 200 == 0:
+                                logger.info(
+                                    "Decoder graph %d node loop iterations=%d (nodes=%d)",
+                                    decode_stats["graph_index"],
+                                    node_loop_iters,
+                                    t,
+                                )
 
             if node_embeddings:
                 node_embeddings = torch.stack(node_embeddings, dim=0)
@@ -1147,8 +1204,15 @@ class GraphDecoder(nn.Module):
                             teacher_cap_hits,
                             attr_cap_hits - teacher_cap_hits,
                         )
-            if attr_teacher_loss is not None:
-                return all_graphs, {"loss": attr_teacher_loss, "tokens": attr_teacher_tokens}
+            if attr_teacher_tokens or node_teacher_tokens or edge_teacher_tokens:
+                return all_graphs, {
+                    "loss": attr_teacher_loss,
+                    "tokens": attr_teacher_tokens,
+                    "node_loss": node_teacher_loss,
+                    "node_tokens": node_teacher_tokens,
+                    "edge_loss": edge_teacher_loss,
+                    "edge_tokens": edge_teacher_tokens,
+                }
             return all_graphs
         finally:
             _forward_prof.__exit__(None, None, None)
@@ -1326,8 +1390,17 @@ class SelfCompressingFitnessRegularizedDAGVAE(nn.Module):
         z = mu + torch.randn_like(std) * std
         return z if latent_mask is None else z * latent_mask
 
-    def decode(self, z, teacher_attr_targets: Optional[List[List[List[int]]]] = None):
-        return self.decoder(z, teacher_attr_targets=teacher_attr_targets)
+    def decode(
+        self,
+        z,
+        teacher_attr_targets: Optional[List[List[List[int]]]] = None,
+        teacher_adj_targets: Optional[List[Optional[torch.Tensor]]] = None,
+    ):
+        return self.decoder(
+            z,
+            teacher_attr_targets=teacher_attr_targets,
+            teacher_adj_targets=teacher_adj_targets,
+        )
 
     def forward(
         self,
@@ -1336,6 +1409,7 @@ class SelfCompressingFitnessRegularizedDAGVAE(nn.Module):
         node_attributes,
         batch,
         teacher_attr_targets: Optional[List[List[List[int]]]] = None,
+        teacher_adj_targets: Optional[List[Optional[torch.Tensor]]] = None,
         num_graphs: Optional[int] = None,
     ):
         mu_g, lv_g = self.encode(
@@ -1346,7 +1420,11 @@ class SelfCompressingFitnessRegularizedDAGVAE(nn.Module):
             num_graphs=num_graphs,
         )
         graph_latent = self.reparameterize(mu_g, lv_g, self.graph_latent_mask)
-        decoded = self.decode(graph_latent, teacher_attr_targets=teacher_attr_targets)
+        decoded = self.decode(
+            graph_latent,
+            teacher_attr_targets=teacher_attr_targets,
+            teacher_adj_targets=teacher_adj_targets,
+        )
         if isinstance(decoded, tuple):
             decoded_graphs, decoder_aux = decoded
         else:
@@ -1475,6 +1553,8 @@ class OnlineTrainer:
         optimizer,
         task=None,
         metric_keys: Optional[Sequence] = None,
+        decoder_empty_penalty: float = 0.0,
+        decoder_missing_node_penalty: float = 0.0,
     ):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = model.to(self.device)
@@ -1496,7 +1576,8 @@ class OnlineTrainer:
         self.invalid_ratio_warmup = 5
         self.progress_callback = None
         self.prune_callback = None
-        self.decoder_empty_penalty = 0.0
+        self.decoder_empty_penalty = float(decoder_empty_penalty or 0.0)
+        self.decoder_missing_node_penalty = float(decoder_missing_node_penalty or 0.0)
         self.wl_kernel_iterations = 2
         self.wl_loss_weight = 0.0
         self.kl_partial_slice_ratio: Optional[float] = None
@@ -1655,6 +1736,7 @@ class OnlineTrainer:
         loss_adj = torch.tensor(0.0, device=self.device)
         loss_feat = torch.tensor(0.0, device=self.device)
         empty_penalty = float(getattr(self, "decoder_empty_penalty", 0.0) or 0.0)
+        missing_node_penalty = float(getattr(self, "decoder_missing_node_penalty", 0.0) or 0.0)
         empty_hits = 0
 
         for i in range(graphs_to_compare):
@@ -1665,6 +1747,9 @@ class OnlineTrainer:
             num_target_nodes = len(target_attrs)
             num_pred_nodes = len(pred_attrs)
             num_nodes = min(num_pred_nodes, num_target_nodes)
+            missing_nodes = max(0, num_target_nodes - num_pred_nodes)
+            if missing_node_penalty > 0 and missing_nodes > 0:
+                loss_adj = loss_adj + missing_node_penalty * missing_nodes
             if num_nodes == 0:
                 empty_hits += 1
                 continue
@@ -1728,9 +1813,19 @@ class OnlineTrainer:
                     else:
                         loss_feat += attribute_value_loss(pred_value)
 
-        if decoder_aux is not None and decoder_aux.get("tokens", 0) > 0:
-            ce_loss = decoder_aux["loss"] / float(decoder_aux["tokens"])
-            loss_feat = loss_feat + float(teacher_force_weight) * ce_loss.to(loss_feat.device)
+        if decoder_aux is not None:
+            token_count = float(decoder_aux.get("tokens", 0) or 0)
+            if token_count > 0:
+                ce_loss = decoder_aux["loss"] / token_count
+                loss_feat = loss_feat + float(teacher_force_weight) * ce_loss.to(loss_feat.device)
+            node_tokens = float(decoder_aux.get("node_tokens", 0) or 0)
+            if node_tokens > 0:
+                node_loss = decoder_aux["node_loss"] / node_tokens
+                loss_adj = loss_adj + node_loss.to(loss_adj.device)
+            edge_tokens = float(decoder_aux.get("edge_tokens", 0) or 0)
+            if edge_tokens > 0:
+                edge_loss = decoder_aux["edge_loss"] / edge_tokens
+                loss_adj = loss_adj + edge_loss.to(loss_adj.device)
 
         denom = max(1, int(batch.num_graphs))
         if empty_penalty > 0 and empty_hits:
@@ -1906,9 +2001,11 @@ class OnlineTrainer:
                 batch = batch.to(self.device)
                 self.optimizer.zero_grad()
                 target_graph_attrs = group_node_attributes(batch.node_attributes, batch.batch)
+                per_graph_node_counts = [len(attrs) for attrs in target_graph_attrs]
                 teacher_attr_targets = build_teacher_attr_targets(
                     target_graph_attrs, None, self.model.shared_attr_vocab
                 )
+                teacher_adj_targets = build_teacher_adj_targets(batch.edge_index, batch.batch, per_graph_node_counts)
                 # --- 1) forward pass ---
                 if DEBUG_TRAINER:
                     logger.info(
@@ -1933,6 +2030,7 @@ class OnlineTrainer:
                     batch.node_attributes,
                     batch.batch,
                     teacher_attr_targets=teacher_attr_targets,
+                    teacher_adj_targets=teacher_adj_targets,
                     num_graphs=batch.num_graphs,
                 )
                 target_y = batch.y
