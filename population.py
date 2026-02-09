@@ -67,7 +67,7 @@ class GuidedPopulation(Population):
     def __init__(self, config):
         super().__init__(config)
         _register_invalid_reason_reporter()
-        graph_latent_dim = 16
+        graph_latent_dim = 32
         num_node_types = 10
         self.task = RegressionTask.random_init()
         self.metric_keys = self._evaluation_metric_keys(self.task)
@@ -164,8 +164,8 @@ class GuidedPopulation(Population):
         self.trainer.module_freeze_verbose = bool(getattr(config, "trainer_freeze_verbose", False))
         self.convex_surrogate_weight = float(getattr(config, "convex_surrogate_weight", 0.5))
         beta_schedule = StagedBetaSchedule(
-            start_beta=0.0,
-            target_beta=0.08,
+            start_beta=0.05,
+            target_beta=0.15,
             warmup_epochs=30,
             ramp_epochs=60,
             hold_epochs=20,

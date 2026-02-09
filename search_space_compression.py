@@ -1402,8 +1402,8 @@ class SelfCompressingFitnessRegularizedDAGVAE(nn.Module):
 class StagedBetaSchedule:
     """Piecewise-linear β schedule with warmup, ramp, hold, and optional cycles."""
 
-    start_beta: float = 0.0
-    target_beta: float = 0.1
+    start_beta: float = 0.05
+    target_beta: float = 0.15
     warmup_epochs: int = 0
     ramp_epochs: int = 50
     hold_epochs: int = 0
@@ -1899,7 +1899,7 @@ class OnlineTrainer:
             self.model.train()
             active_modules = self._modules_for_epoch()
             active_label = "+".join(active_modules)
-            self._apply_module_freeze(active_modules, reason=f"epoch_{epoch}")
+            self._apply_module_freeze(active_modules, reason=f"epoch_{self._kl_global_epoch}")
             current_kl_weight = self._resolve_kl_weight(kl_weight)
             for batch_idx, batch in enumerate(loader, start=1):
                 batch_timer = time.perf_counter() if DEBUG_TRAINER else None
