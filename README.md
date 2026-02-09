@@ -109,6 +109,20 @@ To avoid decoder stalls from attr-name loops that never received a termination s
 - The graph decoder optionally consumes those targets, drives the GRU with embedded ground-truth tokens, and accumulates a per-step cross-entropy loss.
 - The trainer groups batched node attributes, builds the token targets, passes them through the guide model, and blends the decoder’s cross-entropy into the feature reconstruction term.
 
+### Module Freeze Scheduling
+
+The online trainer can rotate which submodules receive gradients each epoch to keep the decoder from collapsing while the surrogate heads learn.
+Configure this with the `[GuidedPopulation]` keys `trainer_freeze_cycle` and `trainer_freeze_verbose` inside `neat-config`:
+
+- `trainer_freeze_cycle` accepts a comma-separated list of phases.
+Each phase is a `+`-delimited set of module aliases drawn from `{encoder, decoder, fitness, icnn}` (`all`/`*` expand to every available module).
+Example: `trainer_freeze_cycle = decoder,encoder+fitness,icnn,all` spends one epoch on decoder-only updates, the next on encoder+predictor, the third on the convex ICNN head, and the fourth on a full joint update before repeating.
+- `trainer_freeze_verbose = true` prints the active phase whenever it changes so you can correlate empty-graph spikes with a specific training slice.
+These phases are also logged to MLflow via the `trainer_module_active_*` metrics and the `active_modules=...` suffix in trainer log lines.
+
+Leaving the cycle unset defaults to a balanced round-robin across whatever modules exist in the current guide.
+The decoder teacher-forcing refresh temporarily unfreezes all heads so the auxiliary rehearsal can update the entire stack regardless of the main-cycle state.
+
 ### Generative Cross-Species Crossover (Graph-VAE)
 
 Another key innovation is a Variational Autoencoder (VAE) that enables unrestricted structural recombination of neural network architectures.

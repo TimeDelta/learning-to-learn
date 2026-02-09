@@ -160,6 +160,8 @@ class GuidedPopulation(Population):
             deque(maxlen=self.decoder_replay_max) if self.decoder_replay_max > 0 else deque()
         )
         self.trainer.decoder_empty_penalty = self.decoder_empty_penalty
+        self.trainer.configure_module_freeze_cycle(getattr(config, "trainer_freeze_cycle", None))
+        self.trainer.module_freeze_verbose = bool(getattr(config, "trainer_freeze_verbose", False))
         self.convex_surrogate_weight = float(getattr(config, "convex_surrogate_weight", 0.5))
         beta_schedule = StagedBetaSchedule(
             start_beta=0.0,

@@ -1456,6 +1456,19 @@ class OnlineTrainer:
     supporting variable node-feature dimensions via list-of-graphs decoding.
     """
 
+    _BASE_MODULE_ORDER = ("encoder", "decoder", "fitness", "icnn")
+    _MODULE_SYNONYMS = {
+        "enc": "encoder",
+        "encoder": "encoder",
+        "latent": "encoder",
+        "dec": "decoder",
+        "decoder": "decoder",
+        "fitness": "fitness",
+        "surrogate": "fitness",
+        "icnn": "icnn",
+        "convex": "icnn",
+    }
+
     def __init__(
         self,
         model: SelfCompressingFitnessRegularizedDAGVAE,
@@ -1489,6 +1502,95 @@ class OnlineTrainer:
         self.kl_partial_slice_ratio: Optional[float] = None
         self.kl_partial_slice_dims: Optional[int] = None
         self.kl_partial_slice_start: int = 0
+        self._module_param_groups = self._build_module_param_groups()
+        self._module_order = tuple(name for name in self._BASE_MODULE_ORDER if name in self._module_param_groups)
+        if not self._module_order:
+            self._module_order = tuple(self._BASE_MODULE_ORDER[:3])  # fallback
+        self.module_names_for_logging = self._module_order
+        self.module_freeze_cycle: tuple[tuple[str, ...], ...] = ()
+        self.module_freeze_verbose = False
+        self._current_active_modules: tuple[str, ...] = self._module_order
+        self._last_freeze_reason: Optional[str] = None
+        self.configure_module_freeze_cycle(None)
+
+    def _build_module_param_groups(self) -> dict[str, tuple[torch.nn.Parameter, ...]]:
+        fitness = self.model.fitness_predictor
+        fitness_params: list[torch.nn.Parameter] = []
+        fitness_params.extend(list(fitness.fc1.parameters()))
+        fitness_params.extend(list(fitness.fc2.parameters()))
+        fitness_params.append(fitness.log_metric_scale)
+        groups: dict[str, list[torch.nn.Parameter]] = {
+            "encoder": list(self.model.graph_encoder.parameters()),
+            "decoder": list(self.model.decoder.parameters()),
+            "fitness": fitness_params,
+        }
+        if hasattr(self.model, "log_alpha_g") and isinstance(self.model.log_alpha_g, torch.nn.Parameter):
+            groups["encoder"].append(self.model.log_alpha_g)
+        icnn = getattr(fitness, "icnn", None)
+        if icnn is not None:
+            groups["icnn"] = list(icnn.parameters())
+        return {name: tuple(params) for name, params in groups.items() if params}
+
+    def configure_module_freeze_cycle(self, cycle_spec: Optional[Sequence[str] | str]):
+        phases = self._parse_freeze_cycle(cycle_spec)
+        self.module_freeze_cycle = phases
+        self._current_active_modules = phases[0]
+        self._last_freeze_reason = None
+        self._apply_module_freeze(self._current_active_modules, reason="freeze_init")
+
+    def _parse_freeze_cycle(self, cycle_spec):
+        if cycle_spec is None:
+            specs: Sequence[str] = ()
+        elif isinstance(cycle_spec, str):
+            specs = [part.strip() for part in cycle_spec.split(",") if part.strip()]
+        else:
+            specs = list(cycle_spec)
+        phases: list[tuple[str, ...]] = []
+        for raw_phase in specs:
+            if not raw_phase:
+                continue
+            tokens = [tok.strip().lower() for tok in raw_phase.split("+") if tok.strip()]
+            if not tokens:
+                continue
+            modules: list[str] = []
+            include_all = any(tok in {"all", "*"} for tok in tokens)
+            if include_all:
+                modules = list(self._module_order)
+            else:
+                for token in tokens:
+                    mapped = self._MODULE_SYNONYMS.get(token)
+                    if mapped and mapped in self._module_param_groups and mapped not in modules:
+                        modules.append(mapped)
+            if modules:
+                phases.append(tuple(modules))
+        if not phases:
+            phases = [tuple(self._module_order)]
+        return tuple(phases)
+
+    def _modules_for_epoch(self) -> tuple[str, ...]:
+        if not self.module_freeze_cycle:
+            return tuple(self._module_order)
+        idx = self._kl_global_epoch % len(self.module_freeze_cycle)
+        return self.module_freeze_cycle[idx]
+
+    def _apply_module_freeze(self, active_modules: Sequence[str], reason: Optional[str] = None):
+        active_set = set(active_modules) if active_modules else set(self._module_order)
+        changed = False
+        for name, params in self._module_param_groups.items():
+            enable = name in active_set
+            for param in params:
+                if param.requires_grad != enable:
+                    param.requires_grad_(enable)
+                    changed = True
+        if changed:
+            self.optimizer.zero_grad(set_to_none=True)
+        normalized = tuple(name for name in self._module_order if name in active_set)
+        self._current_active_modules = normalized or tuple(self._module_order)
+        if self.module_freeze_verbose:
+            label = "+".join(self._current_active_modules)
+            if changed or reason != self._last_freeze_reason:
+                print(f"Trainer module freeze phase -> {label} (reason={reason or 'epoch'})")
+        self._last_freeze_reason = reason
 
     def _update_metric_metadata(self, metric_keys: Sequence):
         self.sorted_metrics = sort_metrics_by_name(metric_keys)
@@ -1795,6 +1897,9 @@ class OnlineTrainer:
             per_metric_error_sum = None
             per_metric_weight_sum = None
             self.model.train()
+            active_modules = self._modules_for_epoch()
+            active_label = "+".join(active_modules)
+            self._apply_module_freeze(active_modules, reason=f"epoch_{epoch}")
             current_kl_weight = self._resolve_kl_weight(kl_weight)
             for batch_idx, batch in enumerate(loader, start=1):
                 batch_timer = time.perf_counter() if DEBUG_TRAINER else None
@@ -1955,13 +2060,16 @@ class OnlineTrainer:
                     loss_terms=loss_metrics,
                     per_metric_losses=per_metric_losses,
                     kl_beta=float(current_kl_weight),
+                    active_modules=tuple(active_modules),
+                    active_modules_label=active_label,
+                    available_modules=self._module_order,
                 )
 
             if verbose:
                 label_str = ", ".join(
                     f"{name}={value:.4g}" for name, value in zip(loss_term_labels, avg_loss_terms.tolist())
                 )
-                label_str = f"{label_str}, kl_beta={current_kl_weight:.4g}"
+                label_str = f"{label_str}, kl_beta={current_kl_weight:.4g}, active={active_label}"
                 if not epochs:
                     print(f"Epoch {epoch}, Loss terms per batch: [{label_str}] (total={total_loss:.4f})")
                 else:
@@ -2048,6 +2156,7 @@ class OnlineTrainer:
         if not refresh_samples:
             return
         loader = DataLoader(refresh_samples, batch_size=batch_size, shuffle=True)
+        self._apply_module_freeze(self._module_order, reason="decoder_teacher_force")
         if verbose:
             print(
                 f"Decoder teacher-forcing pass: epochs={epochs} batch_size={batch_size} weight={teacher_force_weight}"

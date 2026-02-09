@@ -25,6 +25,8 @@ def test_load_guided_population_overrides_reads_values(tmp_path):
             kl_partial_slice_start = 3
             wl_kernel_loss_weight = 0.75
             wl_kernel_iterations = 4
+            trainer_freeze_cycle = decoder+predictor,encoder,all
+            trainer_freeze_verbose = true
             """
         ).strip()
     )
@@ -34,6 +36,8 @@ def test_load_guided_population_overrides_reads_values(tmp_path):
     assert overrides["kl_partial_slice_start"] == 3
     assert overrides["wl_kernel_loss_weight"] == pytest.approx(0.75)
     assert overrides["wl_kernel_iterations"] == 4
+    assert overrides["trainer_freeze_cycle"] == "decoder+predictor,encoder,all"
+    assert overrides["trainer_freeze_verbose"] is True
 
 
 def test_load_guided_population_overrides_rejects_bad_values(tmp_path):

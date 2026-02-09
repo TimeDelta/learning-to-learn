@@ -31,12 +31,25 @@ from reproduction import *
 from torchscript_utils import serialize_script_module
 
 GUIDED_POPULATION_SECTION = "GuidedPopulation"
+
+
+def _parse_bool(value: str) -> bool:
+    lowered = value.strip().lower()
+    if lowered in {"1", "true", "yes", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Expected boolean value for GuidedPopulation override, got '{value}'")
+
+
 GUIDED_POPULATION_FIELDS = {
     "kl_partial_slice_ratio": float,
     "kl_partial_slice_dims": int,
     "kl_partial_slice_start": int,
     "wl_kernel_loss_weight": float,
     "wl_kernel_iterations": int,
+    "trainer_freeze_cycle": str,
+    "trainer_freeze_verbose": _parse_bool,
 }
 
 
@@ -689,6 +702,12 @@ if __name__ == "__main__":
                 loss_terms = kwargs.get("loss_terms", {})
                 kl_beta = kwargs.get("kl_beta")
                 per_metric_losses = kwargs.get("per_metric_losses") or {}
+                active_modules = tuple(kwargs.get("active_modules") or ())
+                available_modules = tuple(
+                    kwargs.get("available_modules")
+                    or getattr(trainer, "module_names_for_logging", ("encoder", "decoder", "predictor"))
+                )
+                active_label = kwargs.get("active_modules_label")
                 step = next(trainer_step_counter)
                 trainer_last_step["value"] = step
                 metrics = {
@@ -698,6 +717,9 @@ if __name__ == "__main__":
                 }
                 if kl_beta is not None:
                     metrics["trainer_kl_beta"] = kl_beta
+                if available_modules:
+                    for module_name in available_modules:
+                        metrics[f"trainer_module_active_{module_name}"] = 1 if module_name in active_modules else 0
                 metrics.update({f"trainer_{name}": value for name, value in loss_terms.items()})
                 filtered_metrics = {k: v for k, v in metrics.items() if v is not None}
                 if filtered_metrics:
@@ -714,9 +736,10 @@ if __name__ == "__main__":
                     epoch_header = f"Epoch {epoch}"
                 else:
                     epoch_header = f"Epoch {epoch}/{total_epochs}"
-                mlflow_run.append_log_line(
-                    f"{epoch_header}, Loss terms per batch: [{loss_str}] (total={total_loss:.4f})"
-                )
+                log_line = f"{epoch_header}, Loss terms per batch: [{loss_str}] (total={total_loss:.4f})"
+                if active_label:
+                    log_line += f" | active_modules={active_label}"
+                mlflow_run.append_log_line(log_line)
                 mlflow_run.flush_log()
                 trainer_metrics_history.append(
                     {
