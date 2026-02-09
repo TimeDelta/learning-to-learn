@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import configparser
 import copy
 import csv
 import hashlib
@@ -28,6 +29,40 @@ from population import _INVALID_REASON_COUNTER
 from relative_rank_stagnation import RelativeRankStagnation
 from reproduction import *
 from torchscript_utils import serialize_script_module
+
+GUIDED_POPULATION_SECTION = "GuidedPopulation"
+GUIDED_POPULATION_FIELDS = {
+    "kl_partial_slice_ratio": float,
+    "kl_partial_slice_dims": int,
+    "kl_partial_slice_start": int,
+}
+
+
+def load_guided_population_overrides(config_path: str | os.PathLike[str]) -> dict[str, object]:
+    """Parse optional GuidedPopulation overrides from the NEAT config file."""
+
+    parser = configparser.ConfigParser()
+    try:
+        read_files = parser.read(config_path)
+    except configparser.Error as exc:  # pragma: no cover - configparse guard
+        raise ValueError(f"Failed to parse config file '{config_path}': {exc}") from exc
+    if not read_files or not parser.has_section(GUIDED_POPULATION_SECTION):
+        return {}
+    section = parser[GUIDED_POPULATION_SECTION]
+    overrides: dict[str, object] = {}
+    for key, caster in GUIDED_POPULATION_FIELDS.items():
+        if key not in section:
+            continue
+        raw_value = section.get(key, "").strip()
+        if raw_value == "":
+            continue
+        try:
+            overrides[key] = caster(raw_value)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid value '{raw_value}' for {key} in [{GUIDED_POPULATION_SECTION}] of {config_path}"
+            ) from exc
+    return overrides
 
 
 def _encode_string_sequence(values):
@@ -576,10 +611,18 @@ if __name__ == "__main__":
         return args
 
     args = _parse_args()
+    guided_population_overrides = load_guided_population_overrides(args.config_file)
 
     config = neat.Config(
         OptimizerGenome, GuidedReproduction, neat.DefaultSpeciesSet, RelativeRankStagnation, args.config_file
     )
+    override_keys = ("kl_partial_slice_ratio", "kl_partial_slice_dims", "kl_partial_slice_start")
+    for key in override_keys:
+        value = guided_population_overrides.get(key)
+        if value is None and hasattr(config, "reproduction_config"):
+            value = getattr(config.reproduction_config, key, None)
+        if value is not None:
+            setattr(config, key, value)
     if getattr(args, "test_mode", False):
         setattr(config, "test_mode", True)
     if args.max_evaluation_steps is not None:
@@ -615,6 +658,20 @@ if __name__ == "__main__":
                     "fitness_threshold": getattr(config, "fitness_threshold", None),
                 }
             )
+            kl_slice_params = {}
+            trainer = getattr(population, "trainer", None)
+            if trainer is not None:
+                ratio = getattr(trainer, "kl_partial_slice_ratio", None)
+                dims = getattr(trainer, "kl_partial_slice_dims", None)
+                start = getattr(trainer, "kl_partial_slice_start", None)
+                if ratio is not None:
+                    kl_slice_params["kl_partial_slice_ratio"] = ratio
+                if dims is not None:
+                    kl_slice_params["kl_partial_slice_dims"] = dims
+                if (ratio is not None or dims is not None) and start is not None:
+                    kl_slice_params["kl_partial_slice_start"] = start
+            if kl_slice_params:
+                mlflow_run.log_params(kl_slice_params)
             mlflow_run.log_artifact(args.config_file)
             mlflow_reporter = MLflowLoggingReporter(mlflow_run)
             population.add_reporter(mlflow_reporter)

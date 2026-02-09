@@ -99,6 +99,37 @@ class GuidedPopulation(Population):
         self.guide = SelfCompressingFitnessRegularizedDAGVAE(graph_encoder, decoder, predictor)
         self.optimizer = torch.optim.Adam(self.guide.parameters(), lr=0.001)
         self.trainer = OnlineTrainer(self.guide, self.optimizer, metric_keys=self.metric_keys)
+        slice_ratio = getattr(config, "kl_partial_slice_ratio", None)
+        if slice_ratio is None and hasattr(config, "reproduction_config"):
+            slice_ratio = getattr(config.reproduction_config, "kl_partial_slice_ratio", None)
+        if slice_ratio is not None:
+            try:
+                slice_ratio = float(slice_ratio)
+            except (TypeError, ValueError):
+                slice_ratio = None
+        if slice_ratio is not None and slice_ratio <= 0:
+            slice_ratio = None
+        slice_dims = getattr(config, "kl_partial_slice_dims", None)
+        if slice_dims is None and hasattr(config, "reproduction_config"):
+            slice_dims = getattr(config.reproduction_config, "kl_partial_slice_dims", None)
+        if slice_dims is not None:
+            try:
+                slice_dims = int(slice_dims)
+            except (TypeError, ValueError):
+                slice_dims = None
+            else:
+                if slice_dims < 0:
+                    slice_dims = None
+        slice_start = getattr(config, "kl_partial_slice_start", None)
+        if slice_start is None and hasattr(config, "reproduction_config"):
+            slice_start = getattr(config.reproduction_config, "kl_partial_slice_start", 0)
+        try:
+            slice_start = max(0, int(slice_start or 0))
+        except (TypeError, ValueError):
+            slice_start = 0
+        self.trainer.kl_partial_slice_ratio = slice_ratio
+        self.trainer.kl_partial_slice_dims = slice_dims
+        self.trainer.kl_partial_slice_start = slice_start
         self.wl_kernel_iterations = int(getattr(config, "wl_kernel_iterations", 2))
         self.wl_kernel_loss_weight = float(getattr(config, "wl_kernel_loss_weight", 0.0))
         self.trainer.wl_kernel_iterations = self.wl_kernel_iterations

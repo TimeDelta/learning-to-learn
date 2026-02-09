@@ -22,6 +22,9 @@ class GuidedReproduction(DefaultReproduction):
                 ConfigParameter("elitism", int, 5),
                 ConfigParameter("survival_threshold", float, 0.2),
                 ConfigParameter("min_species_size", int, 1),
+                ConfigParameter("kl_partial_slice_ratio", float, 1.0),
+                ConfigParameter("kl_partial_slice_dims", int, -1),
+                ConfigParameter("kl_partial_slice_start", int, 0),
             ],
         )
 

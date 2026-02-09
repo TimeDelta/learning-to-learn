@@ -169,6 +169,9 @@ This lets “trust region” radii expand for confident tasks and tighten whenev
 This stage replays ground-truth node/attribute sequences for a few extra epochs (`decoder_teacher_epochs`, default 5) with an amplified cross-entropy weight (`decoder_teacher_force_weight`, default 2.0) so the decoder keeps producing non-empty graphs even as the latent mask prunes dimensions.
 The refresh automatically ramps up to more epochs/weight when the previous generation reported many `empty_graph` failures and also mixes in “near-miss” decoder outputs (graphs that decoded with edges but failed later slot/optimizer checks) plus an explicit penalty whenever a decode terminates before creating edges.
 That combination keeps the decoder anchored to the latent manifold that actually yields usable optimizers.
+*Partial latent KL.* The `[GuidedReproduction]` block inside `neat-config` accepts `kl_partial_slice_ratio` (or an explicit `kl_partial_slice_dims`) plus `kl_partial_slice_start`, letting you clamp the KL divergence term to a contiguous slice of the latent bottleneck.
+Set `kl_partial_slice_dims = -1` (the default) to rely on the ratio, or pin it to any non-negative integer to override the ratio entirely—`0` disables the KL term outright.
+The remaining coordinates float freely until ARD pruning catches up, which helps keep a subset of latents well-structured without forcing every dimension to collapse—useful when the decoder was drifting toward empty graphs under full-latent KL pressure.
 
 ## Experiment Tracking and CLI options
 Run `main.py` directly to evolve optimizers. The script now exposes switches for MLflow tracking and general configuration, so you can keep experiments reproducible:

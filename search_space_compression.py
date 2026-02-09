@@ -1486,6 +1486,9 @@ class OnlineTrainer:
         self.decoder_empty_penalty = 0.0
         self.wl_kernel_iterations = 2
         self.wl_loss_weight = 0.0
+        self.kl_partial_slice_ratio: Optional[float] = None
+        self.kl_partial_slice_dims: Optional[int] = None
+        self.kl_partial_slice_start: int = 0
 
     def _update_metric_metadata(self, metric_keys: Sequence):
         self.sorted_metrics = sort_metrics_by_name(metric_keys)
@@ -1496,6 +1499,44 @@ class OnlineTrainer:
         self.task_metric_guidance_weights = torch.as_tensor(
             [metric.guidance_weight for metric in self.sorted_metrics], dtype=torch.float
         )
+
+    def _resolve_kl_slice_bounds(self, latent_dim: int) -> Optional[tuple[int, int]]:
+        if latent_dim <= 0:
+            return None
+        explicit_dims = self.kl_partial_slice_dims
+        if isinstance(explicit_dims, (int, float)):
+            explicit_dims = int(explicit_dims)
+        else:
+            explicit_dims = None
+        if explicit_dims is None or explicit_dims < 0:
+            ratio = float(self.kl_partial_slice_ratio or 0.0)
+            if ratio <= 0:
+                return None
+            explicit_dims = int(round(latent_dim * ratio))
+            explicit_dims = max(1, min(latent_dim, explicit_dims))
+        else:
+            explicit_dims = max(0, min(latent_dim, explicit_dims))
+        start = max(0, int(self.kl_partial_slice_start or 0))
+        if start >= latent_dim:
+            return None
+        end = min(latent_dim, start + explicit_dims)
+        if end < start:
+            return None
+        return start, end
+
+    def _reduce_kl_loss(self, kl_per_dim: torch.Tensor) -> torch.Tensor:
+        """Aggregate KL divergence, optionally restricting to a latent slice."""
+
+        if kl_per_dim.dim() != 2:
+            raise ValueError("kl_per_dim must be 2D [batch, latent_dim]")
+        latent_dim = kl_per_dim.size(1)
+        bounds = self._resolve_kl_slice_bounds(latent_dim)
+        if bounds is not None:
+            start, end = bounds
+            kl_subset = kl_per_dim[:, start:end]
+        else:
+            kl_subset = kl_per_dim
+        return kl_subset.sum(dim=1).mean()
 
     def _compute_reconstruction_losses(
         self,
@@ -1808,7 +1849,8 @@ class OnlineTrainer:
                     # KL formula: 0.5*(-log_alpha - logvar + precision*(var + mu^2) - 1)
                     return 0.5 * (-log_alpha - logvar + precision * (var + mu.pow(2)) - 1)
 
-                graph_kl_loss = calc_kl_div_per_dim(self.model.log_alpha_g, lv_g, mu_g).sum(dim=1).mean()
+                kl_per_dim = calc_kl_div_per_dim(self.model.log_alpha_g, lv_g, mu_g)
+                graph_kl_loss = self._reduce_kl_loss(kl_per_dim)
 
                 # --- 4) fitness loss ---
                 target = target_y.to(self.device)

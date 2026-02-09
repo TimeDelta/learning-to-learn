@@ -54,6 +54,44 @@ def test_online_trainer_resolves_dynamic_kl_weight():
     assert trainer._kl_global_epoch == 0
 
 
+def test_online_trainer_resolves_kl_slice_bounds():
+    model = MinimalGuide()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    trainer = OnlineTrainer(model, optimizer, metric_keys=[AreaUnderTaskMetrics])
+    trainer.kl_partial_slice_ratio = 0.5
+    trainer.kl_partial_slice_start = 1
+    assert trainer._resolve_kl_slice_bounds(6) == (1, 4)
+    trainer.kl_partial_slice_dims = 2
+    assert trainer._resolve_kl_slice_bounds(10) == (1, 3)
+    trainer.kl_partial_slice_dims = 0
+    assert trainer._resolve_kl_slice_bounds(10) == (1, 1)
+    trainer.kl_partial_slice_start = 9
+    assert trainer._resolve_kl_slice_bounds(9) is None
+    trainer.kl_partial_slice_dims = -1
+    trainer.kl_partial_slice_ratio = 0.25
+    trainer.kl_partial_slice_start = 0
+    assert trainer._resolve_kl_slice_bounds(8) == (0, 2)
+
+
+def test_reduce_kl_loss_uses_configured_slice():
+    model = MinimalGuide()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    trainer = OnlineTrainer(model, optimizer, metric_keys=[AreaUnderTaskMetrics])
+    trainer.kl_partial_slice_dims = 2
+    trainer.kl_partial_slice_start = 1
+    kl_per_dim = torch.tensor([[1.0, 2.0, 3.0, 4.0], [2.0, 3.0, 4.0, 5.0]], dtype=torch.float, requires_grad=True)
+    sliced = trainer._reduce_kl_loss(kl_per_dim)
+    expected = torch.tensor([2.0 + 3.0, 3.0 + 4.0]).mean()
+    assert sliced.item() == pytest.approx(float(expected))
+    trainer.kl_partial_slice_start = 10  # invalid slice falls back to full latent
+    full = trainer._reduce_kl_loss(kl_per_dim)
+    assert full.item() == pytest.approx(float(kl_per_dim.sum(dim=1).mean()))
+    trainer.kl_partial_slice_start = 0
+    trainer.kl_partial_slice_dims = 0  # explicit disable
+    disabled = trainer._reduce_kl_loss(kl_per_dim)
+    assert disabled.item() == pytest.approx(0.0)
+
+
 def _make_graph(node_count, edges):
     node_types = torch.zeros(node_count, dtype=torch.long)
     node_attributes = [{} for _ in range(node_count)]
