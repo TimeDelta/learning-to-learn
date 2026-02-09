@@ -35,6 +35,8 @@ GUIDED_POPULATION_FIELDS = {
     "kl_partial_slice_ratio": float,
     "kl_partial_slice_dims": int,
     "kl_partial_slice_start": int,
+    "wl_kernel_loss_weight": float,
+    "wl_kernel_iterations": int,
 }
 
 
@@ -616,7 +618,7 @@ if __name__ == "__main__":
     config = neat.Config(
         OptimizerGenome, GuidedReproduction, neat.DefaultSpeciesSet, RelativeRankStagnation, args.config_file
     )
-    override_keys = ("kl_partial_slice_ratio", "kl_partial_slice_dims", "kl_partial_slice_start")
+    override_keys = tuple(GUIDED_POPULATION_FIELDS.keys())
     for key in override_keys:
         value = guided_population_overrides.get(key)
         if value is None and hasattr(config, "reproduction_config"):

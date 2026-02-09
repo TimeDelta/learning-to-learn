@@ -37,6 +37,10 @@ rank_tolerance       = 1e-06
 [GuidedReproduction]
 elitism            = 5
 survival_threshold = 0.2
+
+[GuidedPopulation]
 kl_partial_slice_ratio = 0.5
 # kl_partial_slice_dims = 8
 kl_partial_slice_start = 0
+wl_kernel_loss_weight = 1.0
+wl_kernel_iterations = 5

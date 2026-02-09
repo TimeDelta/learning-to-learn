@@ -23,6 +23,8 @@ def test_load_guided_population_overrides_reads_values(tmp_path):
             kl_partial_slice_ratio = 0.25
             kl_partial_slice_dims = 12
             kl_partial_slice_start = 3
+            wl_kernel_loss_weight = 0.75
+            wl_kernel_iterations = 4
             """
         ).strip()
     )
@@ -30,6 +32,8 @@ def test_load_guided_population_overrides_reads_values(tmp_path):
     assert overrides["kl_partial_slice_ratio"] == pytest.approx(0.25)
     assert overrides["kl_partial_slice_dims"] == 12
     assert overrides["kl_partial_slice_start"] == 3
+    assert overrides["wl_kernel_loss_weight"] == pytest.approx(0.75)
+    assert overrides["wl_kernel_iterations"] == 4
 
 
 def test_load_guided_population_overrides_rejects_bad_values(tmp_path):
