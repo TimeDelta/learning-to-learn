@@ -7,6 +7,7 @@ import csv
 import hashlib
 import itertools
 import json
+import logging
 import math
 import os
 import re
@@ -51,6 +52,23 @@ GUIDED_POPULATION_FIELDS = {
     "trainer_freeze_cycle": str,
     "trainer_freeze_verbose": _parse_bool,
 }
+
+
+LOG_LEVEL_CHOICES = ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG")
+
+
+def _configure_root_logger(log_level: str) -> None:
+    """Initialize the root logger according to the CLI-provided level."""
+
+    level = logging.getLevelName(log_level.upper())
+    if not isinstance(level, int):
+        level = logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
+    )
 
 
 def load_guided_population_overrides(config_path: str | os.PathLike[str]) -> dict[str, object]:
@@ -599,6 +617,13 @@ if __name__ == "__main__":
             help="Log the run as a nested MLflow run.",
         )
         parser.add_argument(
+            "--log-level",
+            type=str.upper,
+            choices=LOG_LEVEL_CHOICES,
+            default="INFO",
+            help="Python logging level for this run (default: INFO).",
+        )
+        parser.add_argument(
             "--max-evaluation-steps",
             type=int,
             default=None,
@@ -626,6 +651,7 @@ if __name__ == "__main__":
         return args
 
     args = _parse_args()
+    _configure_root_logger(args.log_level)
     guided_population_overrides = load_guided_population_overrides(args.config_file)
 
     config = neat.Config(
