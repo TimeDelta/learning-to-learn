@@ -323,6 +323,26 @@ class GuidedPopulation(Population):
         if cloned is not None:
             self._decoder_replay_cache.append(cloned)
 
+    def _record_decoder_failure(
+        self,
+        graph_dict: dict | None,
+        fitnesses: dict,
+        reason: str = "empty_graph",
+    ) -> None:
+        if not graph_dict:
+            return
+        data = self.trainer._graph_dict_to_data(graph_dict)
+        if data is None:
+            return
+        try:
+            self.trainer.add_data(
+                [data],
+                [fitnesses],
+                invalid_flags=[True],
+            )
+        except Exception as exc:
+            warn(f"Failed to record decoder failure ({reason}): {exc}")
+
     def _consume_decoder_replay_graphs(self) -> list[dict]:
         if not self._decoder_replay_cache:
             return []
@@ -698,7 +718,8 @@ class GuidedPopulation(Population):
                 empty_graph_count += 1
                 warn("Guided offspring decoder produced an empty graph (no edges); assigning penalty fitness.")
                 genome.graph_dict = graph_dict
-                self._assign_penalty(genome, reason="empty_graph", skip_evaluation=True)
+                penalty_metrics = self._assign_penalty(genome, reason="empty_graph", skip_evaluation=True)
+                self._record_decoder_failure(graph_dict, penalty_metrics, reason="empty_graph")
                 if last_nonempty_graph_dict is not None:
                     self._buffer_decoder_replay_dict(last_nonempty_graph_dict)
                 invalid_reason_counts["empty_graph"] += 1
