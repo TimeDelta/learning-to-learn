@@ -882,21 +882,26 @@ class GraphDecoder(nn.Module):
                             # edge generation to previous nodes
                             hidden_edge = hidden_node
                             edge_in = torch.zeros(1, 1, device=device)
-                            for i in range(t):
-                                hidden_edge = self.edge_rnn(edge_in, hidden_edge)
-                                edge_logit = self.edge_head(hidden_edge).view(-1)
-                                p_edge = torch.sigmoid(edge_logit)
-                                p_edge = torch.nan_to_num(p_edge, nan=0.0).clamp(0.0, 1.0)
-                                if teacher_force_nodes and graph_adj_target is not None:
-                                    if i < graph_adj_target.size(0) and t < graph_adj_target.size(1):
-                                        target_edge = graph_adj_target[i, t].view(-1)
-                                        edge_teacher_loss = edge_teacher_loss + F.binary_cross_entropy_with_logits(
-                                            edge_logit, target_edge
-                                        )
-                                        edge_teacher_tokens += 1
-                                if bool((p_edge > self.edge_threshold).item()):
-                                    edges.append([i, t])
-                                edge_in = p_edge.unsqueeze(0)
+                        for i in range(t):
+                            hidden_edge = self.edge_rnn(edge_in, hidden_edge)
+                            edge_logit = self.edge_head(hidden_edge).view(-1)
+                            p_edge = torch.sigmoid(edge_logit)
+                            p_edge = torch.nan_to_num(p_edge, nan=0.0).clamp(0.0, 1.0)
+                            if teacher_force_nodes and graph_adj_target is not None:
+                                if i < graph_adj_target.size(0) and t < graph_adj_target.size(1):
+                                    target_edge = graph_adj_target[i, t].view(-1)
+                                    edge_teacher_loss = edge_teacher_loss + F.binary_cross_entropy_with_logits(
+                                        edge_logit, target_edge
+                                    )
+                                    edge_teacher_tokens += 1
+                            if teacher_force_nodes:
+                                edge_active = bool((p_edge > self.edge_threshold).item())
+                            else:
+                                edge_sample = torch.bernoulli(p_edge)
+                                edge_active = bool(edge_sample.item())
+                            if edge_active:
+                                edges.append([i, t])
+                            edge_in = p_edge.unsqueeze(0)
                             t += 1
                             if DEBUG_DECODER and t % 50 == 0:
                                 elapsed = time.perf_counter() - node_loop_timer
