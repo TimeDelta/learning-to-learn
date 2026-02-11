@@ -1682,7 +1682,7 @@ class OnlineTrainer:
         normalized = tuple(name for name in self._module_order if name in active_set)
         self._current_active_modules = normalized or tuple(self._module_order)
         if self.module_freeze_verbose:
-            label = "train" + "+".join(self._current_active_modules)
+            label = "train " + "+".join(self._current_active_modules)
             if changed or reason != self._last_freeze_reason:
                 print(f"Trainer module freeze phase -> {label} (reason={reason or 'epoch'})")
         self._last_freeze_reason = reason
