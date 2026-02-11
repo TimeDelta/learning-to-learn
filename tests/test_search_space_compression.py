@@ -4,6 +4,7 @@ from torch_geometric.data import Batch, Data
 
 from metrics import AreaUnderTaskMetrics
 from search_space_compression import (
+    GraphDecoder,
     OnlineTrainer,
     SharedAttributeVocab,
     StagedBetaSchedule,
@@ -134,3 +135,27 @@ def test_structural_alignment_loss_handles_present_batches():
     single_batch = Batch.from_data_list([g1])
     single_loss = trainer._structural_alignment_loss(single_batch, latents[:1])
     assert single_loss.item() == pytest.approx(0.0)
+
+
+def test_graph_decoder_respects_node_budget(monkeypatch):
+    vocab = SharedAttributeVocab([], embedding_dim=4)
+    decoder = GraphDecoder(num_node_types=3, latent_dim=8, shared_attr_vocab=vocab, hidden_dim=4)
+    decoder.max_nodes = 0  # Force the decoder to allow only a single node.
+    decoder.max_edges_per_node = 1
+    decoder.max_edges_per_graph = 1
+
+    with torch.no_grad():
+        decoder.stop_head.weight.zero_()
+        decoder.stop_head.bias.fill_(-20.0)  # near-zero stop prob ⇒ continue forever without a budget.
+
+    def _always_continue(prob):
+        return torch.ones_like(prob)
+
+    monkeypatch.setattr(torch, "bernoulli", _always_continue)
+
+    latent = torch.zeros(1, decoder.latent_dim)
+    graphs = decoder(latent)
+    assert isinstance(graphs, list)
+    assert len(graphs) == 1
+    graph = graphs[0]
+    assert graph["node_types"].shape[0] == 1  # budget enforces a single node even though sampling never stops.
