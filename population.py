@@ -63,6 +63,12 @@ def _register_invalid_reason_reporter():
 class GuidedPopulation(Population):
     _optimizer_state_attr_cache: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
     INVALID_METRIC_VALUE = 1e6
+    INVALID_PENALTY_MIN_SCALE = 0.2
+    INVALID_PENALTY_DEFAULT_SCALE = 0.5
+    INVALID_PENALTY_MAX_SCALE = 1.0
+    MISSING_SLOT_PENALTY_MIN_SCALE = 0.35
+    MISSING_SLOT_PENALTY_MAX_SCALE = 0.9
+    INACTIVE_OPTIMIZER_PENALTY_SCALE = 0.7
 
     def __init__(self, config):
         super().__init__(config)
@@ -202,6 +208,7 @@ class GuidedPopulation(Population):
         if max_evaluation_steps is not None and max_evaluation_steps <= 0:
             max_evaluation_steps = None
         self.max_evaluation_steps = max_evaluation_steps
+        self._last_optimizer_delta = 0.0
 
     def _reset_guided_offspring_stats(self):
         if self._guided_offspring_stats is not None:
@@ -699,12 +706,32 @@ class GuidedPopulation(Population):
                 decoded_graphs = decoded
             graph_dict = decoded_graphs[0]
             repaired = self._repair_graph_dict(graph_dict)
+            repair_reason = graph_dict.get("_repair_failure_reason")
+            repair_details = graph_dict.get("_repair_failure_details")
             if repaired is False:
                 repair_failures += 1
             genome = genome_from_graph_dict(graph_dict, self.config.genome_config, key=i)
             num_edges = len(genome.connections)
             num_params = len(genome.connections)
             graph_signature = graph_signature_from_dict(graph_dict)
+
+            if repair_reason in {"missing_input_slots", "missing_output_slots"}:
+                genome.graph_dict = graph_dict
+                penalty_details = repair_details or {}
+                self._assign_penalty(
+                    genome,
+                    reason=repair_reason,
+                    skip_evaluation=True,
+                    penalty_details=penalty_details,
+                    graph_dict=graph_dict,
+                    record_decoder_failure=True,
+                )
+                self._buffer_decoder_replay_dict(last_nonempty_graph_dict or graph_dict)
+                invalid_reason_counts[repair_reason] += 1
+                if graph_signature:
+                    seen_graph_signatures.add(graph_signature)
+                new_genomes.append(genome)
+                continue
 
             if num_edges > 0:
                 last_nonempty_graph_dict = self._clone_graph_dict(graph_dict)
@@ -718,8 +745,13 @@ class GuidedPopulation(Population):
                 empty_graph_count += 1
                 warn("Guided offspring decoder produced an empty graph (no edges); assigning penalty fitness.")
                 genome.graph_dict = graph_dict
-                penalty_metrics = self._assign_penalty(genome, reason="empty_graph", skip_evaluation=True)
-                self._record_decoder_failure(graph_dict, penalty_metrics, reason="empty_graph")
+                penalty_metrics = self._assign_penalty(
+                    genome,
+                    reason="empty_graph",
+                    skip_evaluation=True,
+                    graph_dict=graph_dict,
+                    record_decoder_failure=True,
+                )
                 if last_nonempty_graph_dict is not None:
                     self._buffer_decoder_replay_dict(last_nonempty_graph_dict)
                 invalid_reason_counts["empty_graph"] += 1
@@ -750,7 +782,22 @@ class GuidedPopulation(Population):
                 )
                 warn(message + "; assigning penalty fitness.")
                 genome.graph_dict = graph_dict
-                self._assign_penalty(genome, reason="missing_output_slots", skip_evaluation=True)
+                total_slots = len(getattr(self.config.genome_config, "output_keys", []))
+                wrong_type_slots = slot_details.get("wrong_type_slots") or []
+                penalty_details = {
+                    "missing_slots": missing_slots,
+                    "wrong_type_slots": wrong_type_slots,
+                    "total_slots": total_slots,
+                    "missing_count": len(set(missing_slots) | set(wrong_type_slots)),
+                }
+                self._assign_penalty(
+                    genome,
+                    reason="missing_output_slots",
+                    skip_evaluation=True,
+                    penalty_details=penalty_details,
+                    graph_dict=graph_dict,
+                    record_decoder_failure=True,
+                )
                 self._buffer_decoder_replay_dict(last_nonempty_graph_dict or graph_dict)
                 invalid_reason_counts["missing_output_slots"] += 1
                 if graph_signature:
@@ -764,7 +811,15 @@ class GuidedPopulation(Population):
                     inactive_optimizer_count += 1
                     warn("Guided offspring optimizer failed to modify model parameters; assigning penalty fitness.")
                     genome.graph_dict = graph_dict
-                    self._assign_penalty(genome, reason="inactive_optimizer", skip_evaluation=True)
+                    penalty_details = {"parameter_delta": getattr(self, "_last_optimizer_delta", 0.0)}
+                    self._assign_penalty(
+                        genome,
+                        reason="inactive_optimizer",
+                        skip_evaluation=True,
+                        penalty_details=penalty_details,
+                        graph_dict=graph_dict,
+                        record_decoder_failure=True,
+                    )
                     self._buffer_decoder_replay_dict(last_nonempty_graph_dict or graph_dict)
                     invalid_reason_counts["inactive_optimizer"] += 1
                     if graph_signature:
@@ -851,9 +906,18 @@ class GuidedPopulation(Population):
             referenced.update(int(v) for v in edge_tensor[1].flatten().tolist())
 
         missing = [int(ok) for ok in output_keys if int(ok) not in referenced]
-        attr_lookup = {}
         node_attrs = graph_dict.get("node_attributes") or []
-        for slot in missing:
+        wrong_type_slots: List[int] = []
+        for raw_slot in output_keys:
+            slot = int(raw_slot)
+            if 0 <= slot < len(node_attrs):
+                attrs = node_attrs[slot] or {}
+                node_type = attrs.get("node_type")
+                if node_type is not None and node_type != "output":
+                    wrong_type_slots.append(slot)
+        combined_missing = sorted(set(missing) | set(wrong_type_slots))
+        attr_lookup = {}
+        for slot in combined_missing:
             if 0 <= slot < len(node_attrs):
                 attrs = node_attrs[slot] or {}
                 if isinstance(attrs, dict):
@@ -864,8 +928,13 @@ class GuidedPopulation(Population):
                 names = []
             attr_lookup[slot] = names
 
-        details = {"missing_slots": missing, "attributes": attr_lookup, "referenced_slots": sorted(referenced)}
-        return len(missing) == 0, details
+        details = {
+            "missing_slots": combined_missing,
+            "attributes": attr_lookup,
+            "referenced_slots": sorted(referenced),
+            "wrong_type_slots": sorted(wrong_type_slots),
+        }
+        return len(combined_missing) == 0, details
 
     @staticmethod
     def _edge_list_from_index(edge_index, node_count: int) -> List[Tuple[int, int]]:
@@ -898,6 +967,8 @@ class GuidedPopulation(Population):
         return normalized
 
     def _repair_graph_dict(self, graph_dict) -> bool:
+        graph_dict.pop("_repair_failure_reason", None)
+        graph_dict.pop("_repair_failure_details", None)
         node_types = graph_dict.get("node_types")
         if node_types is None:
             graph_dict["edge_index"] = torch.empty((2, 0), dtype=torch.long)
@@ -921,12 +992,49 @@ class GuidedPopulation(Population):
         normalized_attrs = self._normalize_node_attributes(graph_dict.get("node_attributes"), node_count)
         input_nodes = [idx for idx, attrs in enumerate(normalized_attrs) if attrs.get("node_type") == "input"]
         output_nodes = [idx for idx, attrs in enumerate(normalized_attrs) if attrs.get("node_type") == "output"]
+
+        def _slot_node_type(slot_idx: int) -> str | None:
+            if 0 <= slot_idx < len(normalized_attrs):
+                attrs = normalized_attrs[slot_idx] or {}
+                node_type = attrs.get("node_type")
+                if isinstance(node_type, str):
+                    return node_type
+            return None
+
         configured_inputs = list(getattr(self.config.genome_config, "input_keys", []))
         configured_outputs = list(getattr(self.config.genome_config, "output_keys", []))
         if configured_inputs and len(input_nodes) < len(configured_inputs):
+            graph_dict["_repair_failure_reason"] = "missing_input_slots"
+            graph_dict["_repair_failure_details"] = {
+                "total_slots": len(configured_inputs),
+                "missing_count": len(configured_inputs) - len(input_nodes),
+                "typed_count": len(input_nodes),
+                "wrong_type_slots": [],
+            }
             graph_dict["edge_index"] = torch.empty((2, 0), dtype=torch.long)
             return False
         if configured_outputs and len(output_nodes) < len(configured_outputs):
+            expected_slots = [int(ok) for ok in configured_outputs]
+            missing_slots: List[int] = []
+            wrong_type_slots: List[int] = []
+            decoded_outputs = set(output_nodes)
+            for slot in expected_slots:
+                if slot in decoded_outputs:
+                    continue
+                node_type = _slot_node_type(slot)
+                if node_type is None:
+                    missing_slots.append(slot)
+                elif node_type != "output":
+                    wrong_type_slots.append(slot)
+                else:
+                    missing_slots.append(slot)
+            graph_dict["_repair_failure_reason"] = "missing_output_slots"
+            graph_dict["_repair_failure_details"] = {
+                "total_slots": len(expected_slots),
+                "missing_count": len(missing_slots) + len(wrong_type_slots),
+                "missing_slots": missing_slots,
+                "wrong_type_slots": wrong_type_slots,
+            }
             graph_dict["edge_index"] = torch.empty((2, 0), dtype=torch.long)
             return False
         if not input_nodes:
@@ -1057,6 +1165,7 @@ class GuidedPopulation(Population):
         prev_metrics = None
         named_params = list(model.named_parameters())
         baseline = {name: param.detach().clone() for name, param in named_params}
+        max_delta_seen = 0.0
 
         for _ in range(max(1, check_steps)):
             metrics = self.task.evaluate_metrics(model, self.task.train_data)
@@ -1077,10 +1186,13 @@ class GuidedPopulation(Population):
                 if after is None:
                     continue
                 total_delta += torch.norm(after - before, p=1).item()
+            if total_delta > max_delta_seen:
+                max_delta_seen = total_delta
             model.load_state_dict(state_dict)
             if total_delta > delta_eps:
                 self._reset_optimizer_state(optimizer, None)
                 self._reset_optimizer_step_counters(optimizer)
+                self._last_optimizer_delta = total_delta
                 return True
             prev_metrics = metrics.detach()
             named_params = list(model.named_parameters())
@@ -1088,6 +1200,7 @@ class GuidedPopulation(Population):
 
         self._reset_optimizer_state(optimizer, None)
         self._reset_optimizer_step_counters(optimizer)
+        self._last_optimizer_delta = max_delta_seen
         return False
 
     def run(self, n=None, offspring_per_species=None):
@@ -1353,21 +1466,82 @@ class GuidedPopulation(Population):
             self.reporters.info(f"Invalid guided offspring reasons: {parts}")
         return genomes
 
-    def _assign_penalty(self, genome, reason="invalid_graph", skip_evaluation=False):
-        validation_metrics = {
-            m: (1 if m.objective == "min" else -1) * self.INVALID_METRIC_VALUE for m in self.task.metrics
-        }
-        validation_metrics[AreaUnderTaskMetrics] = self.INVALID_METRIC_VALUE
-        validation_metrics[TimeCost] = self.INVALID_METRIC_VALUE
-        validation_metrics[MemoryCost] = self.INVALID_METRIC_VALUE
+    def _assign_penalty(
+        self,
+        genome,
+        reason="invalid_graph",
+        skip_evaluation=False,
+        penalty_details=None,
+        graph_dict=None,
+        record_decoder_failure: bool = False,
+    ):
+        if penalty_details is None:
+            penalty_details = getattr(genome, "invalid_penalty_details", None)
+        else:
+            setattr(genome, "invalid_penalty_details", penalty_details)
+        penalty_scale = self._penalty_scale(reason, penalty_details)
+        penalty_value = float(self.INVALID_METRIC_VALUE * penalty_scale)
+        validation_metrics = {m: (1 if m.objective == "min" else -1) * penalty_value for m in self.task.metrics}
+        validation_metrics[AreaUnderTaskMetrics] = penalty_value
+        validation_metrics[TimeCost] = penalty_value
+        validation_metrics[MemoryCost] = penalty_value
         genome.fitnesses = validation_metrics
-        genome.fitness = -0.1
+        genome.fitness = -0.1 * penalty_scale
         setattr(genome, "invalid_graph", True)
         if skip_evaluation:
             genome.skip_evaluation = True
         genome.invalid_reason = reason
         _INVALID_REASON_COUNTER[reason] += 1
+        if record_decoder_failure and graph_dict is not None:
+            try:
+                self._record_decoder_failure(graph_dict, validation_metrics, reason=reason)
+            except Exception as exc:
+                warn(f"Failed to store decoder failure for {reason}: {exc}")
         return validation_metrics
+
+    def _penalty_scale(self, reason: str | None, penalty_details: dict | None) -> float:
+        reason = reason or "invalid_graph"
+        scale = self.INVALID_PENALTY_DEFAULT_SCALE
+        if reason == "empty_graph":
+            scale = self.INVALID_PENALTY_MAX_SCALE
+        elif reason in {"missing_output_slots", "missing_input_slots"}:
+            total_slots = None
+            if penalty_details:
+                total_slots = penalty_details.get("total_slots")
+            if not total_slots:
+                if reason == "missing_output_slots":
+                    total_slots = len(getattr(self.config.genome_config, "output_keys", []))
+                else:
+                    total_slots = len(getattr(self.config.genome_config, "input_keys", []))
+            total_slots = max(1, int(total_slots or 0))
+            missing = 0
+            if penalty_details:
+                missing_count = penalty_details.get("missing_count")
+                if missing_count is not None:
+                    try:
+                        missing = max(0, int(missing_count))
+                    except (TypeError, ValueError):
+                        missing = 0
+                else:
+                    missing_slots = set(int(slot) for slot in penalty_details.get("missing_slots") or [])
+                    wrong_type_slots = set(int(slot) for slot in penalty_details.get("wrong_type_slots") or [])
+                    combined_missing = missing_slots | wrong_type_slots
+                    if combined_missing:
+                        missing = len(combined_missing)
+                    elif penalty_details.get("typed_count") is not None:
+                        try:
+                            typed = max(0, int(penalty_details.get("typed_count") or 0))
+                        except (TypeError, ValueError):
+                            typed = 0
+                        missing = max(0, total_slots - typed)
+            miss_ratio = min(1.0, max(0.0, missing / total_slots))
+            min_scale = self.MISSING_SLOT_PENALTY_MIN_SCALE
+            max_scale = self.MISSING_SLOT_PENALTY_MAX_SCALE
+            scale = min_scale + (max_scale - min_scale) * miss_ratio
+        elif reason == "inactive_optimizer":
+            scale = self.INACTIVE_OPTIMIZER_PENALTY_SCALE
+        clamped = max(self.INVALID_PENALTY_MIN_SCALE, min(self.INVALID_PENALTY_MAX_SCALE, scale))
+        return float(clamped)
 
     def evaluate_optimizer(self, optimizer, model, steps=10):
         """

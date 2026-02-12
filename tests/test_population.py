@@ -299,6 +299,13 @@ def test_graph_output_slot_precheck_detects_missing_slots():
     first_output = config.genome_config.output_keys[0]
     graph_dict["edge_index"] = torch.tensor([[0], [first_output]], dtype=torch.long)
 
+    # Wrong type tagging should still fail coverage.
+    graph_dict["node_attributes"][first_output] = {"node_type": "hidden"}
+    ok_wrong, details_wrong = pop._graph_output_slot_coverage(graph_dict)
+    assert not ok_wrong
+    assert details_wrong["wrong_type_slots"] == [first_output]
+
+    graph_dict["node_attributes"][first_output] = {"node_type": "output"}
     ok2, details2 = pop._graph_output_slot_coverage(graph_dict)
     assert ok2
     assert details2["missing_slots"] == []
@@ -337,13 +344,41 @@ def test_eval_genomes_penalizes_skipped_empty_graphs():
     genome.skip_evaluation = True
     genome.invalid_reason = "empty_graph"
 
-    pop.eval_genomes([(0, genome)], config, task, steps=1)
+    pop.task = task
+    pop.eval_genomes([(0, genome)], config, steps=1)
 
     assert getattr(genome, "invalid_graph", False)
     assert genome.fitnesses[AreaUnderTaskMetrics] == GuidedPopulation.INVALID_METRIC_VALUE
     assert genome.fitnesses[TimeCost] == GuidedPopulation.INVALID_METRIC_VALUE
     assert genome.fitnesses[MemoryCost] == GuidedPopulation.INVALID_METRIC_VALUE
     assert genome.fitness == -0.1
+
+
+def test_assign_penalty_records_decoder_failure_when_requested():
+    config = make_config()
+    pop = GuidedPopulation(config)
+    recorded = {}
+
+    def fake_recorder(graph_dict, fitnesses, reason=""):
+        recorded["graph"] = graph_dict
+        recorded["fitnesses"] = fitnesses
+        recorded["reason"] = reason
+
+    pop._record_decoder_failure = fake_recorder
+    genome = create_simple_genome()
+    dummy_graph = {"edge_index": torch.empty((2, 0), dtype=torch.long)}
+
+    metrics = pop._assign_penalty(
+        genome,
+        reason="inactive_optimizer",
+        skip_evaluation=True,
+        graph_dict=dummy_graph,
+        record_decoder_failure=True,
+    )
+
+    assert recorded["graph"] is dummy_graph
+    assert recorded["reason"] == "inactive_optimizer"
+    assert recorded["fitnesses"] == metrics
 
 
 def test_generate_guided_offspring_handles_missing_elites():
@@ -389,8 +424,13 @@ def test_repair_requires_configured_io_nodes():
     graph = _make_empty_graph_dict(len(node_attrs), node_attrs)
     assert not pop._repair_graph_dict(graph)
     assert graph["edge_index"].numel() == 0
+    assert graph["_repair_failure_reason"] == "missing_input_slots"
+    details = graph["_repair_failure_details"]
+    assert details["missing_count"] >= 1
+    assert details["total_slots"] == num_inputs
+    assert details["typed_count"] == max(0, num_inputs - 1)
 
-    # Omit one required output label.
+    # Omit one required output label (node present but mis-typed).
     node_attrs = []
     for idx in range(max(1, num_inputs + num_outputs)):
         if idx < num_inputs:
@@ -402,6 +442,32 @@ def test_repair_requires_configured_io_nodes():
     graph = _make_empty_graph_dict(len(node_attrs), node_attrs)
     assert not pop._repair_graph_dict(graph)
     assert graph["edge_index"].numel() == 0
+    assert graph["_repair_failure_reason"] == "missing_output_slots"
+    details = graph["_repair_failure_details"]
+    assert details["missing_count"] >= 1
+    assert details["total_slots"] == num_outputs
+    assert details.get("wrong_type_slots") == [config.genome_config.output_keys[0]]
+
+
+def test_penalty_scale_handles_missing_input_slots():
+    config = make_config()
+    pop = GuidedPopulation(config)
+    details = {"total_slots": 4, "missing_count": 2}
+    scale = pop._penalty_scale("missing_input_slots", details)
+    assert pop.MISSING_SLOT_PENALTY_MIN_SCALE <= scale <= pop.MISSING_SLOT_PENALTY_MAX_SCALE
+
+
+def test_penalty_scale_accounts_for_wrong_type_outputs():
+    config = make_config()
+    pop = GuidedPopulation(config)
+    details = {
+        "total_slots": 3,
+        "missing_slots": [],
+        "wrong_type_slots": [0, 2],
+    }
+    scale = pop._penalty_scale("missing_output_slots", details)
+    assert scale > pop.MISSING_SLOT_PENALTY_MIN_SCALE
+    assert scale <= pop.MISSING_SLOT_PENALTY_MAX_SCALE
 
 
 def test_repair_connects_each_input_to_output():

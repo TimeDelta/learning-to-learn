@@ -19,6 +19,12 @@ node_delete_prob      = 0.02
 
 node_type_mutate_rate = 0.01
 
+# TorchScript optimizers take (loss, prev_loss, named_parameters) and return
+# a single dict of updated parameters, so every decoded graph must expose
+# three input pins and one output pin.
+num_inputs            = 3
+num_outputs           = 1
+
 compatibility_disjoint_coefficient = 1.0
 compatibility_weight_coefficient   = 0.5
 

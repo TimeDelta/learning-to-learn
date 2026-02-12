@@ -35,6 +35,8 @@ class OptimizerGenomeConfig(object):
             ConfigParameter("node_delete_prob", float),
             ConfigParameter("single_structural_mutation", bool, "false"),
             ConfigParameter("structural_mutation_surer", str, "default"),
+            ConfigParameter("num_inputs", int, "3"),
+            ConfigParameter("num_outputs", int, "1"),
         ]
 
         self.num_inputs = 3
