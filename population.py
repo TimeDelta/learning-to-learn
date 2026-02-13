@@ -126,8 +126,8 @@ class GuidedPopulation(Population):
 
         self.guide = SelfCompressingFitnessRegularizedDAGVAE(graph_encoder, decoder, predictor)
         self.optimizer = torch.optim.Adam(self.guide.parameters(), lr=0.001)
-        self.decoder_empty_penalty = float(getattr(config, "decoder_empty_penalty", 0.05))
-        self.decoder_missing_node_penalty = float(getattr(config, "decoder_missing_node_penalty", 0.25))
+        self.decoder_empty_penalty = float(getattr(config, "decoder_empty_penalty", 5.0))
+        self.decoder_missing_node_penalty = float(getattr(config, "decoder_missing_node_penalty", 2.5))
         self.trainer = OnlineTrainer(
             self.guide,
             self.optimizer,
