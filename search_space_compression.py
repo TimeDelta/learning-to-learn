@@ -44,6 +44,11 @@ DEBUG_TRAINER = _env_flag("L2L_DEBUG_TRAINER")
 
 logger = logging.getLogger(__name__)
 
+PIN_ROLE_INPUT = "input"
+PIN_ROLE_OUTPUT = "output"
+PIN_ROLE_HIDDEN = "hidden"
+PIN_ROLE_ORDER = [PIN_ROLE_INPUT, PIN_ROLE_HIDDEN, PIN_ROLE_OUTPUT]
+
 
 def flatten_task_features(task_features, expected_len: Optional[int] = None) -> np.ndarray:
     """Flatten heterogeneous task feature collections into a single 1D array with optional padding."""
@@ -90,7 +95,6 @@ def _weisfeiler_lehman_histograms(
     adjacency: List[List[int]] = [[] for _ in range(num_nodes)]
     for src, dst in edge_index_cpu.t().tolist():
         adjacency[src].append(dst)
-        adjacency[dst].append(src)
 
     colors = [f"t{int(label)}" for label in node_types_cpu.tolist()]
     for _ in range(max(1, iterations)):
@@ -534,10 +538,15 @@ class NodeAttributeDeepSetEncoder(nn.Module):
             attr_dict.items(), key=lambda item: attribute_key_to_name(item[0])
         ):  # consistent ordering
             attr_name = attribute_key_to_name(attr)
+            if attr_name == "pin_role":
+                continue
+            attr_name = attribute_key_to_name(attr)
             name_idx = self.shared_attr_vocab.ensure_index(attr_name)
             name_index = torch.tensor(name_idx, dtype=torch.long, device=self.shared_attr_vocab.embedding.weight.device)
             value = self.get_value_tensor(value)
             phis.append(self.attr_encoder(torch.cat([self.shared_attr_vocab.embedding(name_index), value], dim=0)))
+        if not phis:
+            return torch.zeros(self.aggregator[-1].out_features, device=self.shared_attr_vocab.embedding.weight.device)
         return self.aggregator(torch.stack(phis, dim=0).sum(dim=0))
 
 
@@ -548,15 +557,23 @@ class GraphEncoder(nn.Module):
     """
 
     def __init__(
-        self, num_node_types: int, attr_encoder: NodeAttributeDeepSetEncoder, latent_dim: int, hidden_dims: List[int]
+        self,
+        num_node_types: int,
+        attr_encoder: NodeAttributeDeepSetEncoder,
+        latent_dim: int,
+        hidden_dims: List[int],
+        pin_role_vocab: int = 3,
     ):
         super().__init__()
         self.latent_dim = latent_dim
         self.attr_encoder = attr_encoder
         attr_emb_dim = attr_encoder.out_dim
         self.node_type_embedding = nn.Embedding(num_node_types, attr_emb_dim)
+        self.pin_role_embedding = nn.Embedding(pin_role_vocab, attr_emb_dim)
+        self.pin_role_to_index = {role: idx for idx, role in enumerate(PIN_ROLE_ORDER)}
+        self.pin_role_default_index = min(self.pin_role_to_index.get(PIN_ROLE_HIDDEN, 0), pin_role_vocab - 1)
         self.convs = nn.ModuleList()
-        prev_dim = attr_emb_dim * 2
+        prev_dim = attr_emb_dim * 3
         for h in hidden_dims:
             self.convs.append(DAGAttention(prev_dim, h))
             prev_dim = h
@@ -572,10 +589,25 @@ class GraphEncoder(nn.Module):
     def shared_attr_vocab(self):
         return self.attr_encoder.shared_attr_vocab
 
+    def _pin_role_index(self, value: Any) -> int:
+        if isinstance(value, str):
+            role = value.strip().lower()
+            idx = self.pin_role_to_index.get(role)
+            if idx is not None:
+                return min(idx, self.pin_role_embedding.num_embeddings - 1)
+        return self.pin_role_default_index
+
     def forward(self, node_types, edge_index, node_attributes, batch, num_graphs: Optional[int] = None):
         type_embedding = self.node_type_embedding(node_types)
         num_nodes = len(node_types)
-        attr_embedding = torch.zeros((num_nodes, self.attr_encoder.out_dim), device=type_embedding.device)
+        device = type_embedding.device
+        attr_embedding = torch.zeros((num_nodes, self.attr_encoder.out_dim), device=device)
+        role_ids = torch.full(
+            (num_nodes,),
+            fill_value=self.pin_role_default_index,
+            dtype=torch.long,
+            device=device,
+        )
 
         per_graph_attrs = group_node_attributes(node_attributes, batch)
 
@@ -588,6 +620,13 @@ class GraphEncoder(nn.Module):
                     )
                     break
                 attr_embedding[cursor] = self.attr_encoder(attrs).to(type_embedding.device)
+                if isinstance(attrs, dict):
+                    raw_role = attrs.get("pin_role")
+                    if raw_role is None:
+                        raw_role = attrs.get("node_type")
+                else:
+                    raw_role = None
+                role_ids[cursor] = self._pin_role_index(raw_role)
                 cursor += 1
             if cursor >= num_nodes:
                 break
@@ -598,7 +637,8 @@ class GraphEncoder(nn.Module):
                 warn(
                     f"Attribute encoder produced {cursor} vectors but expected {num_nodes}; remaining filled with zeros"
                 )
-        x = torch.cat([type_embedding, attr_embedding], dim=-1)
+        role_embedding = self.pin_role_embedding(role_ids)
+        x = torch.cat([type_embedding, attr_embedding, role_embedding], dim=-1)
         for conv in self.convs:
             x = conv(x, edge_index)
 
@@ -634,22 +674,6 @@ class GraphEncoder(nn.Module):
         self.lin_mu = prune_lin(self.lin_mu)
         self.lin_logvar = prune_lin(self.lin_logvar)
         self.latent_dim = len(kept_idx)
-
-
-class AsyncGraphEncoder(GraphEncoder):
-    """Graph encoder using AsyncDAGLayer instead of attention."""
-
-    def __init__(
-        self, num_node_types: int, attr_encoder: NodeAttributeDeepSetEncoder, latent_dim: int, hidden_dims: List[int]
-    ):
-        super().__init__(num_node_types, attr_encoder, latent_dim, hidden_dims=[])
-        self.convs = nn.ModuleList()
-        prev_dim = attr_encoder.out_dim * 2
-        for h in hidden_dims:
-            self.convs.append(AsyncDAGLayer(prev_dim, h))
-            prev_dim = h
-        self.lin_mu = nn.Linear(prev_dim, latent_dim)
-        self.lin_logvar = nn.Linear(prev_dim, latent_dim)
 
 
 class GraphDeconvNet(MessagePassing):

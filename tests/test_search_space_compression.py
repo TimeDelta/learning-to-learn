@@ -12,11 +12,62 @@ from search_space_compression import (
 )
 
 
+class _DummyAttrEncoder(torch.nn.Module):
+    def forward(self, *args, **kwargs):  # pragma: no cover - not exercised in unit tests
+        raise NotImplementedError
+
+    def get_value_tensor(self, value):
+        if isinstance(value, torch.Tensor):
+            return value.float()
+        if value is None:
+            return torch.tensor([0.0])
+        try:
+            return torch.as_tensor([float(value)], dtype=torch.float32)
+        except (TypeError, ValueError):
+            return torch.tensor([0.0])
+
+
+class _MinimalFitness(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = torch.nn.Linear(1, 1)
+        self.fc2 = torch.nn.Linear(1, 1)
+        self.log_metric_scale = torch.nn.Parameter(torch.zeros(1))
+        self.icnn = None
+
+    def forward(self, *args, **kwargs):  # pragma: no cover - not exercised in unit tests
+        raise NotImplementedError
+
+
 class MinimalGuide(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.shared_attr_vocab = SharedAttributeVocab([], embedding_dim=4)
-        self.dummy = torch.nn.Parameter(torch.zeros(1))
+        self.attr_encoder = _DummyAttrEncoder()
+        self.graph_encoder = torch.nn.Linear(1, 4)
+        self.decoder = torch.nn.Linear(4, 1)
+        self.fitness_predictor = _MinimalFitness()
+        self.log_alpha_g = torch.nn.Parameter(torch.zeros(4))
+        self.register_buffer("graph_latent_mask", torch.ones(4))
+
+    @property
+    def graph_latent_dim(self):
+        return int(self.graph_latent_mask.numel())
+
+    def prune_latent_dims(self, num_prune: int = 1):  # pragma: no cover - simple helper
+        if num_prune <= 0:
+            return
+        active = (self.graph_latent_mask > 0).nonzero(as_tuple=True)[0]
+        if active.numel() == 0:
+            return
+        drop = min(num_prune, active.numel())
+        self.graph_latent_mask[active[-drop:]] = 0
+
+    def resize_bottleneck(self):  # pragma: no cover - noop for tests
+        return
+
+    def forward(self, *args, **kwargs):  # pragma: no cover - not exercised here
+        raise NotImplementedError
 
 
 def test_staged_beta_schedule_phases():

@@ -19,7 +19,12 @@ from neat.population import Population
 from torch_geometric.data import Batch, Data
 from torch_geometric.loader import DataLoader
 
-from genes import NODE_TYPE_OPTIONS, NODE_TYPE_TO_INDEX
+from genes import (
+    NODE_TYPE_OPTIONS,
+    NODE_TYPE_TO_INDEX,
+    node_type_index_from_name,
+    node_type_name_from_index,
+)
 from genome import OptimizerGenome
 from graph_builder import *
 from metrics import *
@@ -31,6 +36,23 @@ from tasks import *
 
 _INVALID_REASON_COUNTER: Counter = Counter()
 _INVALID_REASON_REPORT_REGISTERED = False
+
+PIN_ROLE_INPUT = "input"
+PIN_ROLE_OUTPUT = "output"
+PIN_ROLE_HIDDEN = "hidden"
+_PIN_ROLE_FALLBACKS = {
+    PIN_ROLE_INPUT: PIN_ROLE_INPUT,
+    PIN_ROLE_OUTPUT: PIN_ROLE_OUTPUT,
+    PIN_ROLE_HIDDEN: PIN_ROLE_HIDDEN,
+}
+
+
+def _normalize_pin_role(value: Any) -> str | None:
+    if isinstance(value, str):
+        role = value.strip().lower()
+        if role in _PIN_ROLE_FALLBACKS:
+            return _PIN_ROLE_FALLBACKS[role]
+    return None
 
 
 def _dump_invalid_reason_summary():
@@ -383,15 +405,41 @@ class GuidedPopulation(Population):
         node_ids = sorted(genome.nodes.keys())
         node_types = []
         node_attributes = []
+        input_keys = {
+            int(key)
+            for key in getattr(self.config.genome_config, "input_keys", [])
+            if isinstance(key, (int, float)) or (isinstance(key, str) and key.strip())
+        }
+        output_keys = {
+            int(key)
+            for key in getattr(self.config.genome_config, "output_keys", [])
+            if isinstance(key, (int, float)) or (isinstance(key, str) and key.strip())
+        }
+
+        def _role_for_node_key(node_key: Any) -> str:
+            try:
+                key = int(node_key)
+            except (TypeError, ValueError):
+                return PIN_ROLE_HIDDEN
+            if key in input_keys:
+                return PIN_ROLE_INPUT
+            if key in output_keys:
+                return PIN_ROLE_OUTPUT
+            return PIN_ROLE_HIDDEN
+
         for nid in node_ids:
             node = genome.nodes[nid]
             idx = NODE_TYPE_TO_INDEX.get(node.node_type)
             if idx is None:
                 raise KeyError(f"Unknown node_type {node.node_type!r}")
             attr_names = [attribute_key_to_name(a) for a in node.dynamic_attributes.keys()]
+            attr_dict = copy.deepcopy(node.dynamic_attributes)
+            role = _role_for_node_key(nid)
+            attr_dict["pin_role"] = role
+            attr_names.append("pin_role")
             self.shared_attr_vocab.add_names(attr_names)
             node_types.append(idx)
-            node_attributes.append(copy.deepcopy(node.dynamic_attributes))
+            node_attributes.append(attr_dict)
         node_types = torch.tensor(node_types, dtype=torch.long)
 
         edges = []
@@ -783,7 +831,7 @@ class GuidedPopulation(Population):
                 warn(message + "; assigning penalty fitness.")
                 genome.graph_dict = graph_dict
                 total_slots = len(getattr(self.config.genome_config, "output_keys", []))
-                wrong_type_slots = slot_details.get("wrong_type_slots") or []
+                wrong_type_slots = slot_details.get("wrong_type_slots") or slot_details.get("wrong_role_slots") or []
                 penalty_details = {
                     "missing_slots": missing_slots,
                     "wrong_type_slots": wrong_type_slots,
@@ -873,8 +921,28 @@ class GuidedPopulation(Population):
                 )
             )
 
-        self._accumulate_guided_offspring_stats(total_requested, len(new_genomes), invalid_reason_counts)
-        return new_genomes
+        deduped_genomes, late_duplicates = self._dedupe_genomes_by_signature(new_genomes)
+        if late_duplicates:
+            duplicate_count += late_duplicates
+            warn(f"Guided offspring final dedupe removed {late_duplicates} duplicate graphs.")
+
+        self._accumulate_guided_offspring_stats(total_requested, len(deduped_genomes), invalid_reason_counts)
+        return deduped_genomes
+
+    def _dedupe_genomes_by_signature(self, genomes: Sequence[OptimizerGenome]) -> Tuple[List[OptimizerGenome], int]:
+        seen: Set[str] = set()
+        unique: List[OptimizerGenome] = []
+        removed = 0
+        for genome in genomes:
+            graph_dict = getattr(genome, "graph_dict", None)
+            signature = graph_signature_from_dict(graph_dict) if graph_dict else None
+            if signature and signature in seen:
+                removed += 1
+                continue
+            if signature:
+                seen.add(signature)
+            unique.append(genome)
+        return unique, removed
 
     def _graph_output_slot_coverage(self, graph_dict):
         output_keys = list(getattr(self.config.genome_config, "output_keys", []))
@@ -912,8 +980,10 @@ class GuidedPopulation(Population):
             slot = int(raw_slot)
             if 0 <= slot < len(node_attrs):
                 attrs = node_attrs[slot] or {}
-                node_type = attrs.get("node_type")
-                if node_type is not None and node_type != "output":
+                role = _normalize_pin_role(attrs.get("pin_role"))
+                if role is None:
+                    role = _normalize_pin_role(attrs.get("node_type"))
+                if role is not None and role != PIN_ROLE_OUTPUT:
                     wrong_type_slots.append(slot)
         combined_missing = sorted(set(missing) | set(wrong_type_slots))
         attr_lookup = {}
@@ -990,16 +1060,23 @@ class GuidedPopulation(Population):
             adjacency_in[dst].append(src)
 
         normalized_attrs = self._normalize_node_attributes(graph_dict.get("node_attributes"), node_count)
-        input_nodes = [idx for idx, attrs in enumerate(normalized_attrs) if attrs.get("node_type") == "input"]
-        output_nodes = [idx for idx, attrs in enumerate(normalized_attrs) if attrs.get("node_type") == "output"]
 
-        def _slot_node_type(slot_idx: int) -> str | None:
-            if 0 <= slot_idx < len(normalized_attrs):
-                attrs = normalized_attrs[slot_idx] or {}
-                node_type = attrs.get("node_type")
-                if isinstance(node_type, str):
-                    return node_type
+        def _node_pin_role(idx: int) -> str | None:
+            if idx < 0 or idx >= len(normalized_attrs):
+                return None
+            attrs = normalized_attrs[idx] or {}
+            role = _normalize_pin_role(attrs.get("pin_role"))
+            if role is None:
+                role = _normalize_pin_role(attrs.get("node_type"))
+            if role is not None:
+                return role
+            raw_role = attrs.get("pin_role")
+            if raw_role is not None:
+                warn(f"Unknown node pin role: {raw_role}")
             return None
+
+        input_nodes = [idx for idx in range(len(normalized_attrs)) if _node_pin_role(idx) == "input"]
+        output_nodes = [idx for idx in range(len(normalized_attrs)) if _node_pin_role(idx) == "output"]
 
         configured_inputs = list(getattr(self.config.genome_config, "input_keys", []))
         configured_outputs = list(getattr(self.config.genome_config, "output_keys", []))
@@ -1021,10 +1098,10 @@ class GuidedPopulation(Population):
             for slot in expected_slots:
                 if slot in decoded_outputs:
                     continue
-                node_type = _slot_node_type(slot)
-                if node_type is None:
+                role = _node_pin_role(slot)
+                if role is None:
                     missing_slots.append(slot)
-                elif node_type != "output":
+                elif role != "output":
                     wrong_type_slots.append(slot)
                 else:
                     missing_slots.append(slot)
@@ -1351,7 +1428,7 @@ class GuidedPopulation(Population):
             model_copy = type(model)(self.task.train_data.num_input_features)
             model_copy.load_state_dict(model.state_dict())
             print(f"  Evaluating {genome_id} ({genome.optimizer_path})")
-            result = self.evaluate_optimizer(genome.optimizer, model_copy, steps)
+            result = self.evaluate_optimizer(genome.optimizer, model_copy, steps=steps)
             if result is None:
                 penalty_metrics = self._assign_penalty(genome_map[genome_id])
                 reason = getattr(genome_map[genome_id], "invalid_reason", "invalid_graph")
@@ -1523,17 +1600,20 @@ class GuidedPopulation(Population):
                     except (TypeError, ValueError):
                         missing = 0
                 else:
-                    missing_slots = set(int(slot) for slot in penalty_details.get("missing_slots") or [])
-                    wrong_type_slots = set(int(slot) for slot in penalty_details.get("wrong_type_slots") or [])
-                    combined_missing = missing_slots | wrong_type_slots
-                    if combined_missing:
-                        missing = len(combined_missing)
-                    elif penalty_details.get("typed_count") is not None:
+                    slots = set()
+                    for slot in penalty_details.get("missing_slots") or []:
                         try:
-                            typed = max(0, int(penalty_details.get("typed_count") or 0))
+                            slots.add(int(slot))
                         except (TypeError, ValueError):
-                            typed = 0
-                        missing = max(0, total_slots - typed)
+                            continue
+                    for slot in (
+                        penalty_details.get("wrong_type_slots") or penalty_details.get("wrong_role_slots") or []
+                    ):
+                        try:
+                            slots.add(int(slot))
+                        except (TypeError, ValueError):
+                            continue
+                    missing = len(slots)
             miss_ratio = min(1.0, max(0.0, missing / total_slots))
             min_scale = self.MISSING_SLOT_PENALTY_MIN_SCALE
             max_scale = self.MISSING_SLOT_PENALTY_MAX_SCALE

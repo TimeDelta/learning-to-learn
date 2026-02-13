@@ -35,12 +35,37 @@ NODE_TYPE_OPTIONS = [  # for mutation
     "prim::GetAttr",
     "prim::SetAttr",
     "prim::min",
+    "tensor",
 ]
 NODE_TYPE_TO_INDEX = {nt: i for i, nt in enumerate(NODE_TYPE_OPTIONS)}
-NODE_TYPE_TO_INDEX["input"] = len(NODE_TYPE_TO_INDEX)
-NODE_TYPE_TO_INDEX["hidden"] = len(NODE_TYPE_TO_INDEX)
-NODE_TYPE_TO_INDEX["output"] = len(NODE_TYPE_TO_INDEX)
 ATTRIBUTE_NAMES = set()
+
+
+def node_type_name_from_index(index: int) -> str:
+    if 0 <= index < len(NODE_TYPE_OPTIONS):
+        return NODE_TYPE_OPTIONS[index]
+    raise KeyError(f"Unknown node type index {index}")
+
+
+def node_type_index_from_name(name: str) -> int:
+    if not name:
+        raise KeyError("Empty node type name")
+    if name not in NODE_TYPE_TO_INDEX:
+        raise KeyError(f"Unknown node type {name!r}")
+    return NODE_TYPE_TO_INDEX[name]
+
+
+def ensure_node_type_registered(name: str) -> int:
+    """Ensure a TorchScript node kind has a stable index, extending vocab if needed."""
+    if not name:
+        raise KeyError("Empty node type name")
+    idx = NODE_TYPE_TO_INDEX.get(name)
+    if idx is not None:
+        return idx
+    idx = len(NODE_TYPE_OPTIONS)
+    NODE_TYPE_TO_INDEX[name] = idx
+    NODE_TYPE_OPTIONS.append(name)
+    return idx
 
 
 class NodeGene(BaseGene):

@@ -37,6 +37,16 @@ class GuidedReproduction(DefaultReproduction):
         self.optimizer_validator = None
         self.optimizer_validation_retries = getattr(config, "optimizer_validation_retries", 3)
 
+    def _is_optimizer_valid(self, optimizer) -> bool:
+        validator = getattr(self, "optimizer_validator", None)
+        if not callable(validator):
+            return True
+        try:
+            return bool(validator(optimizer))
+        except Exception as exc:
+            warn(f"Optimizer validator raised {exc}; treating optimizer as invalid")
+            return False
+
     def _guided_fraction(self, generation: int) -> float:
         if generation < self.guided_start_generation:
             return 0.0
@@ -107,13 +117,20 @@ class GuidedReproduction(DefaultReproduction):
             # 1) guided children
             guided_fraction = self._guided_fraction(generation)
             guided_quota = int(round(remaining_spawn * guided_fraction))
+            if guided_quota == 0 and guided_fraction > 0.0 and remaining_spawn > 0:
+                guided_quota = 1
             guided_quota = min(guided_quota, remaining_spawn)
             guided_children = []
             if guided_quota > 0 and self.guide_fn is not None and generation >= self.guided_start_generation:
                 guided_children = self.guide_fn(list(s.members.values()), self.reproduction_config, guided_quota)
 
             for kid in guided_children:
-                gid = next(self.genome_indexer)
+                existing_key = getattr(kid, "key", None)
+                gid = (
+                    existing_key
+                    if existing_key is not None and existing_key not in new_population
+                    else next(self.genome_indexer)
+                )
                 kid.key = gid
                 new_population[gid] = kid
                 self.ancestors[gid] = (None, None)
@@ -157,8 +174,8 @@ class GuidedReproduction(DefaultReproduction):
                                         "NEAT offspring produced an empty graph after mutation; consider adjusting mutation rates."
                                     )
                             optimizer = getattr(child, "optimizer", None)
-                            optimizer_valid = self.optimizer_validator(optimizer)
-                            if not optimizer_valid:
+                            if not self._is_optimizer_valid(optimizer):
+                                optimizer_valid = False
                                 warn("NEAT offspring optimizer failed parameter-update check; retrying mutation.")
                         if not optimizer_valid:
                             continue
@@ -177,19 +194,10 @@ class GuidedReproduction(DefaultReproduction):
                                 self.reporters.info(
                                     f"Fallback minimum graph for species {s.key} failed to compile cleanly: {exc}"
                                 )
-                        validator = getattr(self, "optimizer_validator", None)
-                        if optimizer is not None and callable(validator):
-                            try:
-                                valid = bool(validator(optimizer))
-                            except Exception as exc:
-                                valid = False
-                                warn(
-                                    f"Fallback optimizer validation raised for species {s.key}: {exc}; keeping fallback child regardless."
-                                )
-                            if not valid:
-                                self.reporters.info(
-                                    f"Fallback optimizer for species {s.key} failed validation; proceeding to keep minimum graph child."
-                                )
+                        if optimizer is not None and not self._is_optimizer_valid(optimizer):
+                            self.reporters.info(
+                                f"Fallback optimizer for species {s.key} failed validation; proceeding to keep minimum graph child."
+                            )
                         new_population[cid] = fallback_child
                         self.ancestors[cid] = (p1_id, p2_id)
                         self.reporters.info(

@@ -7,15 +7,19 @@ import neat
 import pytest
 import torch
 from torch.fx.passes.utils.matcher_utils import SubgraphMatcher
+from torch_geometric.data import Data
 
 # allow imports from repo root
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from compare_encoders import optimizer_to_graph_dict
+from attributes import FloatAttribute, IntAttribute, StringAttribute
+from genes import ensure_node_type_registered
 from genome import OptimizerGenome
 from graph_builder import genome_from_graph_dict, rebuild_and_script
+from graph_ir import export_script_module_to_graph_ir
 from relative_rank_stagnation import RelativeRankStagnation
 from reproduction import GuidedReproduction
+from torchscript_utils import serialize_script_module
 
 
 def make_config():
@@ -27,6 +31,53 @@ def make_config():
         RelativeRankStagnation,
         config_path,
     )
+
+
+def optimizer_to_graph_dict(opt):
+    data = optimizer_to_data(opt)
+    graph_ir, module_state = export_script_module_to_graph_ir(opt)
+    return {
+        "node_types": data.node_types,
+        "edge_index": data.edge_index,
+        "node_attributes": data.node_attributes,
+        "serialized_module": serialize_script_module(opt),
+        "graph_ir": graph_ir,
+        "module_state": module_state,
+        "module_type": opt._c._type().qualified_name() if hasattr(opt._c._type(), "qualified_name") else None,
+    }
+
+
+def optimizer_to_data(opt):
+    node_map = {}
+    node_types = []
+    node_attrs = []
+    for idx, node in enumerate(opt.graph.nodes()):
+        node_map[node] = idx
+        node_types.append(ensure_node_type_registered(node.kind()))
+        attrs = {}
+        for name in node.attributeNames():
+            kind = node.kindOf(name)
+            if kind == "i":
+                attrs[IntAttribute(name)] = node.i(name)
+            elif kind == "f":
+                attrs[FloatAttribute(name)] = node.f(name)
+            elif kind == "s":
+                attrs[StringAttribute(name)] = node.s(name)
+        node_attrs.append(attrs)
+
+    edges = []
+    for node in opt.graph.nodes():
+        dst = node_map[node]
+        for inp in node.inputs():
+            src = inp.node()
+            if src in node_map:
+                edges.append([node_map[src], dst])
+    if edges:
+        edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
+    else:
+        edge_index = torch.empty((2, 0), dtype=torch.long)
+    node_types = torch.tensor(node_types, dtype=torch.long)
+    return Data(node_types=node_types, edge_index=edge_index, node_attributes=node_attrs)
 
 
 def get_node_signature(node, type_overrides=None):

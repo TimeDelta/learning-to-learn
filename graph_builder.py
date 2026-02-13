@@ -7,7 +7,7 @@ import torch._C
 import torch.jit
 import torch.nn as nn
 
-from genes import NODE_TYPE_OPTIONS, NodeGene
+from genes import NODE_TYPE_OPTIONS, NodeGene, node_type_name_from_index
 from genome import OptimizerGenome
 from torchscript_utils import load_script_module
 
@@ -395,15 +395,36 @@ def genome_from_graph_dict(graph_dict, genome_config, key=None) -> OptimizerGeno
     else:
         node_type_indices = list(node_types_val)
     node_attrs_seq = graph_dict.get("node_attributes", [])
+    node_key_order = graph_dict.get("node_key_order") or []
+    input_keys = set(getattr(genome_config, "input_keys", []))
+
+    def local_index_to_key(local_idx: int) -> int:
+        if node_key_order and 0 <= local_idx < len(node_key_order):
+            try:
+                return int(node_key_order[local_idx])
+            except (TypeError, ValueError):
+                return int(local_idx)
+        return int(local_idx)
+
     for nid, type_idx in enumerate(node_type_indices):
-        ng = NodeGene(nid, None)
+        node_key = local_index_to_key(nid)
+        if node_key in input_keys:
+            continue
+        ng = NodeGene(node_key, None)
         attr_dict = node_attrs_seq[nid] if nid < len(node_attrs_seq) else {}
         node_type_name = attr_dict.get("node_type")
         if node_type_name is None:
             try:
-                node_type_name = NODE_TYPE_OPTIONS[int(type_idx)]
-            except (ValueError, TypeError, IndexError):
+                node_type_name = node_type_name_from_index(int(type_idx))
+            except (ValueError, TypeError, KeyError):
                 node_type_name = "hidden"
+        elif not isinstance(node_type_name, str):
+            node_type_name = str(node_type_name)
+            print(node_type_name)
+            if isinstance(attr_dict, dict):
+                attr_dict = dict(attr_dict)
+                attr_dict["node_type"] = node_type_name
+                node_attrs_seq[nid] = attr_dict
         ng.node_type = node_type_name
         dyn_attrs = dict(attr_dict)
         for seq_key in ("__output_types__", "__input_types__", "__input_kinds__", "__getattr_output_types__"):
@@ -420,8 +441,9 @@ def genome_from_graph_dict(graph_dict, genome_config, key=None) -> OptimizerGeno
         scope = dyn_attrs.get("__scope__")
         if scope is not None:
             ng.scope = str(scope)
-        genome.nodes[nid] = ng
-    genome.next_node_id = len(genome.nodes)
+        genome.nodes[node_key] = ng
+    positive_keys = [key for key in genome.nodes.keys() if isinstance(key, int) and key >= 0]
+    genome.next_node_id = (max(positive_keys) + 1) if positive_keys else 0
 
     genome.connections = {}
     edge_index_val = graph_dict.get("edge_index")
@@ -434,9 +456,11 @@ def genome_from_graph_dict(graph_dict, genome_config, key=None) -> OptimizerGeno
             edge_tensor = edge_tensor.view(2, -1)
         if edge_tensor.numel() > 0:
             for src, dst in edge_tensor.t().tolist():
-                cg = genome.create_connection(genome_config, src, dst)
+                src_key = local_index_to_key(int(src))
+                dst_key = local_index_to_key(int(dst))
+                cg = genome.create_connection(genome_config, src_key, dst_key)
                 cg.enabled = True
-                genome.connections[(src, dst)] = cg
+                genome.connections[(src_key, dst_key)] = cg
 
     return genome
 

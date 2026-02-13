@@ -61,13 +61,32 @@ class EmptyStateOptimizer:
         self.state = {}
 
 
+class _DummyFitnessHead(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = torch.nn.Linear(1, 1)
+        self.fc2 = torch.nn.Linear(1, 1)
+        self.log_metric_scale = torch.nn.Parameter(torch.zeros(1))
+        self.icnn = None
+
+    def forward(self, *args, **kwargs):  # pragma: no cover - not needed for tests
+        raise NotImplementedError
+
+
 class DummyGuideModel(torch.nn.Module):
-    """Minimal module exposing shared_attr_vocab for OnlineTrainer tests."""
+    """Minimal module exposing trainer-facing attributes without heavy encoders."""
 
     def __init__(self):
         super().__init__()
+        latent_dim = 2
         self.shared_attr_vocab = SharedAttributeVocab([], embedding_dim=4)
-        self.dummy = torch.nn.Parameter(torch.zeros(1))
+        self.attr_encoder = torch.nn.Linear(1, 1)
+        self.graph_encoder = torch.nn.Linear(latent_dim, latent_dim)
+        self.graph_encoder.latent_dim = latent_dim
+        self.decoder = torch.nn.Linear(latent_dim, latent_dim)
+        self.fitness_predictor = _DummyFitnessHead()
+        self.log_alpha_g = torch.nn.Parameter(torch.zeros(latent_dim))
+        self.register_buffer("graph_latent_mask", torch.ones(latent_dim))
 
 
 class StubFitnessPredictor(torch.nn.Module):
@@ -604,13 +623,12 @@ def test_node_attribute_encoder_accepts_tensor_values():
 
 def test_evaluate_optimizer_resizes_state_before_execution():
     config = make_config()
-    pop = GuidedPopulation(config)
-    task = RegressionTask.random_init(num_samples=4, silent=True)
-    model = ManyLossMinimaModel(task.train_data.num_input_features)
+    population = GuidedPopulation(config)
+    model = ManyLossMinimaModel(population.task.train_data.num_input_features)
     optimizer = DummyStatefulOptimizer()
 
     # Should not raise even though optimizer buffers start with mismatched shapes.
-    pop.evaluate_optimizer(optimizer, model, task, steps=1)
+    population.evaluate_optimizer(optimizer, model, steps=1)
 
     assert tuple(optimizer.state_buffers["fc1.weight"].shape) == tuple(model.fc1.weight.shape)
 
@@ -636,16 +654,15 @@ def test_evaluate_optimizer_resets_state_and_step_each_run():
             return updated
 
     config = make_config()
-    pop = GuidedPopulation(config)
-    task = RegressionTask.random_init(num_samples=4, silent=True)
-    model = ManyLossMinimaModel(task.train_data.num_input_features)
+    population = GuidedPopulation(config)
+    model = ManyLossMinimaModel(population.task.train_data.num_input_features)
     optimizer = TrackingOptimizer()
 
-    pop.evaluate_optimizer(optimizer, model, task, steps=1)
+    population.evaluate_optimizer(optimizer, model, steps=1)
     # Simulate leftover state before the second evaluation.
     optimizer.state = {k: v + 5 for k, v in optimizer.state.items()}
     optimizer.step = 42
-    pop.evaluate_optimizer(optimizer, model, task, steps=1)
+    population.evaluate_optimizer(optimizer, model, steps=1)
 
     assert [step for step, _ in optimizer.observed] == [0, 0]
     assert all(len(state) == 0 for _, state in optimizer.observed)
@@ -657,12 +674,11 @@ def test_evaluate_optimizer_marks_nan_outputs_invalid():
             return {name: torch.full_like(param, float("nan")) for name, param in named_parameters}
 
     config = make_config()
-    pop = GuidedPopulation(config)
-    task = RegressionTask.random_init(num_samples=4, silent=True)
-    model = ManyLossMinimaModel(task.train_data.num_input_features)
+    population = GuidedPopulation(config)
+    model = ManyLossMinimaModel(population.task.train_data.num_input_features)
 
     optimizer = NaNOptimizer()
-    result = pop.evaluate_optimizer(optimizer, model, task, steps=1)
+    result = population.evaluate_optimizer(optimizer, model, steps=1)
 
     assert result is None
 

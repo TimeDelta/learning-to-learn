@@ -11,7 +11,7 @@ from torch_geometric.loader import DataLoader
 
 import mlflow
 from attributes import BoolAttribute, FloatAttribute, IntAttribute, StringAttribute
-from genes import NODE_TYPE_TO_INDEX
+from genes import ensure_node_type_registered
 from graph_ir import export_script_module_to_graph_ir
 from metrics import MSELoss, sort_metrics_by_name
 from models import ManyLossMinimaModel
@@ -44,7 +44,7 @@ def optimizer_to_data(opt):
     node_attrs = []
     for idx, node in enumerate(opt.graph.nodes()):
         node_map[node] = idx
-        node_types.append(NODE_TYPE_TO_INDEX.get(node.kind(), NODE_TYPE_TO_INDEX["hidden"]))
+        node_types.append(ensure_node_type_registered(node.kind()))
         attrs = {}
         for name in node.attributeNames():
             kind = node.kindOf(name)
