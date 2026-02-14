@@ -108,7 +108,11 @@ class GuidedPopulation(Population):
             self.shared_attr_vocab, encoder_hdim=10, aggregator_hdim=20, out_dim=20
         )
         graph_encoder = GraphEncoder(
-            len(NODE_TYPE_OPTIONS), attr_encoder, latent_dim=graph_latent_dim, hidden_dims=[32, 32]
+            len(NODE_TYPE_OPTIONS),
+            attr_encoder,
+            latent_dim=graph_latent_dim,
+            hidden_dims=[32, 32],
+            pin_role_dim=2,
         )
         decoder = GraphDecoder(len(NODE_TYPE_OPTIONS), graph_latent_dim, self.shared_attr_vocab)
         icnn_hidden_dims = getattr(config, "latent_icnn_hidden_dims", (64, 32))
@@ -980,8 +984,8 @@ class GuidedPopulation(Population):
             slot = int(raw_slot)
             if 0 <= slot < len(node_attrs):
                 attrs = node_attrs[slot] or {}
-                role = _normalize_pin_role(attrs.get("pin_role"))
-                if role is None:
+                role = self._decode_pin_role_value(attrs.get("pin_role"))
+                if role is None and isinstance(attrs.get("node_type"), str):
                     role = _normalize_pin_role(attrs.get("node_type"))
                 if role is not None and role != PIN_ROLE_OUTPUT:
                     wrong_type_slots.append(slot)
@@ -1036,6 +1040,37 @@ class GuidedPopulation(Population):
             normalized.append(normalized_dict)
         return normalized
 
+    def _decode_pin_role_value(self, value: Any) -> str | None:
+        role = _normalize_pin_role(value) if isinstance(value, str) else None
+        if role or value is None:
+            return role
+        if torch.is_tensor(value):
+            vec = value.detach().flatten().float()
+            if vec.numel() == 0:
+                return None
+            best_role = None
+            best_score = float("-inf")
+            vocab = getattr(self, "shared_attr_vocab", None)
+            if vocab is None:
+                return None
+            embeddings = getattr(vocab, "embedding", None)
+            if embeddings is None:
+                return None
+            for candidate in (PIN_ROLE_INPUT, PIN_ROLE_OUTPUT, PIN_ROLE_HIDDEN):
+                idx = vocab.name_to_index.get(candidate)
+                if idx is None or idx >= embeddings.weight.size(0):
+                    continue
+                ref = embeddings.weight[idx].detach().flatten().float()
+                size = min(vec.numel(), ref.numel())
+                if size == 0:
+                    continue
+                score = F.cosine_similarity(vec[:size].unsqueeze(0), ref[:size].unsqueeze(0)).item()
+                if score > best_score:
+                    best_score = score
+                    best_role = candidate
+            return best_role
+        return None
+
     def _repair_graph_dict(self, graph_dict) -> bool:
         graph_dict.pop("_repair_failure_reason", None)
         graph_dict.pop("_repair_failure_details", None)
@@ -1065,13 +1100,15 @@ class GuidedPopulation(Population):
             if idx < 0 or idx >= len(normalized_attrs):
                 return None
             attrs = normalized_attrs[idx] or {}
-            role = _normalize_pin_role(attrs.get("pin_role"))
+            role = self._decode_pin_role_value(attrs.get("pin_role"))
             if role is None:
-                role = _normalize_pin_role(attrs.get("node_type"))
+                node_type = attrs.get("node_type")
+                if isinstance(node_type, str):
+                    role = _normalize_pin_role(node_type)
             if role is not None:
                 return role
             raw_role = attrs.get("pin_role")
-            if raw_role is not None:
+            if raw_role is not None and isinstance(raw_role, str):
                 warn(f"Unknown node pin role: {raw_role}")
             return None
 

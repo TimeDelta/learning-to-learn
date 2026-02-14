@@ -512,7 +512,7 @@ class NodeAttributeDeepSetEncoder(nn.Module):
         if isinstance(value, (int, float)):
             value = torch.tensor([value], dtype=torch.float)
         elif isinstance(value, str):
-            index = self.shared_attr_vocab.name_to_index.get(value, self.shared_attr_vocab.name_to_index["<UNK>"])
+            index = self.shared_attr_vocab.ensure_index(value)
             index = torch.tensor(index, dtype=torch.long, device=self.shared_attr_vocab.embedding.weight.device)
             value = self.shared_attr_vocab.embedding(index)
         elif isinstance(value, torch.Tensor):
@@ -563,17 +563,19 @@ class GraphEncoder(nn.Module):
         latent_dim: int,
         hidden_dims: List[int],
         pin_role_vocab: int = 3,
+        pin_role_dim: int = 2,
     ):
         super().__init__()
         self.latent_dim = latent_dim
         self.attr_encoder = attr_encoder
         attr_emb_dim = attr_encoder.out_dim
         self.node_type_embedding = nn.Embedding(num_node_types, attr_emb_dim)
-        self.pin_role_embedding = nn.Embedding(pin_role_vocab, attr_emb_dim)
+        self.pin_role_embedding = nn.Embedding(pin_role_vocab, pin_role_dim)
         self.pin_role_to_index = {role: idx for idx, role in enumerate(PIN_ROLE_ORDER)}
         self.pin_role_default_index = min(self.pin_role_to_index.get(PIN_ROLE_HIDDEN, 0), pin_role_vocab - 1)
         self.convs = nn.ModuleList()
-        prev_dim = attr_emb_dim * 3
+        role_dim = self.pin_role_embedding.embedding_dim
+        prev_dim = attr_emb_dim * 2 + role_dim
         for h in hidden_dims:
             self.convs.append(DAGAttention(prev_dim, h))
             prev_dim = h
