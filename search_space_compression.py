@@ -1247,7 +1247,7 @@ class GraphDecoder(nn.Module):
             if attr_teacher_tokens or node_teacher_tokens or edge_teacher_tokens:
                 return all_graphs, {
                     "loss": attr_teacher_loss,
-                    "tokens": attr_teacher_tokens,
+                    "attribute_tokens": attr_teacher_tokens,
                     "node_loss": node_teacher_loss,
                     "node_tokens": node_teacher_tokens,
                     "edge_loss": edge_teacher_loss,
@@ -1854,7 +1854,7 @@ class OnlineTrainer:
                         loss_feat += attribute_value_loss(pred_value)
 
         if decoder_aux is not None:
-            token_count = float(decoder_aux.get("tokens", 0) or 0)
+            token_count = float(decoder_aux.get("attribute_tokens", 0) or 0)
             if token_count > 0:
                 ce_loss = decoder_aux["loss"] / token_count
                 loss_feat = loss_feat + float(teacher_force_weight) * ce_loss.to(loss_feat.device)
@@ -2183,8 +2183,6 @@ class OnlineTrainer:
                 metric_values = metric_values.tolist()
                 weight_list = per_metric_weight_sum.tolist()
                 for idx, value in enumerate(metric_values):
-                    if idx >= len(weight_list) or weight_list[idx] <= 0:
-                        continue
                     per_metric_losses[self._metric_name_for_index(idx)] = float(value)
 
             if self.progress_callback is not None:

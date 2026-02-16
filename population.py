@@ -195,9 +195,11 @@ class GuidedPopulation(Population):
         )
         self.decoder_teacher_verbose = bool(getattr(config, "decoder_teacher_verbose", True))
         self.decoder_replay_max = int(getattr(config, "decoder_replay_max", 256))
-        self._decoder_replay_cache: deque[dict] = (
-            deque(maxlen=self.decoder_replay_max) if self.decoder_replay_max > 0 else deque()
-        )
+        # graph_signature_from_dict can legitimately return None (e.g., tensors with unsupported dtypes) even for validated graphs
+        self._decoder_replay_cache: deque[tuple[str | None, dict]] = deque()
+        self._decoder_replay_signatures: Set[str] = set()
+        # reservoir keeps the most recent valid graphs to reseed future replay passes
+        self._decoder_replay_reservoir: deque[tuple[str | None, dict]] = deque(maxlen=self.decoder_replay_max)
         self.trainer.configure_module_freeze_cycle(getattr(config, "trainer_freeze_cycle", None))
         self.trainer.module_freeze_verbose = bool(getattr(config, "trainer_freeze_verbose", False))
         self.convex_surrogate_weight = float(getattr(config, "convex_surrogate_weight", 0.5))
@@ -353,8 +355,23 @@ class GuidedPopulation(Population):
         if not graph_dict or self.decoder_replay_max <= 0:
             return
         cloned = self._clone_graph_dict(graph_dict)
-        if cloned is not None:
-            self._decoder_replay_cache.append(cloned)
+        if cloned is None:
+            return
+        signature = graph_signature_from_dict(cloned)
+        if signature and signature in self._decoder_replay_signatures:
+            return
+        if self.decoder_replay_max > 0 and len(self._decoder_replay_cache) >= self.decoder_replay_max:
+            old_signature, _ = self._decoder_replay_cache.popleft()
+            if old_signature:
+                self._decoder_replay_signatures.discard(old_signature)
+        self._decoder_replay_cache.append((signature, cloned))
+        if signature:
+            self._decoder_replay_signatures.add(signature)
+        if self.decoder_replay_max > 0:
+            # reservoir keeps the most recent valid graphs to reseed future replay passes
+            if len(self._decoder_replay_reservoir) >= self.decoder_replay_max:
+                self._decoder_replay_reservoir.popleft()
+            self._decoder_replay_reservoir.append((signature, cloned))
 
     def _record_decoder_failure(
         self,
@@ -378,9 +395,16 @@ class GuidedPopulation(Population):
 
     def _consume_decoder_replay_graphs(self) -> list[dict]:
         if not self._decoder_replay_cache:
-            return []
-        payload = list(self._decoder_replay_cache)
+            if not self._decoder_replay_reservoir:
+                return []
+            reseed = list(self._decoder_replay_reservoir)
+            self._decoder_replay_cache.extend(reseed)
+            for signature, _ in reseed:
+                if signature:
+                    self._decoder_replay_signatures.add(signature)
+        payload = [entry[1] for entry in self._decoder_replay_cache]
         self._decoder_replay_cache.clear()
+        self._decoder_replay_signatures.clear()
         return payload
 
     @staticmethod
@@ -746,7 +770,7 @@ class GuidedPopulation(Population):
         seen_graph_signatures: Set[str] = set()
         total_requested = z_g.size(0)
         invalid_reason_counts: Counter = Counter()
-        last_nonempty_graph_dict = None
+        last_valid_graph_dict = None
 
         for i in range(total_requested):
             latent = z_g[i].unsqueeze(0).clone()
@@ -778,15 +802,13 @@ class GuidedPopulation(Population):
                     graph_dict=graph_dict,
                     record_decoder_failure=True,
                 )
-                self._buffer_decoder_replay_dict(last_nonempty_graph_dict or graph_dict)
+                if last_valid_graph_dict is not None:
+                    self._buffer_decoder_replay_dict(last_valid_graph_dict)
                 invalid_reason_counts[repair_reason] += 1
                 if graph_signature:
                     seen_graph_signatures.add(graph_signature)
                 new_genomes.append(genome)
                 continue
-
-            if num_edges > 0:
-                last_nonempty_graph_dict = self._clone_graph_dict(graph_dict)
 
             if num_edges == 0 or debug_saved < debug_save_limit:
                 debug_path = debug_dir / f"gen{generation_idx}_child{i}_edges{num_edges}.pt"
@@ -804,8 +826,8 @@ class GuidedPopulation(Population):
                     graph_dict=graph_dict,
                     record_decoder_failure=True,
                 )
-                if last_nonempty_graph_dict is not None:
-                    self._buffer_decoder_replay_dict(last_nonempty_graph_dict)
+                if last_valid_graph_dict is not None:
+                    self._buffer_decoder_replay_dict(last_valid_graph_dict)
                 invalid_reason_counts["empty_graph"] += 1
                 if graph_signature:
                     seen_graph_signatures.add(graph_signature)
@@ -815,8 +837,8 @@ class GuidedPopulation(Population):
             if graph_signature in seen_graph_signatures:
                 duplicate_count += 1
                 warn("Guided offspring decoder produced a duplicate graph; skipping to preserve diversity.")
-                if last_nonempty_graph_dict is not None:
-                    self._buffer_decoder_replay_dict(last_nonempty_graph_dict)
+                if last_valid_graph_dict is not None:
+                    self._buffer_decoder_replay_dict(last_valid_graph_dict)
                 continue
 
             slot_ok, slot_details = self._graph_output_slot_coverage(graph_dict)
@@ -850,7 +872,8 @@ class GuidedPopulation(Population):
                     graph_dict=graph_dict,
                     record_decoder_failure=True,
                 )
-                self._buffer_decoder_replay_dict(last_nonempty_graph_dict or graph_dict)
+                if last_valid_graph_dict is not None:
+                    self._buffer_decoder_replay_dict(last_valid_graph_dict)
                 invalid_reason_counts["missing_output_slots"] += 1
                 if graph_signature:
                     seen_graph_signatures.add(graph_signature)
@@ -872,7 +895,8 @@ class GuidedPopulation(Population):
                         graph_dict=graph_dict,
                         record_decoder_failure=True,
                     )
-                    self._buffer_decoder_replay_dict(last_nonempty_graph_dict or graph_dict)
+                    if last_valid_graph_dict is not None:
+                        self._buffer_decoder_replay_dict(last_valid_graph_dict)
                     invalid_reason_counts["inactive_optimizer"] += 1
                     if graph_signature:
                         seen_graph_signatures.add(graph_signature)
@@ -881,6 +905,8 @@ class GuidedPopulation(Population):
 
                 genome.optimizer = optimizer
                 genome.graph_dict = graph_dict
+                last_valid_graph_dict = self._clone_graph_dict(graph_dict)
+                self._buffer_decoder_replay_dict(last_valid_graph_dict)
                 if graph_signature:
                     seen_graph_signatures.add(graph_signature)
                 new_genomes.append(genome)
@@ -889,7 +915,8 @@ class GuidedPopulation(Population):
 
             rebuild_failures += 1
             warn("Guided offspring decoder failed to rebuild a valid optimizer; skipping child.")
-            self._buffer_decoder_replay_dict(last_nonempty_graph_dict)
+            if last_valid_graph_dict is not None:
+                self._buffer_decoder_replay_dict(last_valid_graph_dict)
 
         if empty_graph_count:
             warn(
