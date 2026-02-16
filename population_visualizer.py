@@ -324,6 +324,87 @@ def build_dot_graph(
     return "\n".join(dot_lines)
 
 
+def _mermaid_escape(text: str) -> str:
+    return text.replace('"', '\\"').replace("<", "&lt;").replace(">", "&gt;")
+
+
+def build_mermaid_graph(
+    entry: Mapping[str, Any],
+    *,
+    context: RenderContext | None = None,
+    max_attr_lines: int = 4,
+    max_attr_value_chars: int = 32,
+    rankdir: str = "LR",
+    highlight_invalid: bool = True,
+) -> str:
+    graph_dict = entry.get("graph") or {}
+    node_type_ids = _materialize_node_types(graph_dict.get("node_types"))
+    node_count = len(node_type_ids)
+    if node_count == 0:
+        node_attrs = graph_dict.get("node_attributes") or []
+        node_count = len(node_attrs)
+        node_type_ids = list(range(node_count))
+    nodes = [_node_type_name(idx) for idx in node_type_ids]
+    attrs = _normalize_node_attributes(graph_dict.get("node_attributes"), len(nodes))
+    edges = _edge_list(graph_dict.get("edge_index"), len(nodes))
+
+    orientation = rankdir.upper()
+    if orientation not in {"LR", "RL", "TB", "BT"}:
+        orientation = "LR"
+    ctx = context or RenderContext()
+    label_parts = [f"genome={entry.get('genome_id')}"]
+    if ctx.generation is not None:
+        label_parts.append(f"gen={ctx.generation}")
+    if ctx.rank is not None:
+        label_parts.append(f"rank={ctx.rank}")
+    if entry.get("fitness") is not None:
+        try:
+            label_parts.append(f"fitness={float(entry['fitness']):.4f}")
+        except (TypeError, ValueError):
+            label_parts.append(f"fitness={entry['fitness']}")
+    if entry.get("species_id") is not None:
+        label_parts.append(f"species={entry['species_id']}")
+    if ctx.task:
+        label_parts.append(f"task={ctx.task}")
+    if highlight_invalid and entry.get("invalid_graph"):
+        reason = entry.get("invalid_reason") or "invalid"
+        label_parts.append(f"status=invalid({reason})")
+
+    lines = [f"graph {orientation}"]
+    if label_parts:
+        lines.append("  %% " + " | ".join(label_parts))
+
+    node_ids: List[str] = []
+    for idx, (node_name, node_attrs) in enumerate(zip(nodes, attrs)):
+        node_id = f"node_{idx}"
+        node_ids.append(node_id)
+        attr_lines: List[str] = [f"{idx}: {node_name}"]
+        shown = 0
+        for key in sorted(node_attrs.keys()):
+            if key == "node_type":
+                continue
+            summary = _summarize_attr_value(node_attrs[key], max_chars=max_attr_value_chars)
+            attr_lines.append(f"{key}={summary}")
+            shown += 1
+            if shown >= max_attr_lines:
+                attr_lines.append("…")
+                break
+        label = _mermaid_escape("<br/>".join(attr_lines))
+        lines.append(f'  {node_id}["{label}"]')
+
+    for src, dst in edges:
+        lines.append(f"  node_{src} --> node_{dst}")
+
+    if not edges:
+        lines.append("  %% Graph has no edges")
+
+    if highlight_invalid and entry.get("invalid_graph") and node_ids:
+        lines.append("  classDef invalid fill:#FFEBEE,stroke:#C62828,color:#C62828;")
+        lines.append("  class " + ",".join(node_ids) + " invalid;")
+
+    return "\n".join(lines)
+
+
 def write_dot_file(dot_source: str, destination: Path) -> Path:
     destination.write_text(dot_source)
     return destination

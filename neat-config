@@ -53,3 +53,4 @@ wl_kernel_iterations = 5
 # NOTE: each phase here signifies what is trained not what is frozen
 trainer_freeze_cycle = decoder,encoder+fitness,icnn,all
 trainer_freeze_verbose = True
+debug_guided_offspring = True

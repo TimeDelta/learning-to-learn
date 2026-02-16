@@ -12,6 +12,7 @@ from torch_geometric.data import Batch, Data
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 import population as population_module
+import population_visualizer as population_visualizer_module
 from attributes import FloatAttribute, IntAttribute
 from genes import NODE_TYPE_TO_INDEX, ConnectionGene, NodeGene
 from genome import OptimizerGenome
@@ -274,6 +275,34 @@ def test_generate_guided_offspring_allows_attribute_variants(monkeypatch):
     assert len(offspring) == 2
 
 
+def test_generate_guided_offspring_buffers_near_misses(monkeypatch):
+    pop, config = configure_stub_population(
+        [make_graph_factory(0.1)],
+        monkeypatch,
+    )
+    pop._optimizer_updates_parameters = lambda *args, **kwargs: False
+
+    buffered_graphs = []
+
+    def fake_buffer(graph_dict):
+        if graph_dict:
+            buffered_graphs.append(graph_dict)
+
+    pop._buffer_decoder_replay_dict = fake_buffer
+
+    offspring = pop.generate_guided_offspring(
+        [],
+        config,
+        n_offspring=1,
+        latent_steps=1,
+        max_decode_attempts=1,
+        decode_jitter_std=0.0,
+    )
+
+    assert offspring  # even penalized genomes should be returned
+    assert buffered_graphs, "decoder replay buffer did not capture near-miss graphs"
+
+
 def test_generation_eval_steps_respects_max_cap():
     config = make_config()
     config.max_evaluation_steps = 30
@@ -398,6 +427,104 @@ def test_assign_penalty_records_decoder_failure_when_requested():
     assert recorded["graph"] is dummy_graph
     assert recorded["reason"] == "inactive_optimizer"
     assert recorded["fitnesses"] == metrics
+
+
+def test_guided_invalid_visualization_emits_dot(tmp_path):
+    config = make_config()
+    pop = GuidedPopulation(config)
+    pop.generation = 2
+    pop.guided_invalid_viz_enabled = True
+    pop.guided_invalid_viz_dir = tmp_path
+    pop.guided_invalid_viz_formats = ("dot",)
+    pop.guided_invalid_viz_limit = 4
+    pop._guided_invalid_viz_generation = None
+    pop._guided_invalid_viz_used = 0
+
+    genome = create_simple_genome()
+    graph_dict = {
+        "node_types": torch.tensor([0, 1], dtype=torch.long),
+        "edge_index": torch.tensor([[0, 0], [1, 1]], dtype=torch.long),
+        "node_attributes": [{"node_type": "input"}, {"node_type": "output"}],
+    }
+
+    pop._maybe_visualize_guided_invalid_graph(
+        genome,
+        graph_dict,
+        reason="empty_graph",
+        child_index=3,
+        num_edges=0,
+    )
+
+    dot_files = list(tmp_path.glob("*.dot"))
+    assert dot_files, "expected invalid graph visualization"
+    text = dot_files[0].read_text()
+    assert "status=invalid" in text
+    assert "empty_graph" in text
+
+
+def test_guided_invalid_visualization_mermaid_only(tmp_path):
+    config = make_config()
+    pop = GuidedPopulation(config)
+    pop.generation = 4
+    pop.guided_invalid_viz_enabled = True
+    pop.guided_invalid_viz_dir = tmp_path
+    pop.guided_invalid_viz_formats = ("mermaid",)
+    pop.guided_invalid_viz_limit = 2
+
+    genome = create_simple_genome()
+    graph_dict = {
+        "node_types": torch.tensor([0, 1], dtype=torch.long),
+        "edge_index": torch.tensor([[0, 0], [1, 1]], dtype=torch.long),
+        "node_attributes": [{"node_type": "input"}, {"node_type": "output"}],
+    }
+
+    pop._maybe_visualize_guided_invalid_graph(
+        genome,
+        graph_dict,
+        reason="missing_output_slots",
+        child_index=0,
+        num_edges=1,
+    )
+
+    mermaid_files = list(tmp_path.glob("*.mmd"))
+    assert mermaid_files, "expected Mermaid visualization"
+    text = mermaid_files[0].read_text()
+    assert "graph LR" in text
+    assert "status=invalid" in text
+
+
+def test_guided_invalid_visualization_handles_missing_graphviz(monkeypatch, tmp_path):
+    config = make_config()
+    pop = GuidedPopulation(config)
+    pop.generation = 3
+    pop.guided_invalid_viz_enabled = True
+    pop.guided_invalid_viz_dir = tmp_path
+    pop.guided_invalid_viz_formats = ("png", "mermaid")
+    pop.guided_invalid_viz_limit = 2
+
+    def fake_render(*args, **kwargs):
+        raise population_visualizer_module.GraphvizNotFoundError("missing")
+
+    monkeypatch.setattr(population_visualizer_module, "render_with_graphviz", fake_render)
+
+    genome = create_simple_genome()
+    graph_dict = {
+        "node_types": torch.tensor([0, 1], dtype=torch.long),
+        "edge_index": torch.tensor([[0, 0], [1, 1]], dtype=torch.long),
+        "node_attributes": [{"node_type": "input"}, {"node_type": "output"}],
+    }
+
+    pop._maybe_visualize_guided_invalid_graph(
+        genome,
+        graph_dict,
+        reason="inactive_optimizer",
+        child_index=5,
+        num_edges=2,
+    )
+
+    mermaid_files = list(tmp_path.glob("*.mmd"))
+    assert mermaid_files, "Mermaid output should be created even if Graphviz rendering fails"
+    assert pop._guided_invalid_viz_graphviz_missing
 
 
 def test_generate_guided_offspring_handles_missing_elites():

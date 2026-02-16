@@ -36,6 +36,7 @@ from tasks import *
 
 _INVALID_REASON_COUNTER: Counter = Counter()
 _INVALID_REASON_REPORT_REGISTERED = False
+GRAPHVIZ_RENDER_FORMATS = {"png", "svg", "pdf", "jpg", "jpeg", "bmp"}
 
 PIN_ROLE_INPUT = "input"
 PIN_ROLE_OUTPUT = "output"
@@ -237,6 +238,44 @@ class GuidedPopulation(Population):
             max_evaluation_steps = None
         self.max_evaluation_steps = max_evaluation_steps
         self._last_optimizer_delta = 0.0
+        self.guided_invalid_viz_enabled = bool(getattr(config, "guided_invalid_viz_enabled", True))
+        raw_viz_dir = getattr(config, "guided_invalid_viz_dir", None)
+        if raw_viz_dir:
+            self.guided_invalid_viz_dir = Path(raw_viz_dir)
+        else:
+            self.guided_invalid_viz_dir = Path("debug_guided_offspring") / "invalid_graphs"
+        raw_limit = getattr(config, "guided_invalid_viz_limit", 6)
+        try:
+            limit = int(raw_limit)
+        except (TypeError, ValueError):
+            limit = 6
+        self.guided_invalid_viz_limit = max(0, limit)
+        raw_formats = getattr(config, "guided_invalid_viz_formats", ("dot", "mermaid", "png"))
+        if isinstance(raw_formats, str):
+            format_candidates = [part.strip().lower() for part in raw_formats.split(",")]
+        else:
+            try:
+                format_candidates = [str(part).strip().lower() for part in raw_formats]
+            except TypeError:
+                format_candidates = []
+        formats: List[str] = [fmt for fmt in format_candidates if fmt]
+        if not formats:
+            formats = ["dot", "mermaid"]
+        needs_graphviz = any(fmt in GRAPHVIZ_RENDER_FORMATS for fmt in formats)
+        if needs_graphviz and "dot" not in formats:
+            formats.insert(0, "dot")
+        # Preserve order without duplicates.
+        self.guided_invalid_viz_formats = tuple(dict.fromkeys(formats))
+        rankdir = str(getattr(config, "guided_invalid_viz_rankdir", "LR"))
+        rankdir = rankdir.upper()
+        if rankdir not in {"LR", "RL", "TB", "BT"}:
+            rankdir = "LR"
+        self.guided_invalid_viz_rankdir = rankdir
+        self.guided_invalid_viz_engine = str(getattr(config, "guided_invalid_viz_engine", "dot"))
+        self._guided_invalid_viz_generation: int | None = None
+        self._guided_invalid_viz_used = 0
+        self._guided_invalid_viz_import_failed = False
+        self._guided_invalid_viz_graphviz_missing = False
 
     def _reset_guided_offspring_stats(self):
         if self._guided_offspring_stats is not None:
@@ -392,6 +431,128 @@ class GuidedPopulation(Population):
             )
         except Exception as exc:
             warn(f"Failed to record decoder failure ({reason}): {exc}")
+
+    def _maybe_visualize_guided_invalid_graph(
+        self,
+        genome: OptimizerGenome,
+        graph_dict: dict | None,
+        *,
+        reason: str | None,
+        child_index: int | None = None,
+        num_edges: int | None = None,
+    ) -> None:
+        if not self.guided_invalid_viz_enabled or not graph_dict:
+            return
+        if self.guided_invalid_viz_limit <= 0:
+            return
+        generation = getattr(self, "generation", None)
+        if generation != self._guided_invalid_viz_generation:
+            self._guided_invalid_viz_generation = generation
+            self._guided_invalid_viz_used = 0
+        if self._guided_invalid_viz_used >= self.guided_invalid_viz_limit:
+            return
+        cloned_graph = self._clone_graph_dict(graph_dict)
+        if cloned_graph is None:
+            return
+        try:
+            self.guided_invalid_viz_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            warn(f"Failed to create invalid-graph visualization dir '{self.guided_invalid_viz_dir}': {exc}")
+            self.guided_invalid_viz_enabled = False
+            return
+        try:
+            from population_visualizer import (
+                GraphvizNotFoundError,
+                RenderContext,
+                build_dot_graph,
+                build_mermaid_graph,
+                render_with_graphviz,
+            )
+        except Exception as exc:  # pragma: no cover - import guard
+            if not self._guided_invalid_viz_import_failed:
+                warn(f"Unable to import population_visualizer for invalid graph rendering: {exc}")
+                self._guided_invalid_viz_import_failed = True
+            return
+        label_reason = reason or "invalid_graph"
+        sanitized_reason = re.sub(r"[^A-Za-z0-9_.-]+", "_", label_reason)
+        gen_label = generation if isinstance(generation, int) else "X"
+        child_label = child_index if child_index is not None else "X"
+        parts = [f"gen{gen_label}", f"child{child_label}"]
+        if num_edges is not None:
+            parts.append(f"edges{num_edges}")
+        parts.append(sanitized_reason)
+        base_name = "_".join(str(part) for part in parts if part != "")
+        entry = {
+            "genome_id": getattr(genome, "key", None),
+            "species_id": getattr(genome, "species_id", None),
+            "fitness": getattr(genome, "fitness", None),
+            "invalid_graph": True,
+            "invalid_reason": label_reason,
+            "graph": cloned_graph,
+        }
+        context = RenderContext(
+            generation=generation if isinstance(generation, int) else None,
+            task=getattr(self.task, "name", None),
+        )
+        dot_source = build_dot_graph(
+            entry,
+            context=context,
+            rankdir=self.guided_invalid_viz_rankdir,
+            highlight_invalid=True,
+        )
+        dot_path = self.guided_invalid_viz_dir / f"{base_name}.dot"
+        produced_any = False
+        needs_dot = "dot" in self.guided_invalid_viz_formats or any(
+            fmt in GRAPHVIZ_RENDER_FORMATS for fmt in self.guided_invalid_viz_formats
+        )
+        dot_written = False
+        if needs_dot:
+            try:
+                dot_path.write_text(dot_source)
+            except Exception as exc:
+                warn(f"Failed to write invalid graph DOT file '{dot_path}': {exc}")
+            else:
+                produced_any = True
+                dot_written = True
+
+        for fmt in self.guided_invalid_viz_formats:
+            if fmt == "dot":
+                continue
+            if fmt == "mermaid":
+                try:
+                    mermaid_source = build_mermaid_graph(
+                        entry,
+                        context=context,
+                        rankdir=self.guided_invalid_viz_rankdir,
+                        highlight_invalid=True,
+                    )
+                    mermaid_path = self.guided_invalid_viz_dir / f"{base_name}.mmd"
+                    mermaid_path.write_text(mermaid_source)
+                    produced_any = True
+                except Exception as exc:
+                    warn(f"Failed to write invalid graph Mermaid file '{base_name}.mmd': {exc}")
+                continue
+            if fmt in GRAPHVIZ_RENDER_FORMATS:
+                if not dot_written:
+                    continue
+                try:
+                    render_with_graphviz(dot_path, fmt=fmt, engine=self.guided_invalid_viz_engine)
+                    produced_any = True
+                except GraphvizNotFoundError:
+                    if not self._guided_invalid_viz_graphviz_missing:
+                        warn(
+                            "Graphviz not available; invalid guided offspring visualizations will stay in DOT/Mermaid formats."
+                        )
+                        self._guided_invalid_viz_graphviz_missing = True
+                    continue
+                except Exception as exc:
+                    warn(f"Failed to render invalid graph visualization to {fmt}: {exc}")
+                    continue
+                continue
+            warn(f"Unsupported guided invalid visualization format '{fmt}'; skipping.")
+
+        if produced_any:
+            self._guided_invalid_viz_used += 1
 
     def _consume_decoder_replay_graphs(self) -> list[dict]:
         if not self._decoder_replay_cache:
@@ -792,6 +953,13 @@ class GuidedPopulation(Population):
             graph_signature = graph_signature_from_dict(graph_dict)
 
             if repair_reason in {"missing_input_slots", "missing_output_slots"}:
+                self._maybe_visualize_guided_invalid_graph(
+                    genome,
+                    graph_dict,
+                    reason=repair_reason,
+                    child_index=i,
+                    num_edges=num_edges,
+                )
                 genome.graph_dict = graph_dict
                 penalty_details = repair_details or {}
                 self._assign_penalty(
@@ -802,6 +970,7 @@ class GuidedPopulation(Population):
                     graph_dict=graph_dict,
                     record_decoder_failure=True,
                 )
+                self._buffer_decoder_replay_dict(graph_dict)
                 if last_valid_graph_dict is not None:
                     self._buffer_decoder_replay_dict(last_valid_graph_dict)
                 invalid_reason_counts[repair_reason] += 1
@@ -818,6 +987,13 @@ class GuidedPopulation(Population):
             if num_edges == 0:
                 empty_graph_count += 1
                 warn("Guided offspring decoder produced an empty graph (no edges); assigning penalty fitness.")
+                self._maybe_visualize_guided_invalid_graph(
+                    genome,
+                    graph_dict,
+                    reason="empty_graph",
+                    child_index=i,
+                    num_edges=num_edges,
+                )
                 genome.graph_dict = graph_dict
                 penalty_metrics = self._assign_penalty(
                     genome,
@@ -826,6 +1002,7 @@ class GuidedPopulation(Population):
                     graph_dict=graph_dict,
                     record_decoder_failure=True,
                 )
+                self._buffer_decoder_replay_dict(graph_dict)
                 if last_valid_graph_dict is not None:
                     self._buffer_decoder_replay_dict(last_valid_graph_dict)
                 invalid_reason_counts["empty_graph"] += 1
@@ -837,6 +1014,7 @@ class GuidedPopulation(Population):
             if graph_signature in seen_graph_signatures:
                 duplicate_count += 1
                 warn("Guided offspring decoder produced a duplicate graph; skipping to preserve diversity.")
+                self._buffer_decoder_replay_dict(graph_dict)
                 if last_valid_graph_dict is not None:
                     self._buffer_decoder_replay_dict(last_valid_graph_dict)
                 continue
@@ -855,6 +1033,13 @@ class GuidedPopulation(Population):
                     "; ".join(detail_parts) if detail_parts else "no slot metadata available"
                 )
                 warn(message + "; assigning penalty fitness.")
+                self._maybe_visualize_guided_invalid_graph(
+                    genome,
+                    graph_dict,
+                    reason="missing_output_slots",
+                    child_index=i,
+                    num_edges=num_edges,
+                )
                 genome.graph_dict = graph_dict
                 total_slots = len(getattr(self.config.genome_config, "output_keys", []))
                 wrong_type_slots = slot_details.get("wrong_type_slots") or slot_details.get("wrong_role_slots") or []
@@ -872,6 +1057,7 @@ class GuidedPopulation(Population):
                     graph_dict=graph_dict,
                     record_decoder_failure=True,
                 )
+                self._buffer_decoder_replay_dict(graph_dict)
                 if last_valid_graph_dict is not None:
                     self._buffer_decoder_replay_dict(last_valid_graph_dict)
                 invalid_reason_counts["missing_output_slots"] += 1
@@ -885,6 +1071,13 @@ class GuidedPopulation(Population):
                 if not self._optimizer_updates_parameters(optimizer, check_steps=2):
                     inactive_optimizer_count += 1
                     warn("Guided offspring optimizer failed to modify model parameters; assigning penalty fitness.")
+                    self._maybe_visualize_guided_invalid_graph(
+                        genome,
+                        graph_dict,
+                        reason="inactive_optimizer",
+                        child_index=i,
+                        num_edges=num_edges,
+                    )
                     genome.graph_dict = graph_dict
                     penalty_details = {"parameter_delta": getattr(self, "_last_optimizer_delta", 0.0)}
                     self._assign_penalty(
@@ -895,6 +1088,7 @@ class GuidedPopulation(Population):
                         graph_dict=graph_dict,
                         record_decoder_failure=True,
                     )
+                    self._buffer_decoder_replay_dict(graph_dict)
                     if last_valid_graph_dict is not None:
                         self._buffer_decoder_replay_dict(last_valid_graph_dict)
                     invalid_reason_counts["inactive_optimizer"] += 1
@@ -915,6 +1109,7 @@ class GuidedPopulation(Population):
 
             rebuild_failures += 1
             warn("Guided offspring decoder failed to rebuild a valid optimizer; skipping child.")
+            self._buffer_decoder_replay_dict(graph_dict)
             if last_valid_graph_dict is not None:
                 self._buffer_decoder_replay_dict(last_valid_graph_dict)
 
