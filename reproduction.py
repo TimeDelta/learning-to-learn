@@ -108,9 +108,10 @@ class GuidedReproduction(DefaultReproduction):
             spawn = max(spawn, self.reproduction_config.elitism)
             old_members = sorted(s.members.items(), key=lambda item: item[1].fitness, reverse=True)
             # elites
-            for gid, g in old_members[: self.reproduction_config.elitism]:
+            elite_count = min(self.reproduction_config.elitism, len(old_members))
+            for gid, g in old_members[:elite_count]:
                 new_population[gid] = g
-            remaining_spawn = spawn - self.reproduction_config.elitism
+            remaining_spawn = spawn - elite_count
             if remaining_spawn <= 0:
                 continue
 
