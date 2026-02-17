@@ -6,18 +6,16 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
+from population import DECODED_GRAPH_DICT_KEY, REPAIRED_GRAPH_DICT_KEY
 from population_visualizer import (
-    GraphvizNotFoundError,
     RenderContext,
-    build_dot_graph,
+    build_mermaid_graph,
     find_latest_snapshot,
     load_population_snapshot,
-    render_with_graphviz,
     save_summary,
     select_snapshot_entries,
-    write_dot_file,
 )
 
 
@@ -39,7 +37,7 @@ def _parse_args() -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=Path("artifacts/final_population/viz"),
-        help="Directory where DOT/PNG artifacts will be written.",
+        help="Directory where Mermaid artifacts will be written.",
     )
     parser.add_argument("--top-k", type=int, default=16, help="Maximum graphs to render (0 = all).")
     parser.add_argument(
@@ -62,21 +60,10 @@ def _parse_args() -> argparse.Namespace:
         help="Ordering applied before taking --top-k entries.",
     )
     parser.add_argument(
-        "--format",
-        choices=["png", "pdf", "svg", "dot"],
-        default="png",
-        help="Image format to render (dot skips Graphviz rendering).",
-    )
-    parser.add_argument(
-        "--engine",
-        default="dot",
-        help="Graphviz engine to invoke (dot, fdp, neato, ...).",
-    )
-    parser.add_argument(
         "--rankdir",
         choices=["LR", "TB"],
         default="LR",
-        help="Graphviz rank direction (LR = left-to-right, TB = top-to-bottom).",
+        help="Mermaid rank direction (LR = left-to-right, TB = top-to-bottom).",
     )
     parser.add_argument(
         "--max-attr-lines",
@@ -91,9 +78,10 @@ def _parse_args() -> argparse.Namespace:
         help="Maximum characters for each attribute summary line.",
     )
     parser.add_argument(
-        "--skip-render",
-        action="store_true",
-        help="Only emit DOT files even when --format requests an image.",
+        "--variants",
+        choices=["repaired", "decoded", "both"],
+        default="repaired",
+        help="Which graph variants to export for each genome.",
     )
     parser.add_argument(
         "--summary-name",
@@ -156,42 +144,48 @@ def main() -> int:
     task = snapshot.get("task")
 
     render_records: List[dict] = []
-    graphviz_error_reported = False
     for rank, entry in enumerate(entries, start=1):
         context = RenderContext(generation=generation, rank=rank, task=task)
-        dot_source = build_dot_graph(
-            entry,
-            context=context,
-            max_attr_lines=max(args.max_attr_lines, 0),
-            max_attr_value_chars=max(args.max_attr_chars, 8),
-            rankdir=args.rankdir,
-        )
         base_name = _format_entry_basename(entry, generation, rank)
-        dot_path = write_dot_file(dot_source, output_dir / f"{base_name}.dot")
+        base_graph = entry.get("graph") or {}
+        decoded_graph = base_graph.get(DECODED_GRAPH_DICT_KEY)
+        repaired_graph = base_graph.get(REPAIRED_GRAPH_DICT_KEY) or base_graph
 
-        image_path = None
-        if not args.skip_render and args.format != "dot":
-            try:
-                image_path = render_with_graphviz(dot_path, fmt=args.format, engine=args.engine)
-            except GraphvizNotFoundError as exc:
-                if not graphviz_error_reported:
-                    print(f"warning: {exc}; only DOT files were written.", file=sys.stderr)
-                    graphviz_error_reported = True
-            except RuntimeError as exc:
-                print(f"warning: failed to render {dot_path.name}: {exc}", file=sys.stderr)
+        variants: List[Tuple[str, Mapping[str, Any]]] = []
+        if args.variants in {"decoded", "both"} and decoded_graph is not None:
+            variants.append(("decoded", decoded_graph))
+        if args.variants in {"repaired", "both"}:
+            variants.append(("repaired", repaired_graph))
+        if not variants:
+            variants.append(("repaired", repaired_graph))
+
+        mermaid_files: List[str] = []
+        for suffix, graph_payload in variants:
+            mermaid_entry = dict(entry)
+            mermaid_entry["graph"] = graph_payload
+            mermaid_source = build_mermaid_graph(
+                mermaid_entry,
+                context=context,
+                max_attr_lines=max(args.max_attr_lines, 0),
+                max_attr_value_chars=max(args.max_attr_chars, 8),
+                rankdir=args.rankdir,
+            )
+            mermaid_path = output_dir / f"{base_name}_{suffix}.mmd"
+            mermaid_path.write_text(mermaid_source)
+            mermaid_files.append(mermaid_path.name)
 
         render_records.append(
             {
                 "genome_id": entry.get("genome_id"),
                 "species_id": entry.get("species_id"),
                 "fitness": entry.get("fitness"),
-                "dot": dot_path.name,
-                "image": image_path.name if image_path else None,
+                "mermaid": mermaid_files,
                 "invalid_graph": entry.get("invalid_graph"),
                 "invalid_reason": entry.get("invalid_reason"),
             }
         )
-        print(f"Rendered genome {entry.get('genome_id')} to {dot_path.name}")
+        printable = ", ".join(mermaid_files)
+        print(f"Rendered genome {entry.get('genome_id')} to {printable}")
 
     if not args.no_summary:
         summary_path = output_dir / args.summary_name

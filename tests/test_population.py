@@ -12,7 +12,6 @@ from torch_geometric.data import Batch, Data
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 import population as population_module
-import population_visualizer as population_visualizer_module
 from attributes import FloatAttribute, IntAttribute
 from genes import NODE_TYPE_TO_INDEX, ConnectionGene, NodeGene
 from genome import OptimizerGenome
@@ -429,13 +428,13 @@ def test_assign_penalty_records_decoder_failure_when_requested():
     assert recorded["fitnesses"] == metrics
 
 
-def test_guided_invalid_visualization_emits_dot(tmp_path):
+def test_guided_invalid_visualization_emits_mermaid_files(tmp_path):
     config = make_config()
     pop = GuidedPopulation(config)
     pop.generation = 2
     pop.guided_invalid_viz_enabled = True
     pop.guided_invalid_viz_dir = tmp_path
-    pop.guided_invalid_viz_formats = ("dot",)
+    pop.guided_invalid_viz_formats = ("mermaid",)
     pop.guided_invalid_viz_limit = 4
     pop._guided_invalid_viz_generation = None
     pop._guided_invalid_viz_used = 0
@@ -455,20 +454,21 @@ def test_guided_invalid_visualization_emits_dot(tmp_path):
         num_edges=0,
     )
 
-    dot_files = list(tmp_path.glob("*.dot"))
-    assert dot_files, "expected invalid graph visualization"
-    text = dot_files[0].read_text()
+    repaired_files = list(tmp_path.glob("*_repaired.mmd"))
+    assert repaired_files, "expected repaired mermaid visualization"
+    text = repaired_files[0].read_text()
+    assert "graph LR" in text
     assert "status=invalid" in text
     assert "empty_graph" in text
 
 
-def test_guided_invalid_visualization_prefers_decoded_snapshot(tmp_path):
+def test_guided_invalid_visualization_writes_separate_decoded_mermaid(tmp_path):
     config = make_config()
     pop = GuidedPopulation(config)
     pop.generation = 5
     pop.guided_invalid_viz_enabled = True
     pop.guided_invalid_viz_dir = tmp_path
-    pop.guided_invalid_viz_formats = ("dot",)
+    pop.guided_invalid_viz_formats = ("mermaid",)
     genome = create_simple_genome()
 
     decoded_graph = {
@@ -491,10 +491,10 @@ def test_guided_invalid_visualization_prefers_decoded_snapshot(tmp_path):
         num_edges=0,
     )
 
-    dot_files = list(tmp_path.glob("*.dot"))
-    assert dot_files, "decoded snapshot should be visualized"
-    text = dot_files[0].read_text()
-    assert "node_0 -> node_1" in text
+    decoded_files = list(tmp_path.glob("*_decoded.mmd"))
+    assert decoded_files, "decoded snapshot should be visualized"
+    text = decoded_files[0].read_text()
+    assert "node_0 --> node_1" in text
 
 
 def test_guided_invalid_visualization_mermaid_only(tmp_path):
@@ -521,8 +521,8 @@ def test_guided_invalid_visualization_mermaid_only(tmp_path):
         num_edges=1,
     )
 
-    mermaid_files = list(tmp_path.glob("*.mmd"))
-    assert mermaid_files, "expected Mermaid visualization"
+    mermaid_files = list(tmp_path.glob("*_repaired.mmd"))
+    assert mermaid_files, "expected repaired Mermaid visualization"
     text = mermaid_files[0].read_text()
     assert "graph LR" in text
     assert "status=invalid" in text
@@ -556,26 +556,21 @@ def test_guided_invalid_visualization_mermaid_uses_repaired_graph(tmp_path):
         num_edges=0,
     )
 
-    mermaid_files = list(tmp_path.glob("*.mmd"))
-    assert mermaid_files, "mermaid visualization missing"
-    text = mermaid_files[0].read_text()
+    repaired_files = list(tmp_path.glob("*_repaired.mmd"))
+    assert repaired_files, "repaired mermaid visualization missing"
+    text = repaired_files[0].read_text()
     assert "%% Graph has no edges" in text
     assert "node_0 --> node_1" not in text
 
 
-def test_guided_invalid_visualization_handles_missing_graphviz(monkeypatch, tmp_path):
+def test_guided_invalid_visualization_warns_on_unsupported_format(tmp_path):
     config = make_config()
     pop = GuidedPopulation(config)
     pop.generation = 3
     pop.guided_invalid_viz_enabled = True
     pop.guided_invalid_viz_dir = tmp_path
-    pop.guided_invalid_viz_formats = ("png", "mermaid")
-    pop.guided_invalid_viz_limit = 2
-
-    def fake_render(*args, **kwargs):
-        raise population_visualizer_module.GraphvizNotFoundError("missing")
-
-    monkeypatch.setattr(population_visualizer_module, "render_with_graphviz", fake_render)
+    pop.guided_invalid_viz_formats = ("png",)
+    pop.guided_invalid_viz_limit = 1
 
     genome = create_simple_genome()
     graph_dict = {
@@ -584,17 +579,16 @@ def test_guided_invalid_visualization_handles_missing_graphviz(monkeypatch, tmp_
         "node_attributes": [{"node_type": "input"}, {"node_type": "output"}],
     }
 
-    pop._maybe_visualize_guided_invalid_graph(
-        genome,
-        graph_dict,
-        reason="inactive_optimizer",
-        child_index=5,
-        num_edges=2,
-    )
+    with pytest.warns(UserWarning, match="Unsupported guided invalid visualization format"):
+        pop._maybe_visualize_guided_invalid_graph(
+            genome,
+            graph_dict,
+            reason="inactive_optimizer",
+            child_index=5,
+            num_edges=2,
+        )
 
-    mermaid_files = list(tmp_path.glob("*.mmd"))
-    assert mermaid_files, "Mermaid output should be created even if Graphviz rendering fails"
-    assert pop._guided_invalid_viz_graphviz_missing
+    assert not list(tmp_path.glob("*.mmd"))
 
 
 def test_generate_guided_offspring_handles_missing_elites():
@@ -688,6 +682,23 @@ def test_repair_preserves_predicted_edges_for_visualization():
     # ensure decoded snapshot did not receive synthesized pin_role attributes
     original_attrs = decoded["node_attributes"]
     assert all("pin_role" not in attrs for attrs in original_attrs)
+
+
+def test_prepare_decoded_graph_strips_invalid_edges():
+    config = make_config()
+    pop = GuidedPopulation(config)
+    graph = {
+        "node_types": torch.tensor([0], dtype=torch.long),
+        "edge_index": torch.tensor([[0], [5]], dtype=torch.long),
+        "node_attributes": [{"node_type": "input"}],
+    }
+
+    node_count, edges = pop._prepare_decoded_graph_dict(graph)
+
+    assert node_count == 1
+    assert edges == []
+    decoded = graph[population_module.DECODED_GRAPH_DICT_KEY]
+    assert decoded["edge_index"].numel() == 0
 
 
 def test_penalty_scale_handles_missing_input_slots():

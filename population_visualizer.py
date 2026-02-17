@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import json
 import math
-import shutil
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -23,10 +21,6 @@ except Exception:  # pragma: no cover
 
 DECODED_GRAPH_DICT_KEY = "_decoded_graph_dict"
 _INDEX_TO_NODE_TYPE: Dict[int, str] = {idx: name for name, idx in NODE_TYPE_TO_INDEX.items()}
-
-
-class GraphvizNotFoundError(RuntimeError):
-    """Raised when Graphviz cannot be located on PATH."""
 
 
 @dataclass
@@ -248,95 +242,6 @@ def _node_style(node_type_name: str) -> Dict[str, str]:
     return style
 
 
-def build_dot_graph(
-    entry: Mapping[str, Any],
-    *,
-    context: RenderContext | None = None,
-    max_attr_lines: int = 4,
-    max_attr_value_chars: int = 32,
-    rankdir: str = "LR",
-    highlight_invalid: bool = True,
-) -> str:
-    """Return a Graphviz DOT string for an individual genome entry."""
-
-    graph_dict = entry.get("graph") or {}
-    node_type_ids = _materialize_node_types(graph_dict.get("node_types"))
-    node_count = len(node_type_ids)
-    if node_count == 0:
-        node_attrs = graph_dict.get("node_attributes") or []
-        node_count = len(node_attrs)
-        node_type_ids = list(range(node_count))
-    nodes = [_node_type_name(idx) for idx in node_type_ids]
-    attrs = _normalize_node_attributes(graph_dict.get("node_attributes"), len(nodes))
-    edges = _edge_list(graph_dict.get("edge_index"), len(nodes))
-    decoded_graph = graph_dict.get(DECODED_GRAPH_DICT_KEY)
-    predicted_edges = _edge_list(decoded_graph.get("edge_index"), len(nodes)) if decoded_graph else []
-    edge_set = set(edges)
-    predicted_overlay = [edge for edge in predicted_edges if edge not in edge_set]
-
-    ctx = context or RenderContext()
-    label_parts = [f"genome={entry.get('genome_id')}"]
-    if ctx.generation is not None:
-        label_parts.append(f"gen={ctx.generation}")
-    if ctx.rank is not None:
-        label_parts.append(f"rank={ctx.rank}")
-    if entry.get("fitness") is not None:
-        try:
-            label_parts.append(f"fitness={float(entry['fitness']):.4f}")
-        except (TypeError, ValueError):
-            label_parts.append(f"fitness={entry['fitness']}")
-    if entry.get("species_id") is not None:
-        label_parts.append(f"species={entry['species_id']}")
-    if ctx.task:
-        label_parts.append(f"task={ctx.task}")
-    if highlight_invalid and entry.get("invalid_graph"):
-        reason = entry.get("invalid_reason")
-        label_parts.append(f"status=invalid({reason or 'unknown'})")
-
-    dot_lines = ["digraph population_graph {", f"  graph [rankdir={rankdir}, labelloc=t, labelfontsize=18];"]
-    dot_lines.append(f"  label=\"{' | '.join(label_parts)}\";")
-
-    if entry.get("invalid_graph") and highlight_invalid:
-        dot_lines.append("  node [color=#C62828, fontcolor=#C62828];")
-        dot_lines.append("  edge [color=#C62828];")
-    else:
-        dot_lines.append("  node [style=filled, fillcolor=#ECEFF1];")
-
-    for idx, (node_name, node_attrs) in enumerate(zip(nodes, attrs)):
-        style = _node_style(node_name)
-        attr_lines: List[str] = [f"{idx}: {node_name}"]
-        shown = 0
-        for key in sorted(node_attrs.keys()):
-            if key == "node_type":
-                continue
-            summary = _summarize_attr_value(node_attrs[key], max_chars=max_attr_value_chars)
-            attr_lines.append(f"{key}={summary}")
-            shown += 1
-            if shown >= max_attr_lines:
-                attr_lines.append("…")
-                break
-        label = "\\n".join(_escape_label(part) for part in attr_lines)
-        style_args = " ".join(f'{k}="{v}"' for k, v in style.items())
-        dot_lines.append(f'  node_{idx} [{style_args} label="{label}"];')
-
-    for src, dst in edges:
-        dot_lines.append(f"  node_{src} -> node_{dst};")
-
-    if predicted_overlay:
-        for src, dst in predicted_overlay:
-            dot_lines.append(
-                '  node_{src} -> node_{dst} [style=dashed, color="#90A4AE", penwidth=1.4];'.format(src=src, dst=dst)
-            )
-
-    if not edges and predicted_overlay:
-        dot_lines.append("  // No repaired edges; dashed edges show decoder predictions")
-    elif not edges:
-        dot_lines.append("  // Graph has no edges")
-
-    dot_lines.append("}")
-    return "\n".join(dot_lines)
-
-
 def _mermaid_escape(text: str) -> str:
     return text.replace('"', '\\"').replace("<", "&lt;").replace(">", "&gt;")
 
@@ -416,23 +321,6 @@ def build_mermaid_graph(
         lines.append("  class " + ",".join(node_ids) + " invalid;")
 
     return "\n".join(lines)
-
-
-def write_dot_file(dot_source: str, destination: Path) -> Path:
-    destination.write_text(dot_source)
-    return destination
-
-
-def render_with_graphviz(dot_path: Path, *, fmt: str = "png", engine: str = "dot") -> Path:
-    binary = shutil.which(engine)
-    if binary is None:
-        raise GraphvizNotFoundError(f"Graphviz binary '{engine}' not found on PATH.")
-    output_path = dot_path.with_suffix(f".{fmt}")
-    cmd = [binary, f"-T{fmt}", str(dot_path), "-o", str(output_path)]
-    completed = subprocess.run(cmd, capture_output=True, text=True)
-    if completed.returncode != 0:
-        raise RuntimeError(f"Graphviz command failed with exit code {completed.returncode}: {completed.stderr.strip()}")
-    return output_path
 
 
 def save_summary(

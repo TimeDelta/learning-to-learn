@@ -95,7 +95,7 @@ To keep these failures from overwhelming the surrogate model:
 
 This subsampling keeps the decoder from collapsing onto invalid DAGs while still providing a clear gradient signal to steer it back toward feasible graphs.
 
-Whenever a guided graph fails these validity filters, the run snapshots the offending graph under `debug_guided_offspring/invalid_graphs/`. By default you get both a Graphviz-ready `.dot` and a Mermaid `.mmd` rendering so you can preview failures inside VS Code/GitHub even when Graphviz binaries are unavailable. If a Graphviz engine *is* on `PATH`, the same `.dot` file is automatically rendered into any other formats you list (e.g., `png`, `svg`). Filenames encode the generation, guided child index, edge count, and failure reason so they line up with console warnings. Tweak the behavior with `[GuidedPopulation]` values `guided_invalid_viz_enabled`, `guided_invalid_viz_dir`, `guided_invalid_viz_limit`, `guided_invalid_viz_formats` (accepts `dot`, `mermaid`, plus any Graphviz renderer target), `guided_invalid_viz_rankdir`, and `guided_invalid_viz_engine`.
+Whenever a guided graph fails these validity filters, the run snapshots the offending graph under `debug_guided_offspring/invalid_graphs/`. Each failure produces Mermaid `.mmd` files for both the decoder's raw output (if available) and the repaired version so you can inspect them inside VS Code/GitHub without any external tooling. Filenames encode the generation, guided child index, edge count, and failure reason so they line up with console warnings. Tweak the behavior with `[GuidedPopulation]` values `guided_invalid_viz_enabled`, `guided_invalid_viz_dir`, `guided_invalid_viz_limit`, `guided_invalid_viz_formats` (now only `mermaid` is supported), and `guided_invalid_viz_rankdir`.
 
 Inspired by the targeted feasibility restorations used in CTFGNAS [57], the post-decoding phase is treated as a constrained graph-repair problem: every decoded adjacency is first passed through an analytical repair operator (`GuidedPopulation._repair_graph_dict`).
 The operator only executes when every required input and output node is present in the decoded graph; otherwise the sample is rejected immediately and a graph containing all required input and output nodes such that each input has a path to at least one output and each output has a path from some input.
@@ -219,7 +219,7 @@ This mirrors what shows up in stdout while giving you a permanent experiment rec
 
 ## Visualizing Final Population Snapshots
 Once `main.py` finishes, it saves a serialized population snapshot under `artifacts/final_population/`.
-You can turn those `.pt` files into Graphviz diagrams via `scripts/visualize_final_population.py`:
+You can turn those `.pt` files into Mermaid diagrams via `scripts/visualize_final_population.py`:
 
 ```
 python3 scripts/visualize_final_population.py \
@@ -230,11 +230,9 @@ python3 scripts/visualize_final_population.py \
 Key behaviors:
 
 - If `--snapshot` is omitted, the script grabs the newest `.pt` file under `--snapshot-dir` (default `artifacts/final_population`).
-- For each selected genome it writes a `*.dot` file plus an optional rendered image (`--format png|pdf|svg`). Pass `--skip-render` or `--format dot` when Graphviz binaries are unavailable.
+- For each selected genome it writes one or two `.mmd` files (decoded + repaired variants when available) that preview cleanly in VS Code, GitHub, or [Mermaid Live](https://mermaid.live).
 - `--genome-id` (repeatable) filters by exact ids, `--include-invalid` keeps individuals flagged as invalid, and `--rankdir` flips between left-to-right and top-to-bottom layouts.
 - A JSON manifest (default `summary.json`) is emitted alongside the figures so you can correlate filenames back to genome/fitness metadata.
-
-Make sure Graphviz (`dot`, `neato`, etc.) is on your `PATH` when requesting raster/vector formats; otherwise the script will fall back to DOT-only output while warning once per run.
 
 ## Other Papers that Might be Useful
 - [On the Relationship Between Variational Inference and Auto-Associative Memory](https://arxiv.org/pdf/2210.08013.pdf)

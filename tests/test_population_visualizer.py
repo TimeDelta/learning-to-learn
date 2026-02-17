@@ -9,7 +9,7 @@ if str(ROOT) not in sys.path:
 from population_visualizer import (
     DECODED_GRAPH_DICT_KEY,
     RenderContext,
-    build_dot_graph,
+    build_mermaid_graph,
     save_summary,
     select_snapshot_entries,
 )
@@ -33,7 +33,7 @@ def test_select_snapshot_entries_filters_and_sorts():
     assert [entry["genome_id"] for entry in filtered] == [2]
 
 
-def test_build_dot_graph_outputs_basic_structure():
+def test_build_mermaid_graph_outputs_basic_structure():
     entry = {
         "genome_id": 7,
         "species_id": 3,
@@ -48,14 +48,14 @@ def test_build_dot_graph_outputs_basic_structure():
             ],
         },
     }
-    dot = build_dot_graph(entry, context=RenderContext(generation=2, rank=1, task="demo"), max_attr_lines=2)
-    assert "genome=7" in dot
-    assert "rank=1" in dot
-    assert "node_0 -> node_1" in dot
-    assert "node_1 -> node_2" in dot
+    mermaid = build_mermaid_graph(entry, context=RenderContext(generation=2, rank=1, task="demo"), max_attr_lines=2)
+    assert "graph LR" in mermaid
+    assert "gen=2" in mermaid
+    assert "node_0 --> node_1" in mermaid
+    assert "node_1 --> node_2" in mermaid
 
 
-def test_build_dot_graph_overlays_predicted_edges_when_missing():
+def test_build_mermaid_graph_ignores_predicted_edges_when_missing():
     entry = {
         "genome_id": 9,
         "graph": {
@@ -69,9 +69,9 @@ def test_build_dot_graph_overlays_predicted_edges_when_missing():
         "edge_index": [(0, 1)],
         "node_attributes": [{}, {}],
     }
-    dot = build_dot_graph(entry)
-    assert "style=dashed" in dot
-    assert "node_0 -> node_1" in dot
+    mermaid = build_mermaid_graph(entry)
+    assert "node_0 --> node_1" not in mermaid
+    assert "Graph has no edges" in mermaid
 
 
 def test_save_summary_serializes_entries(tmp_path):
