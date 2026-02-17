@@ -115,7 +115,13 @@ class GuidedPopulation(Population):
             hidden_dims=[32, 32],
             pin_role_dim=2,
         )
-        decoder = GraphDecoder(len(NODE_TYPE_OPTIONS), graph_latent_dim, self.shared_attr_vocab)
+        pin_role_teacher_weight = float(getattr(config, "decoder_pin_role_teacher_weight", 3.0) or 3.0)
+        decoder = GraphDecoder(
+            len(NODE_TYPE_OPTIONS),
+            graph_latent_dim,
+            self.shared_attr_vocab,
+            pin_role_teacher_weight=pin_role_teacher_weight,
+        )
         icnn_hidden_dims = getattr(config, "latent_icnn_hidden_dims", (64, 32))
         if isinstance(icnn_hidden_dims, str):
             icnn_hidden_dims = [int(part) for part in icnn_hidden_dims.split(",") if part.strip()]
@@ -1334,53 +1340,117 @@ class GuidedPopulation(Population):
                 warn(f"Unknown node pin role: {raw_role}")
             return None
 
-        input_nodes = [idx for idx in range(len(normalized_attrs)) if _node_pin_role(idx) == "input"]
-        output_nodes = [idx for idx in range(len(normalized_attrs)) if _node_pin_role(idx) == "output"]
+        def _assign_pin_role(idx: int, role: str) -> bool:
+            if idx < 0 or idx >= len(normalized_attrs):
+                return False
+            attrs = dict(normalized_attrs[idx] or {})
+            current = _normalize_pin_role(attrs.get("pin_role"))
+            if current == role:
+                return False
+            attrs["pin_role"] = role
+            normalized_attrs[idx] = attrs
+            return True
+
+        def _recompute_pin_nodes() -> Tuple[List[int], List[int]]:
+            inputs = [idx for idx in range(len(normalized_attrs)) if _node_pin_role(idx) == PIN_ROLE_INPUT]
+            outputs = [idx for idx in range(len(normalized_attrs)) if _node_pin_role(idx) == PIN_ROLE_OUTPUT]
+            return inputs, outputs
 
         configured_inputs = list(getattr(self.config.genome_config, "input_keys", []))
         configured_outputs = list(getattr(self.config.genome_config, "output_keys", []))
-        if configured_inputs and len(input_nodes) < len(configured_inputs):
+        required_inputs = len(configured_inputs)
+        expected_output_slots = [int(ok) for ok in configured_outputs if isinstance(ok, (int, float))]
+        output_slot_set = {slot for slot in expected_output_slots if 0 <= slot < node_count}
+
+        input_nodes, output_nodes = _recompute_pin_nodes()
+
+        def _apply_input_fallback() -> None:
+            nonlocal input_nodes, output_nodes
+            if required_inputs <= 0 or len(input_nodes) >= required_inputs:
+                return
+            candidate_order = list(range(node_count))
+            candidate_order.sort(key=lambda idx: (len(adjacency_in[idx]) > 0, idx))
+            for idx in candidate_order:
+                if len(input_nodes) >= required_inputs:
+                    break
+                if idx in output_slot_set:
+                    continue
+                role = _node_pin_role(idx)
+                if role in {PIN_ROLE_INPUT, PIN_ROLE_OUTPUT}:
+                    continue
+                _assign_pin_role(idx, PIN_ROLE_INPUT)
+                input_nodes, output_nodes = _recompute_pin_nodes()
+
+        def _apply_output_fallback() -> None:
+            nonlocal input_nodes, output_nodes
+            if not expected_output_slots or len(output_nodes) >= len(expected_output_slots):
+                return
+            # First ensure configured slots receive explicit roles when possible.
+            for slot in sorted(output_slot_set):
+                if 0 <= slot < node_count:
+                    _assign_pin_role(slot, PIN_ROLE_OUTPUT)
+            input_nodes, output_nodes = _recompute_pin_nodes()
+            if len(output_nodes) >= len(expected_output_slots):
+                return
+            candidate_order = list(range(node_count))
+            candidate_order.sort(key=lambda idx: (len(adjacency_out[idx]) > 0, -idx))
+            reserved_inputs = set(input_nodes)
+            for idx in candidate_order:
+                if len(output_nodes) >= len(expected_output_slots):
+                    break
+                if idx in output_slot_set or idx in reserved_inputs:
+                    continue
+                role = _node_pin_role(idx)
+                if role == PIN_ROLE_OUTPUT:
+                    continue
+                _assign_pin_role(idx, PIN_ROLE_OUTPUT)
+                input_nodes, output_nodes = _recompute_pin_nodes()
+
+        if required_inputs and len(input_nodes) < required_inputs:
+            _apply_input_fallback()
+        if required_inputs and len(input_nodes) < required_inputs:
+            graph_dict["node_attributes"] = normalized_attrs
             graph_dict["_repair_failure_reason"] = "missing_input_slots"
             graph_dict["_repair_failure_details"] = {
-                "total_slots": len(configured_inputs),
-                "missing_count": len(configured_inputs) - len(input_nodes),
+                "total_slots": required_inputs,
+                "missing_count": required_inputs - len(input_nodes),
                 "typed_count": len(input_nodes),
                 "wrong_type_slots": [],
             }
             graph_dict["edge_index"] = torch.empty((2, 0), dtype=torch.long)
             return False
-        if configured_outputs and len(output_nodes) < len(configured_outputs):
-            expected_slots = [int(ok) for ok in configured_outputs]
+
+        if configured_outputs and len(output_nodes) < len(expected_output_slots):
+            _apply_output_fallback()
+        if configured_outputs and len(output_nodes) < len(expected_output_slots):
             missing_slots: List[int] = []
             wrong_type_slots: List[int] = []
-            decoded_outputs = set(output_nodes)
-            for slot in expected_slots:
-                if slot in decoded_outputs:
+            for slot in expected_output_slots:
+                if slot in output_nodes:
+                    continue
+                if slot < 0 or slot >= node_count:
+                    missing_slots.append(int(slot))
                     continue
                 role = _node_pin_role(slot)
                 if role is None:
-                    missing_slots.append(slot)
-                elif role != "output":
-                    wrong_type_slots.append(slot)
-                else:
-                    missing_slots.append(slot)
+                    missing_slots.append(int(slot))
+                elif role != PIN_ROLE_OUTPUT:
+                    wrong_type_slots.append(int(slot))
+            graph_dict["node_attributes"] = normalized_attrs
             graph_dict["_repair_failure_reason"] = "missing_output_slots"
             graph_dict["_repair_failure_details"] = {
-                "total_slots": len(expected_slots),
+                "total_slots": len(expected_output_slots),
                 "missing_count": len(missing_slots) + len(wrong_type_slots),
                 "missing_slots": missing_slots,
                 "wrong_type_slots": wrong_type_slots,
             }
             graph_dict["edge_index"] = torch.empty((2, 0), dtype=torch.long)
             return False
+
         if not input_nodes:
             input_nodes = list(range(min(2, node_count))) or [0]
-        valid_outputs = [int(ok) for ok in configured_outputs if 0 <= int(ok) < node_count]
-        if output_nodes and valid_outputs:
-            # merge decoded tags with configured slots without duplicates
-            merged = list(dict.fromkeys(output_nodes + valid_outputs))
-            output_nodes = merged
-        elif not output_nodes:
+        if not output_nodes:
+            valid_outputs = [slot for slot in output_slot_set]
             output_nodes = valid_outputs or [node_count - 1]
 
         hidden_nodes = [idx for idx in range(node_count) if idx not in input_nodes and idx not in output_nodes]
@@ -1472,6 +1542,8 @@ class GuidedPopulation(Population):
                 break
             add_edge(sources[0], node)
             reachable = reachable_nodes()
+
+        graph_dict["node_attributes"] = normalized_attrs
 
         if not edges:
             default_src = input_nodes[0] if input_nodes else 0

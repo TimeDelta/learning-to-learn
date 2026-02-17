@@ -552,47 +552,49 @@ def _make_empty_graph_dict(node_count: int, node_attrs):
     }
 
 
-def test_repair_requires_configured_io_nodes():
+def test_repair_synthesizes_pin_roles_when_labels_missing():
     config = make_config()
     pop = GuidedPopulation(config)
     num_inputs = len(config.genome_config.input_keys)
-    num_outputs = len(config.genome_config.output_keys)
+    output_slots = [int(ok) for ok in config.genome_config.output_keys if isinstance(ok, (int, float))]
+    max_output_slot = max(output_slots) if output_slots else -1
+    node_count = max(max_output_slot + 1, num_inputs + len(output_slots) + 1, 1)
+    graph = _make_empty_graph_dict(node_count, [{} for _ in range(node_count)])
 
-    # Omit one required input label.
-    node_attrs = []
-    for idx in range(max(1, num_inputs + num_outputs)):
-        if idx < max(0, num_inputs - 1):
-            node_attrs.append({"node_type": "input"})
-        elif idx < max(0, num_inputs + num_outputs - 1):
-            node_attrs.append({"node_type": "output"})
-        else:
-            node_attrs.append({"node_type": "hidden"})
-    graph = _make_empty_graph_dict(len(node_attrs), node_attrs)
+    assert pop._repair_graph_dict(graph)
+    attrs = graph["node_attributes"]
+    input_count = sum(1 for attr in attrs if attr.get("pin_role") == "input")
+    output_count = sum(1 for attr in attrs if attr.get("pin_role") == "output")
+    assert input_count >= num_inputs
+    assert output_count >= min(len(output_slots), node_count)
+    assert graph["edge_index"].numel() > 0
+
+
+def test_repair_fails_when_not_enough_input_nodes():
+    config = make_config()
+    required_inputs = len(config.genome_config.input_keys)
+    if required_inputs <= 1:
+        pytest.skip("config does not require multiple input slots")
+    pop = GuidedPopulation(config)
+    node_count = max(1, required_inputs - 1)
+    graph = _make_empty_graph_dict(node_count, [{} for _ in range(node_count)])
+
     assert not pop._repair_graph_dict(graph)
-    assert graph["edge_index"].numel() == 0
     assert graph["_repair_failure_reason"] == "missing_input_slots"
-    details = graph["_repair_failure_details"]
-    assert details["missing_count"] >= 1
-    assert details["total_slots"] == num_inputs
-    assert details["typed_count"] == max(0, num_inputs - 1)
-
-    # Omit one required output label (node present but mis-typed).
-    node_attrs = []
-    for idx in range(max(1, num_inputs + num_outputs)):
-        if idx < num_inputs:
-            node_attrs.append({"node_type": "input"})
-        elif idx < num_inputs + max(0, num_outputs - 1):
-            node_attrs.append({"node_type": "output"})
-        else:
-            node_attrs.append({"node_type": "hidden"})
-    graph = _make_empty_graph_dict(len(node_attrs), node_attrs)
-    assert not pop._repair_graph_dict(graph)
     assert graph["edge_index"].numel() == 0
+
+
+def test_repair_reports_missing_output_slots_when_nodes_absent():
+    config = make_config()
+    config.genome_config.output_keys = [0, 3]
+    pop = GuidedPopulation(config)
+    node_attrs = [{} for _ in range(2)]  # only slots 0 and 1 exist
+    graph = _make_empty_graph_dict(len(node_attrs), node_attrs)
+
+    assert not pop._repair_graph_dict(graph)
     assert graph["_repair_failure_reason"] == "missing_output_slots"
     details = graph["_repair_failure_details"]
-    assert details["missing_count"] >= 1
-    assert details["total_slots"] == num_outputs
-    assert details.get("wrong_type_slots") == [config.genome_config.output_keys[0]]
+    assert 3 in details["missing_slots"]
 
 
 def test_penalty_scale_handles_missing_input_slots():

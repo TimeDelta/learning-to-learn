@@ -741,6 +741,7 @@ class GraphDecoder(nn.Module):
         edge_threshold: float = 0.5,
         max_edges_per_node: int = 256,
         max_edges_per_graph: int = 4096,
+        pin_role_teacher_weight: float = 3.0,
     ):
         super().__init__()
         self.shared_attr_vocab = shared_attr_vocab
@@ -777,6 +778,8 @@ class GraphDecoder(nn.Module):
         # Encourage attribute decoder to terminate by progressively biasing the EOS logit.
         self.attr_eos_bias_base = 0.0
         self.attr_eos_bias_slope = 0.1
+        self.pin_role_teacher_weight = max(1.0, float(pin_role_teacher_weight))
+        self.pin_role_token_index = self.shared_attr_vocab.ensure_index("pin_role")
 
     def forward(
         self,
@@ -1102,7 +1105,13 @@ class GraphDecoder(nn.Module):
                                 step_loss = F.cross_entropy(
                                     similarity_logits.unsqueeze(0), target_tensor, reduction="mean"
                                 )
-                                attr_teacher_loss = attr_teacher_loss + step_loss
+                                if self.pin_role_token_index is not None and int(target_idx) == int(
+                                    self.pin_role_token_index
+                                ):
+                                    scale = self.pin_role_teacher_weight
+                                else:
+                                    scale = 1.0
+                                attr_teacher_loss = attr_teacher_loss + scale * step_loss
                                 attr_teacher_tokens += 1
                             prev_token_idx = target_idx
                             if target_idx == self.attr_eos_index:
