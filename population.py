@@ -315,7 +315,9 @@ class GuidedPopulation(Population):
             self.guided_stats_callback(summary)
         if summary["invalid_total"]:
             parts = ", ".join(f"{reason}={count}" for reason, count in sorted(summary["invalid_by_reason"].items()))
-            self.reporters.info(f"Guided offspring invalid counts: total={summary['invalid_total']} :: {parts}")
+            self.reporters.info(
+                f"Post-repair guided offspring invalid counts: total={summary['invalid_total']} :: {parts}"
+            )
         self._guided_offspring_stats = summary
 
     def _emit_dataset_stats(self, valid_size: int, invalid_size: int):
