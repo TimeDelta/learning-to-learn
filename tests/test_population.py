@@ -462,6 +462,41 @@ def test_guided_invalid_visualization_emits_dot(tmp_path):
     assert "empty_graph" in text
 
 
+def test_guided_invalid_visualization_prefers_decoded_snapshot(tmp_path):
+    config = make_config()
+    pop = GuidedPopulation(config)
+    pop.generation = 5
+    pop.guided_invalid_viz_enabled = True
+    pop.guided_invalid_viz_dir = tmp_path
+    pop.guided_invalid_viz_formats = ("dot",)
+    genome = create_simple_genome()
+
+    decoded_graph = {
+        "node_types": torch.tensor([0, 1], dtype=torch.long),
+        "edge_index": torch.tensor([[0], [1]], dtype=torch.long),
+        "node_attributes": [{"node_type": "input"}, {"node_type": "output"}],
+    }
+    repaired_graph = {
+        "node_types": torch.tensor([0], dtype=torch.long),
+        "edge_index": torch.empty((2, 0), dtype=torch.long),
+        "node_attributes": [{"node_type": "input"}],
+        population_module.DECODED_GRAPH_DICT_KEY: decoded_graph,
+    }
+
+    pop._maybe_visualize_guided_invalid_graph(
+        genome,
+        repaired_graph,
+        reason="missing_output_slots",
+        child_index=1,
+        num_edges=0,
+    )
+
+    dot_files = list(tmp_path.glob("*.dot"))
+    assert dot_files, "decoded snapshot should be visualized"
+    text = dot_files[0].read_text()
+    assert "node_0 -> node_1" in text
+
+
 def test_guided_invalid_visualization_mermaid_only(tmp_path):
     config = make_config()
     pop = GuidedPopulation(config)
@@ -491,6 +526,41 @@ def test_guided_invalid_visualization_mermaid_only(tmp_path):
     text = mermaid_files[0].read_text()
     assert "graph LR" in text
     assert "status=invalid" in text
+
+
+def test_guided_invalid_visualization_mermaid_uses_repaired_graph(tmp_path):
+    config = make_config()
+    pop = GuidedPopulation(config)
+    pop.generation = 6
+    pop.guided_invalid_viz_enabled = True
+    pop.guided_invalid_viz_dir = tmp_path
+    pop.guided_invalid_viz_formats = ("mermaid",)
+    genome = create_simple_genome()
+    decoded_graph = {
+        "node_types": torch.tensor([0, 1], dtype=torch.long),
+        "edge_index": torch.tensor([[0], [1]], dtype=torch.long),
+        "node_attributes": [{"node_type": "input"}, {"node_type": "output"}],
+    }
+    repaired_graph = {
+        "node_types": torch.tensor([0], dtype=torch.long),
+        "edge_index": torch.empty((2, 0), dtype=torch.long),
+        "node_attributes": [{"node_type": "input"}],
+        population_module.DECODED_GRAPH_DICT_KEY: decoded_graph,
+    }
+
+    pop._maybe_visualize_guided_invalid_graph(
+        genome,
+        repaired_graph,
+        reason="missing_output_slots",
+        child_index=2,
+        num_edges=0,
+    )
+
+    mermaid_files = list(tmp_path.glob("*.mmd"))
+    assert mermaid_files, "mermaid visualization missing"
+    text = mermaid_files[0].read_text()
+    assert "%% Graph has no edges" in text
+    assert "node_0 --> node_1" not in text
 
 
 def test_guided_invalid_visualization_handles_missing_graphviz(monkeypatch, tmp_path):
@@ -595,6 +665,29 @@ def test_repair_reports_missing_output_slots_when_nodes_absent():
     assert graph["_repair_failure_reason"] == "missing_output_slots"
     details = graph["_repair_failure_details"]
     assert 3 in details["missing_slots"]
+
+
+def test_repair_preserves_predicted_edges_for_visualization():
+    config = make_config()
+    required_inputs = len(config.genome_config.input_keys)
+    if required_inputs <= 1:
+        pytest.skip("config does not require multiple input slots")
+    pop = GuidedPopulation(config)
+    node_count = max(1, required_inputs - 1)
+    graph = _make_empty_graph_dict(node_count, [{} for _ in range(node_count)])
+    predicted = torch.tensor([[0], [0]], dtype=torch.long)
+    graph["edge_index"] = predicted.clone()
+
+    assert not pop._repair_graph_dict(graph)
+    assert "_decoded_edge_index" not in graph
+    assert torch.equal(graph["edge_index"], predicted)
+
+    decoded = graph.get(population_module.DECODED_GRAPH_DICT_KEY)
+    assert decoded is not None
+    assert torch.equal(decoded["edge_index"], predicted)
+    # ensure decoded snapshot did not receive synthesized pin_role attributes
+    original_attrs = decoded["node_attributes"]
+    assert all("pin_role" not in attrs for attrs in original_attrs)
 
 
 def test_penalty_scale_handles_missing_input_slots():

@@ -37,6 +37,7 @@ from tasks import *
 _INVALID_REASON_COUNTER: Counter = Counter()
 _INVALID_REASON_REPORT_REGISTERED = False
 GRAPHVIZ_RENDER_FORMATS = {"png", "svg", "pdf", "jpg", "jpeg", "bmp"}
+DECODED_GRAPH_DICT_KEY = "_decoded_graph_dict"
 
 PIN_ROLE_INPUT = "input"
 PIN_ROLE_OUTPUT = "output"
@@ -456,9 +457,14 @@ class GuidedPopulation(Population):
             self._guided_invalid_viz_used = 0
         if self._guided_invalid_viz_used >= self.guided_invalid_viz_limit:
             return
-        cloned_graph = self._clone_graph_dict(graph_dict)
-        if cloned_graph is None:
+        repaired_graph = self._clone_graph_dict(graph_dict)
+        if repaired_graph is None:
             return
+        decoded_graph = None
+        if DECODED_GRAPH_DICT_KEY in graph_dict:
+            base_graph = graph_dict[DECODED_GRAPH_DICT_KEY]
+            decoded_graph = self._clone_graph_dict(base_graph)
+        graph_for_entry = decoded_graph or repaired_graph
         try:
             self.guided_invalid_viz_dir.mkdir(parents=True, exist_ok=True)
         except Exception as exc:
@@ -493,7 +499,7 @@ class GuidedPopulation(Population):
             "fitness": getattr(genome, "fitness", None),
             "invalid_graph": True,
             "invalid_reason": label_reason,
-            "graph": cloned_graph,
+            "graph": graph_for_entry,
         }
         context = RenderContext(
             generation=generation if isinstance(generation, int) else None,
@@ -525,8 +531,10 @@ class GuidedPopulation(Population):
                 continue
             if fmt == "mermaid":
                 try:
+                    mermaid_entry = dict(entry)
+                    mermaid_entry["graph"] = repaired_graph or graph_for_entry
                     mermaid_source = build_mermaid_graph(
-                        entry,
+                        mermaid_entry,
                         context=context,
                         rankdir=self.guided_invalid_viz_rankdir,
                         highlight_invalid=True,
@@ -705,6 +713,9 @@ class GuidedPopulation(Population):
         edge_index = graph_dict.get("edge_index")
         if edge_index is not None:
             cloned["edge_index"] = edge_index.clone().detach().cpu()
+        decoded_graph = graph_dict.get(DECODED_GRAPH_DICT_KEY)
+        if decoded_graph is not None:
+            cloned[DECODED_GRAPH_DICT_KEY] = copy.deepcopy(decoded_graph)
         attributes = []
         for attr in graph_dict.get("node_attributes", []) or []:
             cloned_attr = {}
@@ -1328,6 +1339,15 @@ class GuidedPopulation(Population):
     def _repair_graph_dict(self, graph_dict) -> bool:
         graph_dict.pop("_repair_failure_reason", None)
         graph_dict.pop("_repair_failure_details", None)
+
+        def _preserve_decoded_graph_dict() -> None:
+            if DECODED_GRAPH_DICT_KEY in graph_dict:
+                return
+            cloned = self._clone_graph_dict(graph_dict)
+            if cloned is not None:
+                graph_dict[DECODED_GRAPH_DICT_KEY] = cloned
+
+        _preserve_decoded_graph_dict()
         node_types = graph_dict.get("node_types")
         if node_types is None:
             graph_dict["edge_index"] = torch.empty((2, 0), dtype=torch.long)
@@ -1483,7 +1503,6 @@ class GuidedPopulation(Population):
                 "typed_count": len(input_nodes),
                 "wrong_type_slots": [],
             }
-            graph_dict["edge_index"] = torch.empty((2, 0), dtype=torch.long)
             return False
 
         if configured_outputs and len(output_nodes) < len(expected_output_slots):
@@ -1510,7 +1529,6 @@ class GuidedPopulation(Population):
                 "missing_slots": missing_slots,
                 "wrong_type_slots": wrong_type_slots,
             }
-            graph_dict["edge_index"] = torch.empty((2, 0), dtype=torch.long)
             return False
 
         if not input_nodes:

@@ -7,6 +7,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from population_visualizer import (
+    DECODED_GRAPH_DICT_KEY,
     RenderContext,
     build_dot_graph,
     save_summary,
@@ -52,6 +53,25 @@ def test_build_dot_graph_outputs_basic_structure():
     assert "rank=1" in dot
     assert "node_0 -> node_1" in dot
     assert "node_1 -> node_2" in dot
+
+
+def test_build_dot_graph_overlays_predicted_edges_when_missing():
+    entry = {
+        "genome_id": 9,
+        "graph": {
+            "node_types": [0, 1],
+            "edge_index": [],
+            "node_attributes": [{}, {}],
+        },
+    }
+    entry["graph"][DECODED_GRAPH_DICT_KEY] = {
+        "node_types": [0, 1],
+        "edge_index": [(0, 1)],
+        "node_attributes": [{}, {}],
+    }
+    dot = build_dot_graph(entry)
+    assert "style=dashed" in dot
+    assert "node_0 -> node_1" in dot
 
 
 def test_save_summary_serializes_entries(tmp_path):

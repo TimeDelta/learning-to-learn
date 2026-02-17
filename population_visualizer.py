@@ -21,6 +21,7 @@ except Exception:  # pragma: no cover
     NODE_TYPE_TO_INDEX: Dict[str, int] = {}
 
 
+DECODED_GRAPH_DICT_KEY = "_decoded_graph_dict"
 _INDEX_TO_NODE_TYPE: Dict[int, str] = {idx: name for name, idx in NODE_TYPE_TO_INDEX.items()}
 
 
@@ -268,6 +269,10 @@ def build_dot_graph(
     nodes = [_node_type_name(idx) for idx in node_type_ids]
     attrs = _normalize_node_attributes(graph_dict.get("node_attributes"), len(nodes))
     edges = _edge_list(graph_dict.get("edge_index"), len(nodes))
+    decoded_graph = graph_dict.get(DECODED_GRAPH_DICT_KEY)
+    predicted_edges = _edge_list(decoded_graph.get("edge_index"), len(nodes)) if decoded_graph else []
+    edge_set = set(edges)
+    predicted_overlay = [edge for edge in predicted_edges if edge not in edge_set]
 
     ctx = context or RenderContext()
     label_parts = [f"genome={entry.get('genome_id')}"]
@@ -317,7 +322,15 @@ def build_dot_graph(
     for src, dst in edges:
         dot_lines.append(f"  node_{src} -> node_{dst};")
 
-    if not edges:
+    if predicted_overlay:
+        for src, dst in predicted_overlay:
+            dot_lines.append(
+                '  node_{src} -> node_{dst} [style=dashed, color="#90A4AE", penwidth=1.4];'.format(src=src, dst=dst)
+            )
+
+    if not edges and predicted_overlay:
+        dot_lines.append("  // No repaired edges; dashed edges show decoder predictions")
+    elif not edges:
         dot_lines.append("  // Graph has no edges")
 
     dot_lines.append("}")
