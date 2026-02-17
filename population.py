@@ -115,12 +115,11 @@ class GuidedPopulation(Population):
             hidden_dims=[32, 32],
             pin_role_dim=2,
         )
-        pin_role_teacher_weight = float(getattr(config, "decoder_pin_role_teacher_weight", 3.0) or 3.0)
         decoder = GraphDecoder(
             len(NODE_TYPE_OPTIONS),
             graph_latent_dim,
             self.shared_attr_vocab,
-            pin_role_teacher_weight=pin_role_teacher_weight,
+            graph_encoder.pin_role_embedding,
         )
         icnn_hidden_dims = getattr(config, "latent_icnn_hidden_dims", (64, 32))
         if isinstance(icnn_hidden_dims, str):
@@ -600,16 +599,30 @@ class GuidedPopulation(Population):
         node_ids = sorted(genome.nodes.keys())
         node_types = []
         node_attributes = []
+        raw_input_keys = [key for key in getattr(self.config.genome_config, "input_keys", [])]
+        raw_output_keys = [key for key in getattr(self.config.genome_config, "output_keys", [])]
         input_keys = {
             int(key)
-            for key in getattr(self.config.genome_config, "input_keys", [])
+            for key in raw_input_keys
             if isinstance(key, (int, float)) or (isinstance(key, str) and key.strip())
         }
         output_keys = {
             int(key)
-            for key in getattr(self.config.genome_config, "output_keys", [])
+            for key in raw_output_keys
             if isinstance(key, (int, float)) or (isinstance(key, str) and key.strip())
         }
+        input_slot_ranks = {}
+        for order, key in enumerate(raw_input_keys):
+            try:
+                input_slot_ranks[int(key)] = order
+            except (TypeError, ValueError):
+                continue
+        output_slot_ranks = {}
+        for order, key in enumerate(raw_output_keys):
+            try:
+                output_slot_ranks[int(key)] = order
+            except (TypeError, ValueError):
+                continue
 
         def _role_for_node_key(node_key: Any) -> str:
             try:
@@ -632,6 +645,19 @@ class GuidedPopulation(Population):
             role = _role_for_node_key(nid)
             attr_dict["pin_role"] = role
             attr_names.append("pin_role")
+            slot_rank = None
+            try:
+                node_key_int = int(nid)
+            except (TypeError, ValueError):
+                node_key_int = None
+            if node_key_int is not None:
+                if role == PIN_ROLE_INPUT:
+                    slot_rank = input_slot_ranks.get(node_key_int)
+                elif role == PIN_ROLE_OUTPUT:
+                    slot_rank = output_slot_ranks.get(node_key_int)
+            if slot_rank is not None:
+                attr_dict["pin_slot_index"] = int(slot_rank)
+                attr_names.append("pin_slot_index")
             self.shared_attr_vocab.add_names(attr_names)
             node_types.append(idx)
             node_attributes.append(attr_dict)
@@ -1340,6 +1366,30 @@ class GuidedPopulation(Population):
                 warn(f"Unknown node pin role: {raw_role}")
             return None
 
+        def _node_pin_slot(idx: int) -> int | None:
+            if idx < 0 or idx >= len(normalized_attrs):
+                return None
+            attrs = normalized_attrs[idx] or {}
+            raw = attrs.get("pin_slot_index")
+            if raw is None:
+                return None
+            if torch.is_tensor(raw):
+                if raw.numel() == 0:
+                    return None
+                try:
+                    value = float(raw.detach().cpu().view(-1)[0].item())
+                except Exception:
+                    return None
+            else:
+                try:
+                    value = float(raw)
+                except (TypeError, ValueError):
+                    return None
+            slot = int(round(value))
+            if slot < 0:
+                return None
+            return slot
+
         def _assign_pin_role(idx: int, role: str) -> bool:
             if idx < 0 or idx >= len(normalized_attrs):
                 return False
@@ -1354,6 +1404,8 @@ class GuidedPopulation(Population):
         def _recompute_pin_nodes() -> Tuple[List[int], List[int]]:
             inputs = [idx for idx in range(len(normalized_attrs)) if _node_pin_role(idx) == PIN_ROLE_INPUT]
             outputs = [idx for idx in range(len(normalized_attrs)) if _node_pin_role(idx) == PIN_ROLE_OUTPUT]
+            inputs.sort(key=lambda idx: (_node_pin_slot(idx) is None, _node_pin_slot(idx) or 0, idx))
+            outputs.sort(key=lambda idx: (_node_pin_slot(idx) is None, _node_pin_slot(idx) or 0, idx))
             return inputs, outputs
 
         configured_inputs = list(getattr(self.config.genome_config, "input_keys", []))
@@ -1369,7 +1421,14 @@ class GuidedPopulation(Population):
             if required_inputs <= 0 or len(input_nodes) >= required_inputs:
                 return
             candidate_order = list(range(node_count))
-            candidate_order.sort(key=lambda idx: (len(adjacency_in[idx]) > 0, idx))
+            candidate_order.sort(
+                key=lambda idx: (
+                    len(adjacency_in[idx]) > 0,
+                    _node_pin_slot(idx) is None,
+                    _node_pin_slot(idx) or 0,
+                    idx,
+                )
+            )
             for idx in candidate_order:
                 if len(input_nodes) >= required_inputs:
                     break
@@ -1393,7 +1452,14 @@ class GuidedPopulation(Population):
             if len(output_nodes) >= len(expected_output_slots):
                 return
             candidate_order = list(range(node_count))
-            candidate_order.sort(key=lambda idx: (len(adjacency_out[idx]) > 0, -idx))
+            candidate_order.sort(
+                key=lambda idx: (
+                    len(adjacency_out[idx]) == 0,
+                    _node_pin_slot(idx) is None,
+                    _node_pin_slot(idx) or 0,
+                    -idx,
+                )
+            )
             reserved_inputs = set(input_nodes)
             for idx in candidate_order:
                 if len(output_nodes) >= len(expected_output_slots):
