@@ -8,16 +8,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-try:  # pragma: no cover - optional dependency for loading .pt snapshots
-    import torch
-except Exception:  # pragma: no cover - torch might be unavailable in lightweight envs
-    torch = None  # type: ignore
+import torch
 
-try:  # pragma: no cover - if torch import fails, genes import likely fails as well
-    from genes import NODE_TYPE_TO_INDEX
-except Exception:  # pragma: no cover
-    NODE_TYPE_TO_INDEX: Dict[str, int] = {}
-
+from genes import NODE_TYPE_TO_INDEX
 
 DECODED_GRAPH_DICT_KEY = "_decoded_graph_dict"
 _INDEX_TO_NODE_TYPE: Dict[int, str] = {idx: name for name, idx in NODE_TYPE_TO_INDEX.items()}
@@ -43,8 +36,6 @@ _DEF_NODE_COLORS = {
 def load_population_snapshot(path: str | Path) -> Dict[str, Any]:
     """Load a serialized population snapshot from ``torch.save`` output."""
 
-    if torch is None:  # pragma: no cover - exercised only when torch unavailable
-        raise RuntimeError("torch is not available; cannot load population snapshot.")
     snapshot = torch.load(Path(path), map_location="cpu")
     if not isinstance(snapshot, dict) or "entries" not in snapshot:
         raise ValueError("Malformed population snapshot: expected dict with 'entries'.")
@@ -250,7 +241,7 @@ def build_mermaid_graph(
     entry: Mapping[str, Any],
     *,
     context: RenderContext | None = None,
-    max_attr_lines: int = 4,
+    max_attr_lines: int | None = None,
     max_attr_value_chars: int = 32,
     rankdir: str = "LR",
     highlight_invalid: bool = True,
@@ -297,17 +288,15 @@ def build_mermaid_graph(
         node_id = f"node_{idx}"
         node_ids.append(node_id)
         attr_lines: List[str] = [f"{idx}: {node_name}"]
-        shown = 0
         for key in sorted(node_attrs.keys()):
             if key == "node_type":
                 continue
             summary = _summarize_attr_value(node_attrs[key], max_chars=max_attr_value_chars)
             attr_lines.append(f"{key}={summary}")
-            shown += 1
-            if shown >= max_attr_lines:
-                attr_lines.append("…")
+            if max_attr_lines is not None and len(attr_lines) - 1 >= max_attr_lines:
                 break
-        label = _mermaid_escape("<br/>".join(attr_lines))
+        escaped_lines = [_mermaid_escape(line) for line in attr_lines]
+        label = "<br/>".join(escaped_lines)
         lines.append(f'  {node_id}["{label}"]')
 
     for src, dst in edges:

@@ -51,6 +51,8 @@ GUIDED_POPULATION_FIELDS = {
     "wl_kernel_iterations": int,
     "trainer_freeze_cycle": str,
     "trainer_freeze_verbose": _parse_bool,
+    "repair_randomize_connections": _parse_bool,
+    "repair_random_seed": int,
 }
 
 

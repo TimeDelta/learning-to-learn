@@ -55,6 +55,27 @@ def test_build_mermaid_graph_outputs_basic_structure():
     assert "node_1 --> node_2" in mermaid
 
 
+def test_build_mermaid_graph_renders_line_breaks_without_ellipsis():
+    entry = {
+        "genome_id": 5,
+        "graph": {
+            "node_types": [0],
+            "edge_index": [],
+            "node_attributes": [
+                {
+                    "pin_role": "hidden",
+                    "pin_slot_index": 0,
+                    "extra": "value",
+                }
+            ],
+        },
+    }
+    mermaid = build_mermaid_graph(entry)
+    assert "<br/>pin_role=hidden" in mermaid
+    assert "<br/>pin_slot_index=0" in mermaid
+    assert "…" not in mermaid
+
+
 def test_build_mermaid_graph_ignores_predicted_edges_when_missing():
     entry = {
         "genome_id": 9,

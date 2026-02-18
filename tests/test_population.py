@@ -1,3 +1,4 @@
+import copy
 import os
 import sys
 from collections import deque
@@ -631,6 +632,12 @@ def test_repair_synthesizes_pin_roles_when_labels_missing():
     output_count = sum(1 for attr in attrs if attr.get("pin_role") == "output")
     assert input_count >= num_inputs
     assert output_count >= min(len(output_slots), node_count)
+    input_slots = {
+        attr.get("pin_slot_index")
+        for attr in attrs
+        if attr.get("pin_role") == "input" and attr.get("pin_slot_index") is not None
+    }
+    assert {slot for slot in range(num_inputs)}.issubset(input_slots)
     assert graph["edge_index"].numel() > 0
 
 
@@ -645,20 +652,96 @@ def test_repair_fails_when_not_enough_input_nodes():
 
     assert not pop._repair_graph_dict(graph)
     assert graph["_repair_failure_reason"] == "missing_input_slots"
+    details = graph["_repair_failure_details"]
+    missing = details.get("missing_slots") or []
+    assert missing  # should report which slots are uncovered
     assert graph["edge_index"].numel() == 0
+
+
+def test_repair_reports_slot_collisions_when_slots_unavailable():
+    config = make_config()
+    required_inputs = len(config.genome_config.input_keys)
+    if required_inputs <= 1:
+        pytest.skip("config does not require multiple input slots")
+    node_count = required_inputs
+    # Reserve every slot as an output so the repair hook cannot repurpose nodes freely.
+    config.genome_config.output_keys = list(range(node_count))
+    pop = GuidedPopulation(config)
+    node_attrs = [{"pin_role": "input", "pin_slot_index": 0} for _ in range(node_count)]
+    graph = _make_empty_graph_dict(node_count, node_attrs)
+
+    assert not pop._repair_graph_dict(graph)
+    assert graph["_repair_failure_reason"] == "missing_input_slots"
+    details = graph["_repair_failure_details"]
+    assert details["missing_slots"], "slot coverage should be reported"
 
 
 def test_repair_reports_missing_output_slots_when_nodes_absent():
     config = make_config()
-    config.genome_config.output_keys = [0, 3]
+    missing_slot = len(config.genome_config.input_keys) + 1
+    config.genome_config.output_keys = [0, missing_slot]
     pop = GuidedPopulation(config)
-    node_attrs = [{} for _ in range(2)]  # only slots 0 and 1 exist
+    node_count = max(len(config.genome_config.input_keys), missing_slot)
+    node_attrs = [{} for _ in range(node_count)]
     graph = _make_empty_graph_dict(len(node_attrs), node_attrs)
 
     assert not pop._repair_graph_dict(graph)
     assert graph["_repair_failure_reason"] == "missing_output_slots"
     details = graph["_repair_failure_details"]
-    assert 3 in details["missing_slots"]
+    assert missing_slot in details["missing_slots"]
+
+
+def test_repair_connects_hidden_nodes_to_inputs_and_outputs():
+    config = make_config()
+    pop = GuidedPopulation(config)
+    node_attrs = [
+        {"pin_role": "input", "pin_slot_index": 0},
+        {"pin_role": "input", "pin_slot_index": 1},
+        {"pin_role": "input", "pin_slot_index": 2},
+        {"pin_role": "hidden"},
+        {"pin_role": "hidden"},
+        {"pin_role": "output"},
+    ]
+    graph = _make_empty_graph_dict(len(node_attrs), node_attrs)
+
+    assert pop._repair_graph_dict(graph)
+
+    edges = graph["edge_index"].t().tolist()
+    adjacency_out = {idx: [] for idx in range(len(node_attrs))}
+    adjacency_in = {idx: [] for idx in range(len(node_attrs))}
+    for src, dst in edges:
+        adjacency_out[src].append(dst)
+        adjacency_in[dst].append(src)
+
+    def reachable_from_inputs():
+        seen = {idx for idx, attrs in enumerate(node_attrs) if attrs.get("pin_role") == "input"}
+        queue = deque(seen)
+        while queue:
+            current = queue.popleft()
+            for nxt in adjacency_out.get(current, []):
+                if nxt not in seen:
+                    seen.add(nxt)
+                    queue.append(nxt)
+        return seen
+
+    def reaches_outputs():
+        outputs = {idx for idx, attrs in enumerate(node_attrs) if attrs.get("pin_role") == "output"}
+        seen = set(outputs)
+        queue = deque(outputs)
+        while queue:
+            current = queue.popleft()
+            for src in adjacency_in.get(current, []):
+                if src not in seen:
+                    seen.add(src)
+                    queue.append(src)
+        return seen
+
+    forward = reachable_from_inputs()
+    backward = reaches_outputs()
+    hidden_indices = [idx for idx, attrs in enumerate(node_attrs) if attrs.get("pin_role") == "hidden"]
+    for idx in hidden_indices:
+        assert idx in forward
+        assert idx in backward
 
 
 def test_repair_preserves_predicted_edges_for_visualization():
@@ -767,6 +850,40 @@ def test_repair_connects_each_input_to_output():
 
     for out in output_nodes:
         assert out in reachable_union
+
+
+def test_repair_randomization_changes_fallback_edge_choices():
+    base_config = make_config()
+    base_config.genome_config.input_keys = [0]
+    base_config.genome_config.output_keys = [0]
+    deterministic_pop = GuidedPopulation(base_config)
+
+    rand_config = make_config()
+    rand_config.genome_config.input_keys = [0]
+    rand_config.genome_config.output_keys = [0]
+    rand_config.repair_randomize_connections = True
+    rand_config.repair_random_seed = 123
+    randomized_pop = GuidedPopulation(rand_config)
+
+    node_attrs = [
+        {"pin_role": "input", "pin_slot_index": 0},
+        {"pin_role": "input", "pin_slot_index": 1},
+        {"pin_role": "input", "pin_slot_index": 2},
+        {"pin_role": "hidden"},
+        {"pin_role": "hidden"},
+        {"pin_role": "hidden"},
+        {"pin_role": "output"},
+    ]
+
+    base_graph = _make_empty_graph_dict(len(node_attrs), copy.deepcopy(node_attrs))
+    rand_graph = _make_empty_graph_dict(len(node_attrs), copy.deepcopy(node_attrs))
+
+    assert deterministic_pop._repair_graph_dict(base_graph)
+    assert randomized_pop._repair_graph_dict(rand_graph)
+
+    base_edges = sorted(base_graph["edge_index"].t().tolist())
+    rand_edges = sorted(rand_graph["edge_index"].t().tolist())
+    assert base_edges != rand_edges
 
 
 def test_fitness_predictor_returns_per_metric_log_scales():
