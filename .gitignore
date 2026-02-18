@@ -5,3 +5,4 @@ mlartifacts/
 mlflow.db
 debug_guided_offspring/
 *.mmd
+artifacts/
