@@ -1,0 +1,5 @@
+{
+   "executablePath": "/Users/bryannova/.cache/puppeteer/chrome-headless-shell/mac-131.0.6778.204/chrome-headless-shell-mac-x64/chrome-headless-shell",
+   "protocolTimeout": 300000,
+   "args": ["--disable-dev-shm-usage"]
+}
