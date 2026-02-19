@@ -137,6 +137,7 @@ class GuidedPopulation(Population):
             self.shared_attr_vocab,
             graph_encoder.pin_role_embedding,
             min_pin_nodes=decoder_min_pin_nodes,
+            required_input_count=len(configured_inputs),
         )
         icnn_hidden_dims = getattr(config, "latent_icnn_hidden_dims", (64, 32))
         if isinstance(icnn_hidden_dims, str):
@@ -1569,6 +1570,10 @@ class GuidedPopulation(Population):
                 return False
             attrs = dict(normalized_attrs[idx] or {})
             current = _normalize_pin_role(attrs.get("pin_role"))
+            if attrs.get("_pin_role_locked"):
+                if current == role:
+                    return False
+                return False
             if current == role:
                 return False
             attrs["pin_role"] = role
@@ -1580,6 +1585,10 @@ class GuidedPopulation(Population):
                 return False
             attrs = dict(normalized_attrs[idx] or {})
             current = _node_pin_slot(idx)
+            if attrs.get("_pin_slot_locked"):
+                if current == slot:
+                    return False
+                return False
             if slot is None:
                 if "pin_slot_index" in attrs:
                     attrs.pop("pin_slot_index", None)

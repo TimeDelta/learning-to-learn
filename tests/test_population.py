@@ -744,6 +744,33 @@ def test_repair_connects_hidden_nodes_to_inputs_and_outputs():
         assert idx in backward
 
 
+def test_repair_preserves_seeded_input_pins():
+    config = make_config()
+    pop = GuidedPopulation(config)
+    required_inputs = len(config.genome_config.input_keys)
+    if required_inputs < 2:
+        pytest.skip("insufficient configured inputs for this test")
+    node_attrs = []
+    for slot in range(required_inputs):
+        node_attrs.append(
+            {
+                "pin_role": "input",
+                "pin_slot_index": slot,
+                "_pin_role_locked": True,
+                "_pin_slot_locked": True,
+            }
+        )
+    node_attrs.append({})
+    graph = _make_empty_graph_dict(len(node_attrs), node_attrs)
+
+    pop._repair_graph_dict(graph)
+
+    attrs = graph["node_attributes"]
+    for slot in range(required_inputs):
+        assert attrs[slot]["pin_role"] == "input"
+        assert attrs[slot]["pin_slot_index"] == slot
+
+
 def test_repair_preserves_predicted_edges_for_visualization():
     config = make_config()
     required_inputs = len(config.genome_config.input_keys)
