@@ -48,6 +48,14 @@ PIN_ROLE_INPUT = "input"
 PIN_ROLE_OUTPUT = "output"
 PIN_ROLE_HIDDEN = "hidden"
 PIN_ROLE_ORDER = [PIN_ROLE_INPUT, PIN_ROLE_HIDDEN, PIN_ROLE_OUTPUT]
+PIN_SLOT_SAFE_DEFAULT_VALUE = 1.0
+PIN_SLOT_MAX_MAGNITUDE = 1024.0
+LATENT_LOGVAR_MIN = -20.0
+LATENT_LOGVAR_MAX = 20.0
+LOG_ALPHA_MIN = -20.0
+LOG_ALPHA_MAX = 20.0
+LATENT_SAMPLE_CLAMP = 1_000.0
+LOSS_VALUE_CLAMP = 1_000_000.0
 
 
 def _normalize_pin_role(value: Any) -> str | None:
@@ -56,6 +64,36 @@ def _normalize_pin_role(value: Any) -> str | None:
         if role in {PIN_ROLE_INPUT, PIN_ROLE_HIDDEN, PIN_ROLE_OUTPUT}:
             return role
     return None
+
+
+def _sanitize_pin_slot_scalar(value: torch.Tensor) -> torch.Tensor:
+    """Clamp NaN/Inf pin-slot logits to a bounded, finite range."""
+    safe = torch.nan_to_num(
+        value,
+        nan=PIN_SLOT_SAFE_DEFAULT_VALUE,
+        posinf=PIN_SLOT_MAX_MAGNITUDE,
+        neginf=-PIN_SLOT_MAX_MAGNITUDE,
+    )
+    return safe.clamp(min=-PIN_SLOT_MAX_MAGNITUDE, max=PIN_SLOT_MAX_MAGNITUDE)
+
+
+def _sanitize_logvar(value: torch.Tensor) -> torch.Tensor:
+    safe = torch.nan_to_num(value, nan=0.0, posinf=LATENT_LOGVAR_MAX, neginf=LATENT_LOGVAR_MIN)
+    return safe.clamp(min=LATENT_LOGVAR_MIN, max=LATENT_LOGVAR_MAX)
+
+
+def _sanitize_log_alpha(value: torch.Tensor) -> torch.Tensor:
+    safe = torch.nan_to_num(value, nan=0.0, posinf=LOG_ALPHA_MAX, neginf=LOG_ALPHA_MIN)
+    return safe.clamp(min=LOG_ALPHA_MIN, max=LOG_ALPHA_MAX)
+
+
+def _sanitize_latent_sample(value: torch.Tensor) -> torch.Tensor:
+    safe = torch.nan_to_num(value, nan=0.0, posinf=LATENT_SAMPLE_CLAMP, neginf=-LATENT_SAMPLE_CLAMP)
+    return safe.clamp(min=-LATENT_SAMPLE_CLAMP, max=LATENT_SAMPLE_CLAMP)
+
+
+def _finite_loss(value: torch.Tensor, clamp: float = LOSS_VALUE_CLAMP) -> torch.Tensor:
+    return torch.nan_to_num(value, nan=0.0, posinf=clamp, neginf=-clamp)
 
 
 def flatten_task_features(task_features, expected_len: Optional[int] = None) -> np.ndarray:
@@ -1129,6 +1167,7 @@ class GraphDecoder(nn.Module):
                 if decoded_role is not None:
                     attrs["pin_role"] = decoded_role
                 slot_scalar = self.pin_slot_head(embedding).squeeze()
+                slot_scalar = _sanitize_pin_slot_scalar(slot_scalar)
                 slot_target = None
                 if graph_slot_targets is not None and node_idx < len(graph_slot_targets):
                     slot_target = graph_slot_targets[node_idx]
@@ -1593,8 +1632,12 @@ class SelfCompressingFitnessRegularizedDAGVAE(nn.Module):
         return self.graph_encoder(node_types, edge_index, node_attributes, batch, num_graphs=num_graphs)
 
     def reparameterize(self, mu, logvar, latent_mask):
+        logvar = _sanitize_logvar(logvar)
         std = torch.exp(0.5 * logvar)
+        std = _sanitize_latent_sample(std)
+        mu = _sanitize_latent_sample(mu)
         z = mu + torch.randn_like(std) * std
+        z = _sanitize_latent_sample(z)
         return z if latent_mask is None else z * latent_mask
 
     def decode(
@@ -2057,7 +2100,7 @@ class OnlineTrainer:
         loss_feat = loss_feat / denom
         if graphs_to_compare == 0 and empty_penalty > 0:
             loss_adj = loss_adj + empty_penalty
-        return loss_adj, loss_feat
+        return _finite_loss(loss_adj), _finite_loss(loss_feat)
 
     def _structural_alignment_loss(self, batch, graph_latent) -> torch.Tensor:
         if self.wl_loss_weight <= 0 or graph_latent is None or batch.num_graphs <= 1:
@@ -2276,13 +2319,16 @@ class OnlineTrainer:
                 # --- 3) ARD-KL losses ---
                 def calc_kl_div_per_dim(log_alpha, logvar, mu):
                     # ARD-KL divergence per sample and per dim
+                    log_alpha = _sanitize_log_alpha(log_alpha)
+                    logvar = _sanitize_logvar(logvar)
+                    mu = _sanitize_latent_sample(mu)
                     precision = torch.exp(log_alpha)
                     var = torch.exp(logvar)
-                    # KL formula: 0.5*(-log_alpha - logvar + precision*(var + mu^2) - 1)
-                    return 0.5 * (-log_alpha - logvar + precision * (var + mu.pow(2)) - 1)
+                    kl = 0.5 * (-log_alpha - logvar + precision * (var + mu.pow(2)) - 1)
+                    return _finite_loss(kl)
 
                 kl_per_dim = calc_kl_div_per_dim(self.model.log_alpha_g, lv_g, mu_g)
-                graph_kl_loss = self._reduce_kl_loss(kl_per_dim)
+                graph_kl_loss = _finite_loss(self._reduce_kl_loss(kl_per_dim))
 
                 # --- 4) fitness loss ---
                 target = target_y.to(self.device)
@@ -2298,7 +2344,7 @@ class OnlineTrainer:
                 weighted_error = hetero_term * weight_expand
                 denom = weight_expand.sum().clamp_min(1.0)
                 loss_fitness = weighted_error.sum() / denom
-                raw_weighted_error = sq_error * weight_expand
+                raw_weighted_error = torch.nan_to_num(sq_error * weight_expand, nan=0.0)
                 if per_metric_error_sum is None or per_metric_error_sum.numel() != weighted_error.size(-1):
                     per_metric_error_sum = torch.zeros(weighted_error.size(-1))
                     per_metric_weight_sum = torch.zeros(weighted_error.size(-1))
@@ -2323,6 +2369,15 @@ class OnlineTrainer:
                     slot_tokens = float(decoder_aux.get("pin_slot_tokens", 0) or 0)
                     if slot_tokens > 0:
                         pin_slot_recon = (decoder_aux["pin_slot_loss"] / slot_tokens).to(self.device)
+
+                loss_adj = _finite_loss(loss_adj)
+                loss_feat = _finite_loss(loss_feat)
+                graph_kl_loss = _finite_loss(graph_kl_loss)
+                loss_fitness = _finite_loss(loss_fitness)
+                loss_convex = _finite_loss(loss_convex)
+                wl_loss = _finite_loss(wl_loss)
+                pin_role_recon = _finite_loss(pin_role_recon)
+                pin_slot_recon = _finite_loss(pin_slot_recon)
 
                 # --- 5) total & backward ---
                 loss_terms = [
