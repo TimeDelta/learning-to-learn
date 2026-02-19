@@ -844,6 +844,7 @@ class GraphDecoder(nn.Module):
         edge_threshold: float = 0.5,
         max_edges_per_node: int = 256,
         max_edges_per_graph: int = 4096,
+        min_pin_nodes: int | None = None,
     ):
         super().__init__()
         self.shared_attr_vocab = shared_attr_vocab
@@ -877,6 +878,13 @@ class GraphDecoder(nn.Module):
         self.edge_threshold = edge_threshold
         self.max_edges_per_node = max(1, int(max_edges_per_node))
         self.max_edges_per_graph = max(1, int(max_edges_per_graph))
+        if min_pin_nodes is None:
+            self.min_pin_nodes = 0
+        else:
+            try:
+                self.min_pin_nodes = max(0, int(min_pin_nodes))
+            except (TypeError, ValueError):
+                self.min_pin_nodes = 0
         # Encourage attribute decoder to terminate by progressively biasing the EOS logit.
         self.attr_eos_bias_base = 0.0
         self.attr_eos_bias_slope = 0.1
@@ -1031,6 +1039,7 @@ class GraphDecoder(nn.Module):
                             stop_prob = torch.sigmoid(stop_logit)
                             stop_prob = torch.nan_to_num(stop_prob, nan=1.0).clamp(0.0, 1.0)
                             continue_prob = (1.0 - stop_prob).clamp(0.0, 1.0)
+                            force_min_pins = self.min_pin_nodes > 0 and t < self.min_pin_nodes
                             if teacher_force_nodes:
                                 target_stop = 1.0 if (target_node_count is not None and t >= target_node_count) else 0.0
                                 node_teacher_loss = node_teacher_loss + F.binary_cross_entropy_with_logits(
@@ -1044,6 +1053,8 @@ class GraphDecoder(nn.Module):
                                         )
                                     break
                             else:
+                                if force_min_pins:
+                                    continue_prob = torch.ones_like(continue_prob)
                                 if DEBUG_DECODER and decode_stats is not None:
                                     decode_stats["node_stop_samples"].append(float(continue_prob.item()))
                                 if torch.bernoulli(continue_prob).item() == 0:
@@ -1152,8 +1163,9 @@ class GraphDecoder(nn.Module):
                 pin_role_vec = None
                 decoded_role = None
                 target_pin_role = None
-                pin_role_vec = self.pin_role_head(embedding)
-                decoded_role = self._infer_pin_role(pin_role_vec, pin_role_reference)
+                if self.pin_role_head is not None:
+                    pin_role_vec = self.pin_role_head(embedding)
+                    decoded_role = self._infer_pin_role(pin_role_vec, pin_role_reference)
                 if graph_pin_targets is not None and node_idx < len(graph_pin_targets):
                     target_pin_role = graph_pin_targets[node_idx]
                 if pin_role_vec is not None and target_pin_role is not None:

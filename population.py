@@ -116,11 +116,27 @@ class GuidedPopulation(Population):
             hidden_dims=[32, 32],
             pin_role_dim=2,
         )
+        genome_config = getattr(config, "genome_config", None)
+        configured_inputs = list(getattr(genome_config, "input_keys", [])) if genome_config else []
+        configured_outputs = list(getattr(genome_config, "output_keys", [])) if genome_config else []
+        output_slots: List[int] = []
+        for key in configured_outputs:
+            try:
+                output_slots.append(int(key))
+            except (TypeError, ValueError):
+                continue
+        max_output_slot = max(output_slots) if output_slots else -1
+        decoder_min_pin_nodes = max(
+            len(configured_inputs) + len(configured_outputs),
+            max_output_slot + 1,
+            1,
+        )
         decoder = GraphDecoder(
             len(NODE_TYPE_OPTIONS),
             graph_latent_dim,
             self.shared_attr_vocab,
             graph_encoder.pin_role_embedding,
+            min_pin_nodes=decoder_min_pin_nodes,
         )
         icnn_hidden_dims = getattr(config, "latent_icnn_hidden_dims", (64, 32))
         if isinstance(icnn_hidden_dims, str):

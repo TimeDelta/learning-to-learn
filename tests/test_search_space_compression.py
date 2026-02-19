@@ -210,3 +210,24 @@ def test_graph_decoder_respects_node_budget(monkeypatch):
     assert len(graphs) == 1
     graph = graphs[0]
     assert graph["node_types"].shape[0] == 1  # budget enforces a single node even though sampling never stops.
+
+
+def test_graph_decoder_enforces_min_pin_nodes():
+    vocab = SharedAttributeVocab([], embedding_dim=4)
+    decoder = GraphDecoder(
+        num_node_types=3,
+        latent_dim=8,
+        shared_attr_vocab=vocab,
+        hidden_dim=4,
+        min_pin_nodes=3,
+    )
+    decoder.eval()
+
+    with torch.no_grad():
+        decoder.stop_head.weight.zero_()
+        decoder.stop_head.bias.fill_(20.0)  # would normally stop immediately
+
+    latent = torch.zeros(1, decoder.latent_dim)
+    graphs = decoder(latent)
+    graph = graphs[0]
+    assert len(graph["node_attributes"]) >= 3
