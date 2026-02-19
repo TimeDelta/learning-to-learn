@@ -630,6 +630,9 @@ class GuidedPopulation(Population):
             role = _role_for_node_key(nid)
             attr_dict["pin_role"] = role
             attr_names.append("pin_role")
+            attr_dict["is_input_pin"] = 1.0 if role == PIN_ROLE_INPUT else 0.0
+            attr_dict["is_output_pin"] = 1.0 if role == PIN_ROLE_OUTPUT else 0.0
+            attr_names.extend(["is_input_pin", "is_output_pin"])
             slot_rank = None
             try:
                 node_key_int = int(nid)
@@ -740,6 +743,54 @@ class GuidedPopulation(Population):
             edge_index = torch.as_tensor(edge_index, dtype=torch.long)
         data = Data(node_types=node_types, edge_index=edge_index, node_attributes=node_attributes)
         return data
+
+    def _minimum_required_node_count(self) -> int:
+        config = getattr(self.config, "genome_config", None)
+        if config is None:
+            return 1
+        input_keys = list(getattr(config, "input_keys", []))
+        output_keys = list(getattr(config, "output_keys", []))
+        required_inputs = len(input_keys)
+        output_slots: List[int] = []
+        for key in output_keys:
+            try:
+                output_slots.append(int(key))
+            except (TypeError, ValueError):
+                continue
+        max_output_slot = max(output_slots) if output_slots else -1
+        slot_bound = max_output_slot + 1 if max_output_slot >= 0 else 0
+        return max(required_inputs, len(output_keys), slot_bound, 1)
+
+    @staticmethod
+    def _ensure_graph_node_capacity(graph_dict: dict, min_nodes: int) -> int:
+        if not graph_dict or min_nodes <= 0:
+            return 0
+        node_attrs = graph_dict.get("node_attributes") or []
+        if not isinstance(node_attrs, list):
+            node_attrs = list(node_attrs)
+        original_len = len(node_attrs)
+        while len(node_attrs) < min_nodes:
+            node_attrs.append({})
+        graph_dict["node_attributes"] = node_attrs
+
+        desired = len(node_attrs)
+        node_types = graph_dict.get("node_types")
+        if isinstance(node_types, torch.Tensor):
+            if node_types.numel() < desired:
+                pad = torch.zeros(desired - node_types.numel(), dtype=node_types.dtype)
+                graph_dict["node_types"] = torch.cat([node_types, pad], dim=0)
+        elif isinstance(node_types, list):
+            while len(node_types) < desired:
+                node_types.append(0)
+            graph_dict["node_types"] = node_types
+        elif desired > 0:
+            graph_dict["node_types"] = torch.zeros(desired, dtype=torch.long)
+
+        edge_index = graph_dict.get("edge_index")
+        if edge_index is None:
+            graph_dict["edge_index"] = torch.empty((2, 0), dtype=torch.long)
+
+        return len(node_attrs) - original_len
 
     def _prepare_decoded_graph_dict(self, graph_dict: dict | None) -> Tuple[int, List[Tuple[int, int]]]:
         if not graph_dict:
@@ -994,6 +1045,42 @@ class GuidedPopulation(Population):
             else:
                 decoded_graphs = decoded
             graph_dict = decoded_graphs[0]
+            min_nodes_required = self._minimum_required_node_count()
+            original_node_count = len(graph_dict.get("node_attributes") or [])
+            self._ensure_graph_node_capacity(graph_dict, min_nodes_required)
+            if original_node_count < min_nodes_required:
+                reason = "insufficient_node_count"
+                genome = genome_from_graph_dict(graph_dict, self.config.genome_config, key=i)
+                num_edges = len(genome.connections)
+                self._maybe_visualize_guided_invalid_graph(
+                    genome,
+                    graph_dict,
+                    reason=reason,
+                    child_index=i,
+                    num_edges=num_edges,
+                )
+                genome.graph_dict = graph_dict
+                penalty_details = {
+                    "required_nodes": min_nodes_required,
+                    "decoded_nodes": original_node_count,
+                }
+                self._assign_penalty(
+                    genome,
+                    reason=reason,
+                    skip_evaluation=True,
+                    penalty_details=penalty_details,
+                    graph_dict=graph_dict,
+                    record_decoder_failure=True,
+                )
+                self._buffer_decoder_replay_dict(graph_dict)
+                if last_valid_graph_dict is not None:
+                    self._buffer_decoder_replay_dict(last_valid_graph_dict)
+                invalid_reason_counts[reason] += 1
+                graph_signature = graph_signature_from_dict(graph_dict)
+                if graph_signature:
+                    seen_graph_signatures.add(graph_signature)
+                new_genomes.append(genome)
+                continue
             self._prepare_decoded_graph_dict(graph_dict)
             repaired = self._repair_graph_dict(graph_dict)
             repair_reason = graph_dict.get("_repair_failure_reason")
@@ -1356,6 +1443,41 @@ class GuidedPopulation(Population):
                 graph_dict[REPAIRED_GRAPH_DICT_KEY] = cloned
 
         node_count, edges = self._prepare_decoded_graph_dict(graph_dict)
+        configured_inputs = list(getattr(self.config.genome_config, "input_keys", []))
+        configured_outputs = list(getattr(self.config.genome_config, "output_keys", []))
+
+        def _extend_node_entries(amount: int) -> None:
+            if amount <= 0:
+                return
+            node_attrs = graph_dict.get("node_attributes") or []
+            if not isinstance(node_attrs, list):
+                node_attrs = list(node_attrs)
+            node_attrs.extend({} for _ in range(amount))
+            graph_dict["node_attributes"] = node_attrs
+            node_types = graph_dict.get("node_types")
+            if isinstance(node_types, torch.Tensor):
+                padding = torch.zeros(amount, dtype=node_types.dtype)
+                graph_dict["node_types"] = torch.cat([node_types, padding], dim=0)
+            elif isinstance(node_types, list):
+                node_types.extend([0] * amount)
+            elif node_types is None:
+                graph_dict["node_types"] = torch.zeros(amount, dtype=torch.long)
+
+        required_inputs = len(configured_inputs)
+        expected_input_slots = [order for order, _ in enumerate(configured_inputs)]
+        expected_output_slots = [int(ok) for ok in configured_outputs if isinstance(ok, (int, float))]
+        max_output_slot = max(expected_output_slots) if expected_output_slots else -1
+        minimum_nodes = node_count
+        if required_inputs > minimum_nodes:
+            minimum_nodes = required_inputs
+        if max_output_slot >= minimum_nodes:
+            minimum_nodes = max_output_slot + 1
+        if minimum_nodes <= 0:
+            minimum_nodes = 1
+        if minimum_nodes > node_count:
+            _extend_node_entries(minimum_nodes - node_count)
+            node_count = minimum_nodes
+
         if node_count <= 0:
             _record_repaired_graph_snapshot()
             return False
@@ -1363,8 +1485,9 @@ class GuidedPopulation(Population):
         adjacency_out = {idx: [] for idx in range(node_count)}
         adjacency_in = {idx: [] for idx in range(node_count)}
         for src, dst in edges:
-            adjacency_out[src].append(dst)
-            adjacency_in[dst].append(src)
+            if 0 <= src < node_count and 0 <= dst < node_count:
+                adjacency_out[src].append(dst)
+                adjacency_in[dst].append(src)
 
         normalized_attrs = self._normalize_node_attributes(graph_dict.get("node_attributes"), node_count)
 
@@ -1454,6 +1577,21 @@ class GuidedPopulation(Population):
             normalized_attrs[idx] = attrs
             return True
 
+        def _synthesize_pin_roles_from_slots() -> None:
+            for idx in range(len(normalized_attrs)):
+                slot = _node_pin_slot(idx)
+                if slot is None:
+                    continue
+                role = _node_pin_role(idx)
+                if slot in expected_input_slots and role != PIN_ROLE_INPUT:
+                    _assign_pin_role(idx, PIN_ROLE_INPUT)
+                    _assign_pin_slot(idx, slot)
+                elif slot in expected_output_slots and role != PIN_ROLE_OUTPUT:
+                    _assign_pin_role(idx, PIN_ROLE_OUTPUT)
+                    _assign_pin_slot(idx, slot)
+
+        _synthesize_pin_roles_from_slots()
+
         def _recompute_pin_nodes() -> Tuple[List[int], List[int]]:
             inputs = [idx for idx in range(len(normalized_attrs)) if _node_pin_role(idx) == PIN_ROLE_INPUT]
             outputs = [idx for idx in range(len(normalized_attrs)) if _node_pin_role(idx) == PIN_ROLE_OUTPUT]
@@ -1461,11 +1599,6 @@ class GuidedPopulation(Population):
             outputs.sort(key=lambda idx: (_node_pin_slot(idx) is None, _node_pin_slot(idx) or 0, idx))
             return inputs, outputs
 
-        configured_inputs = list(getattr(self.config.genome_config, "input_keys", []))
-        configured_outputs = list(getattr(self.config.genome_config, "output_keys", []))
-        required_inputs = len(configured_inputs)
-        expected_input_slots = [order for order, _ in enumerate(configured_inputs)]
-        expected_output_slots = [int(ok) for ok in configured_outputs if isinstance(ok, (int, float))]
         output_slot_set = {slot for slot in expected_output_slots if 0 <= slot < node_count}
 
         input_nodes, output_nodes = _recompute_pin_nodes()

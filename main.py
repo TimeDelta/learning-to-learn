@@ -16,6 +16,7 @@ import tempfile
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
+from warnings import warn
 
 import neat
 import torch
@@ -153,17 +154,85 @@ def create_initial_genome(config, optimizer):
     """
     Creates an initial genome that mirrors the structure of the provided TorchScript optimizer computation graph.
     """
+
+    def _register_node(node_key: int, ts_node: torch._C.Node | None) -> None:
+        new_node_gene = NodeGene(node_key, ts_node)
+        new_node_gene.init_attributes(config.genome_config)
+        if ts_node is not None:
+            _annotate_node_for_speciation(new_node_gene, ts_node)
+        genome.nodes[node_key] = new_node_gene
+
     genome = config.genome_type(0)
     genome.serialized_module = serialize_script_module(optimizer)
 
     node_mapping = {}  # from TorchScript nodes to genome node keys
+    graph_input_values = list(optimizer.graph.inputs())
+    graph_inputs = {val.node() for val in graph_input_values}
+
+    configured_input_keys = list(getattr(config.genome_config, "input_keys", []))
+    configured_output_keys = list(getattr(config.genome_config, "output_keys", []))
+
+    user_arg_nodes: List[torch._C.Node] = []
+    for value in graph_input_values:
+        ts_node = value.node()
+        if ts_node is None:
+            continue
+        try:
+            type_repr = str(value.type())
+        except RuntimeError:
+            type_repr = ""
+        if type_repr.startswith("__torch__.") and value.debugName() == "self":
+            # Skip the implicit module "self" argument.
+            continue
+        user_arg_nodes.append(ts_node)
+        if len(user_arg_nodes) >= len(configured_input_keys):
+            break
+
+    if len(user_arg_nodes) < len(configured_input_keys):
+        warn(
+            "TorchScript graph exposes fewer inputs than configured; missing pin roles may persist "
+            f"({len(user_arg_nodes)} found vs {len(configured_input_keys)} expected)."
+        )
+
+    for pin_key, ts_node in zip(configured_input_keys, user_arg_nodes):
+        try:
+            key = int(pin_key)
+        except (TypeError, ValueError):
+            continue
+        _register_node(key, ts_node)
+        node_mapping[ts_node] = key
+
+    graph_nodes = list(optimizer.graph.nodes())
+    output_producers: List[torch._C.Node] = []
+    for value in optimizer.graph.outputs():
+        producer = value.node()
+        if producer is not None:
+            output_producers.append(producer)
+        if len(output_producers) >= len(configured_output_keys):
+            break
+    if len(output_producers) < len(configured_output_keys):
+        warn(
+            "TorchScript graph exposes fewer outputs than configured; missing output pin labels may persist "
+            f"({len(output_producers)} found vs {len(configured_output_keys)} expected)."
+        )
+    for pin_key, producer in zip(configured_output_keys, output_producers):
+        try:
+            key = int(pin_key)
+        except (TypeError, ValueError):
+            continue
+        if producer in node_mapping:
+            # Already registered via inputs (unexpected) or duplicates; skip.
+            continue
+        _register_node(key, producer)
+        node_mapping[producer] = key
+
     next_node_id = 0
-    graph_inputs = {val.node() for val in optimizer.graph.inputs()}
-    for node in optimizer.graph.nodes():
-        new_node_gene = NodeGene(next_node_id, node)
-        new_node_gene.init_attributes(config.genome_config)
-        _annotate_node_for_speciation(new_node_gene, node)
-        genome.nodes[next_node_id] = new_node_gene
+    for node in graph_nodes:
+        if node in node_mapping:
+            continue
+        while next_node_id in genome.nodes:
+            next_node_id += 1
+        _register_node(next_node_id, node)
         node_mapping[node] = next_node_id
         next_node_id += 1
 
