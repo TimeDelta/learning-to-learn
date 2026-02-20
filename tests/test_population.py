@@ -626,7 +626,7 @@ def test_repair_synthesizes_pin_roles_when_labels_missing():
     node_count = max(max_output_slot + 1, num_inputs + len(output_slots) + 1, 1)
     graph = _make_empty_graph_dict(node_count, [{} for _ in range(node_count)])
 
-    assert pop._repair_graph_dict(graph)
+    pop._repair_graph_dict(graph)
     attrs = graph["node_attributes"]
     input_count = sum(1 for attr in attrs if attr.get("pin_role") == "input")
     output_count = sum(1 for attr in attrs if attr.get("pin_role") == "output")
@@ -685,10 +685,42 @@ def test_repair_reports_missing_output_slots_when_nodes_absent():
     node_attrs = [{} for _ in range(node_count)]
     graph = _make_empty_graph_dict(len(node_attrs), node_attrs)
 
-    assert not pop._repair_graph_dict(graph)
-    assert graph["_repair_failure_reason"] == "missing_output_slots"
-    details = graph["_repair_failure_details"]
-    assert missing_slot in details["missing_slots"]
+    assert pop._repair_graph_dict(graph)
+    assert graph.get("_repair_failure_reason") is None
+    outputs = {attr.get("pin_slot_index") for attr in graph["node_attributes"] if attr.get("pin_role") == "output"}
+    assert {0, missing_slot}.issubset(outputs)
+
+
+def test_repair_allows_locked_outputs_sharing_input_slots():
+    config = make_config()
+    required_inputs = len(config.genome_config.input_keys)
+    if required_inputs == 0:
+        pytest.skip("config does not require input slots")
+    config.genome_config.output_keys = [0]
+    pop = GuidedPopulation(config)
+    node_attrs = []
+    for slot in range(required_inputs):
+        node_attrs.append(
+            {
+                "pin_role": "input",
+                "pin_slot_index": slot,
+                "_pin_role_locked": True,
+                "_pin_slot_locked": True,
+            }
+        )
+    node_attrs.append(
+        {
+            "pin_role": "output",
+            "pin_slot_index": 0,
+            "_pin_role_locked": True,
+            "_pin_slot_locked": True,
+        }
+    )
+    graph = _make_empty_graph_dict(len(node_attrs), node_attrs)
+
+    pop._repair_graph_dict(graph)
+    assert graph.get("_repair_failure_reason") is None
+    assert graph.get("_repair_failure_details") is None
 
 
 def test_repair_connects_hidden_nodes_to_inputs_and_outputs():
@@ -792,6 +824,49 @@ def test_repair_preserves_predicted_edges_for_visualization():
     # ensure decoded snapshot did not receive synthesized pin_role attributes
     original_attrs = decoded["node_attributes"]
     assert all("pin_role" not in attrs for attrs in original_attrs)
+
+
+def test_output_slot_coverage_accepts_metadata_slots():
+    config = make_config()
+    pop = GuidedPopulation(config)
+    node_attrs = [
+        {"pin_role": "input", "pin_slot_index": 0},
+        {"pin_role": "input", "pin_slot_index": 1},
+        {"pin_role": "input", "pin_slot_index": 2},
+        {"pin_role": "output", "pin_slot_index": 0},
+    ]
+    graph = {
+        "node_types": torch.tensor([0, 1, 2, 3], dtype=torch.long),
+        "edge_index": torch.tensor([[1, 2], [3, 3]], dtype=torch.long),
+        "node_attributes": node_attrs,
+    }
+
+    ok, details = pop._graph_output_slot_coverage(graph)
+
+    assert ok, f"coverage should succeed, details={details}"
+    assert details["missing_slots"] == []
+    assert details["wrong_type_slots"] == []
+
+
+def test_output_slot_coverage_requires_incoming_edges():
+    config = make_config()
+    pop = GuidedPopulation(config)
+    node_attrs = [
+        {"pin_role": "input", "pin_slot_index": 0},
+        {"pin_role": "input", "pin_slot_index": 1},
+        {"pin_role": "input", "pin_slot_index": 2},
+        {"pin_role": "output", "pin_slot_index": 0},
+    ]
+    graph = {
+        "node_types": torch.tensor([0, 1, 2, 3], dtype=torch.long),
+        "edge_index": torch.tensor([[0, 1], [1, 2]], dtype=torch.long),
+        "node_attributes": node_attrs,
+    }
+
+    ok, details = pop._graph_output_slot_coverage(graph)
+
+    assert not ok
+    assert details["missing_slots"] == [0]
 
 
 def test_prepare_decoded_graph_strips_invalid_edges():

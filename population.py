@@ -138,6 +138,7 @@ class GuidedPopulation(Population):
             graph_encoder.pin_role_embedding,
             min_pin_nodes=decoder_min_pin_nodes,
             required_input_count=len(configured_inputs),
+            required_output_slots=output_slots,
         )
         icnn_hidden_dims = getattr(config, "latent_icnn_hidden_dims", (64, 32))
         if isinstance(icnn_hidden_dims, str):
@@ -1352,42 +1353,62 @@ class GuidedPopulation(Population):
             details = {"missing_slots": output_keys, "attributes": {}, "referenced_slots": []}
             return False, details
 
-        referenced = set()
+        referenced_nodes = set()
         if edge_tensor.numel() > 0:
-            referenced.update(int(v) for v in edge_tensor[1].flatten().tolist())
+            referenced_nodes.update(int(v) for v in edge_tensor[1].flatten().tolist())
 
-        missing = [int(ok) for ok in output_keys if int(ok) not in referenced]
         node_attrs = graph_dict.get("node_attributes") or []
+        slot_to_outputs: Dict[int, List[int]] = {}
+        slot_misfits: Dict[int, List[int]] = {}
+        for idx in range(len(node_attrs)):
+            attrs = node_attrs[idx] or {}
+            slot_val = attrs.get("pin_slot_index")
+            try:
+                slot = int(slot_val)
+            except (TypeError, ValueError):
+                continue
+            role = self._decode_pin_role_value(attrs.get("pin_role"))
+            if role is None and isinstance(attrs.get("node_type"), str):
+                role = _normalize_pin_role(attrs.get("node_type"))
+            if role == PIN_ROLE_OUTPUT:
+                slot_to_outputs.setdefault(slot, []).append(idx)
+            else:
+                slot_misfits.setdefault(slot, []).append(idx)
+
+        missing_slots: List[int] = []
         wrong_type_slots: List[int] = []
         for raw_slot in output_keys:
-            slot = int(raw_slot)
-            if 0 <= slot < len(node_attrs):
-                attrs = node_attrs[slot] or {}
-                role = self._decode_pin_role_value(attrs.get("pin_role"))
-                if role is None and isinstance(attrs.get("node_type"), str):
-                    role = _normalize_pin_role(attrs.get("node_type"))
-                if role is not None and role != PIN_ROLE_OUTPUT:
+            try:
+                slot = int(raw_slot)
+            except (TypeError, ValueError):
+                continue
+            nodes = slot_to_outputs.get(slot, [])
+            if not nodes:
+                if slot in slot_misfits:
                     wrong_type_slots.append(slot)
-        combined_missing = sorted(set(missing) | set(wrong_type_slots))
-        attr_lookup = {}
-        for slot in combined_missing:
-            if 0 <= slot < len(node_attrs):
-                attrs = node_attrs[slot] or {}
-                if isinstance(attrs, dict):
-                    names = sorted(attribute_key_to_name(name) for name in attrs.keys())
                 else:
-                    names = []
-            else:
-                names = []
-            attr_lookup[slot] = names
+                    missing_slots.append(slot)
+                continue
+            if not any(node in referenced_nodes for node in nodes):
+                missing_slots.append(slot)
+
+        combined_missing = sorted(set(missing_slots))
+        attr_lookup: Dict[int, List[str]] = {}
+        for slot in combined_missing + sorted(set(wrong_type_slots)):
+            names: List[str] = []
+            for idx in slot_to_outputs.get(slot, []) + slot_misfits.get(slot, []):
+                attrs = node_attrs[idx] or {}
+                if isinstance(attrs, dict):
+                    names.extend(attribute_key_to_name(name) for name in attrs.keys())
+            attr_lookup[slot] = sorted(set(names))
 
         details = {
             "missing_slots": combined_missing,
             "attributes": attr_lookup,
-            "referenced_slots": sorted(referenced),
-            "wrong_type_slots": sorted(wrong_type_slots),
+            "referenced_slots": sorted(referenced_nodes),
+            "wrong_type_slots": sorted(set(wrong_type_slots)),
         }
-        return len(combined_missing) == 0, details
+        return len(combined_missing) == 0 and not wrong_type_slots, details
 
     @staticmethod
     def _edge_list_from_index(edge_index, node_count: int) -> List[Tuple[int, int]]:
@@ -1483,12 +1504,7 @@ class GuidedPopulation(Population):
         required_inputs = len(configured_inputs)
         expected_input_slots = [order for order, _ in enumerate(configured_inputs)]
         expected_output_slots = [int(ok) for ok in configured_outputs if isinstance(ok, (int, float))]
-        max_output_slot = max(expected_output_slots) if expected_output_slots else -1
-        minimum_nodes = node_count
-        if required_inputs > minimum_nodes:
-            minimum_nodes = required_inputs
-        if max_output_slot >= minimum_nodes:
-            minimum_nodes = max_output_slot + 1
+        minimum_nodes = max(node_count, self._minimum_required_node_count())
         if minimum_nodes <= 0:
             minimum_nodes = 1
         if minimum_nodes > node_count:
@@ -1508,6 +1524,18 @@ class GuidedPopulation(Population):
 
         normalized_attrs = self._normalize_node_attributes(graph_dict.get("node_attributes"), node_count)
 
+        def _grow_nodes(amount: int) -> None:
+            nonlocal node_count
+            if amount <= 0:
+                return
+            start = node_count
+            _extend_node_entries(amount)
+            node_count += amount
+            for idx in range(start, node_count):
+                adjacency_out[idx] = []
+                adjacency_in[idx] = []
+                normalized_attrs.append({})
+
         def _candidate_order(indices: Sequence[int], *, key=None, reverse: bool = False) -> List[int]:
             seq = list(indices)
             if self.repair_randomize_connections and len(seq) > 1:
@@ -1524,6 +1552,30 @@ class GuidedPopulation(Population):
             if self.repair_randomize_connections and len(seq) > 1:
                 self._repair_rng.shuffle(seq)
             return seq
+
+        def _flag_enabled(value: Any) -> bool:
+            """Interpret decoder-emitted attributes that may be tensors or scalars."""
+            if value is None:
+                return False
+            if isinstance(value, bool):
+                return value
+            if torch.is_tensor(value):
+                if value.numel() == 0:
+                    return False
+                try:
+                    scalar = value.detach().cpu().view(-1)[0].item()
+                except Exception:
+                    return False
+                return bool(scalar)
+            if isinstance(value, (int, float)):
+                return bool(value)
+            if isinstance(value, str):
+                lowered = value.strip().lower()
+                if lowered in {"false", "0", "no", "off"}:
+                    return False
+                if lowered in {"true", "1", "yes", "on"}:
+                    return True
+            return bool(value)
 
         def _node_pin_role(idx: int) -> str | None:
             if idx < 0 or idx >= len(normalized_attrs):
@@ -1570,10 +1622,8 @@ class GuidedPopulation(Population):
                 return False
             attrs = dict(normalized_attrs[idx] or {})
             current = _normalize_pin_role(attrs.get("pin_role"))
-            if attrs.get("_pin_role_locked"):
-                if current == role:
-                    return False
-                return False
+            if _flag_enabled(attrs.get("_pin_role_locked")):
+                return current == role
             if current == role:
                 return False
             attrs["pin_role"] = role
@@ -1585,10 +1635,8 @@ class GuidedPopulation(Population):
                 return False
             attrs = dict(normalized_attrs[idx] or {})
             current = _node_pin_slot(idx)
-            if attrs.get("_pin_slot_locked"):
-                if current == slot:
-                    return False
-                return False
+            if _flag_enabled(attrs.get("_pin_slot_locked")):
+                return current == slot
             if slot is None:
                 if "pin_slot_index" in attrs:
                     attrs.pop("pin_slot_index", None)
@@ -1624,9 +1672,21 @@ class GuidedPopulation(Population):
             outputs.sort(key=lambda idx: (_node_pin_slot(idx) is None, _node_pin_slot(idx) or 0, idx))
             return inputs, outputs
 
-        output_slot_set = {slot for slot in expected_output_slots if 0 <= slot < node_count}
-
         input_nodes, output_nodes = _recompute_pin_nodes()
+
+        def _output_slot_coverage() -> Dict[int, int]:
+            coverage: Dict[int, int] = {}
+            for idx in range(len(normalized_attrs)):
+                if _node_pin_role(idx) != PIN_ROLE_OUTPUT:
+                    continue
+                slot = _node_pin_slot(idx)
+                if slot is None:
+                    continue
+                slot = int(slot)
+                if slot not in expected_output_slots:
+                    continue
+                coverage.setdefault(slot, idx)
+            return coverage
 
         def _input_slot_state() -> Tuple[Dict[int, int], List[int], List[int], List[int], List[int]]:
             slot_to_node: Dict[int, int] = {}
@@ -1637,23 +1697,39 @@ class GuidedPopulation(Population):
 
             for idx in input_nodes:
                 slot = _node_pin_slot(idx)
+                attrs = normalized_attrs[idx] or {}
                 if slot is None or slot not in expected_input_slots:
                     flexible_inputs.append(idx)
                     continue
                 slot = int(slot)
                 if slot in slot_to_node:
-                    duplicate_slots.append(slot)
-                    flexible_inputs.append(idx)
-                else:
-                    slot_to_node[slot] = idx
+                    if not _flag_enabled(attrs.get("_pin_slot_locked")):
+                        duplicate_slots.append(slot)
+                        _assign_pin_slot(idx, None)
+                        flexible_inputs.append(idx)
+                    continue
+                slot_to_node[slot] = idx
 
             for idx in range(node_count):
                 slot = _node_pin_slot(idx)
                 if slot is None or slot not in expected_input_slots:
                     continue
                 role = _node_pin_role(idx)
+                attrs = normalized_attrs[idx] or {}
                 if role != PIN_ROLE_INPUT:
-                    wrong_role_slots.append(int(slot))
+                    if role == PIN_ROLE_OUTPUT:
+                        continue
+                    if _flag_enabled(attrs.get("_pin_slot_locked")) or _flag_enabled(attrs.get("_pin_role_locked")):
+                        if int(slot) not in slot_to_node:
+                            wrong_role_slots.append(int(slot))
+                    else:
+                        _assign_pin_slot(idx, None)
+                        if _normalize_pin_role(attrs.get("pin_role")) == PIN_ROLE_INPUT and not _flag_enabled(
+                            attrs.get("_pin_role_locked")
+                        ):
+                            attrs.pop("pin_role", None)
+                    continue
+                slot_to_node[int(slot)] = idx
 
             missing_slots = [slot for slot in expected_input_slots if slot not in slot_to_node]
             return slot_to_node, missing_slots, wrong_role_slots, flexible_inputs, duplicate_slots
@@ -1729,8 +1805,6 @@ class GuidedPopulation(Population):
             for idx in candidate_order:
                 if not missing_slots:
                     break
-                if idx in output_slot_set:
-                    continue
                 role = _node_pin_role(idx)
                 if role == PIN_ROLE_OUTPUT:
                     continue
@@ -1743,15 +1817,40 @@ class GuidedPopulation(Population):
 
         def _apply_output_fallback() -> None:
             nonlocal input_nodes, output_nodes
-            if not expected_output_slots or len(output_nodes) >= len(expected_output_slots):
+            if not expected_output_slots:
                 return
-            # First ensure configured slots receive explicit roles when possible.
-            for slot in sorted(output_slot_set):
-                if 0 <= slot < node_count:
-                    _assign_pin_role(slot, PIN_ROLE_OUTPUT)
-            input_nodes, output_nodes = _recompute_pin_nodes()
-            if len(output_nodes) >= len(expected_output_slots):
+
+            def _mark_output(idx: int, slot: int | None) -> None:
+                _assign_pin_role(idx, PIN_ROLE_OUTPUT)
+                if slot is not None:
+                    _assign_pin_slot(idx, slot)
+
+            slot_to_node = _output_slot_coverage()
+            missing_slots = sorted(dict.fromkeys(slot for slot in expected_output_slots if slot not in slot_to_node))
+            if not missing_slots:
                 return
+
+            reserved_inputs = set(input_nodes)
+
+            # Reuse nodes already claiming a slot when they are mutable.
+            for idx in range(node_count):
+                if not missing_slots:
+                    break
+                slot = _node_pin_slot(idx)
+                if slot is None or slot not in missing_slots:
+                    continue
+                if idx in reserved_inputs:
+                    continue
+                attrs = normalized_attrs[idx] or {}
+                if _flag_enabled(attrs.get("_pin_role_locked")) or _flag_enabled(attrs.get("_pin_slot_locked")):
+                    continue
+                _mark_output(idx, slot)
+                missing_slots.remove(slot)
+
+            if not missing_slots:
+                input_nodes, output_nodes = _recompute_pin_nodes()
+                return
+
             candidate_order = _candidate_order(
                 range(node_count),
                 key=lambda idx: (
@@ -1761,16 +1860,31 @@ class GuidedPopulation(Population):
                     -idx,
                 ),
             )
-            reserved_inputs = set(input_nodes)
+
             for idx in candidate_order:
-                if len(output_nodes) >= len(expected_output_slots):
+                if not missing_slots:
                     break
-                if idx in output_slot_set or idx in reserved_inputs:
+                if idx in reserved_inputs:
                     continue
-                role = _node_pin_role(idx)
-                if role == PIN_ROLE_OUTPUT:
+                attrs = normalized_attrs[idx] or {}
+                if _flag_enabled(attrs.get("_pin_role_locked")):
                     continue
-                _assign_pin_role(idx, PIN_ROLE_OUTPUT)
+                slot = _consume_slot(missing_slots)
+                if slot is None:
+                    break
+                _mark_output(idx, slot)
+
+            input_nodes, output_nodes = _recompute_pin_nodes()
+
+            if missing_slots:
+                additional = len(missing_slots)
+                start_idx = node_count
+                _grow_nodes(additional)
+                new_idx = start_idx
+                for slot in missing_slots:
+                    _mark_output(new_idx, slot)
+                    new_idx += 1
+                missing_slots.clear()
                 input_nodes, output_nodes = _recompute_pin_nodes()
 
         if required_inputs:
@@ -1797,40 +1911,50 @@ class GuidedPopulation(Population):
                 "missing_slots": [int(slot) for slot in missing_slots],
                 "wrong_role_slots": [int(slot) for slot in wrong_role_slots],
                 "duplicate_slots": sorted(set(int(slot) for slot in duplicate_slots)),
+                "slot_to_node": {int(k): int(v) for k, v in slot_state[0].items()},
+                "input_nodes": [int(idx) for idx in input_nodes],
             }
+            logger.warning(
+                "Missing input slots detected; first attrs=%s",
+                normalized_attrs[: min(len(normalized_attrs), max(1, required_inputs + 1))],
+            )
+            logger.warning(graph_dict)
             _record_repaired_graph_snapshot()
             return False
 
-        if configured_outputs and len(output_nodes) < len(expected_output_slots):
+        if configured_outputs:
+            coverage = _output_slot_coverage()
             missing_slots: List[int] = []
             wrong_type_slots: List[int] = []
             for slot in expected_output_slots:
-                if slot in output_nodes:
+                slot_int = int(slot)
+                if slot_int in coverage:
                     continue
-                if slot < 0 or slot >= node_count:
-                    missing_slots.append(int(slot))
-                    continue
-                role = _node_pin_role(slot)
-                if role is None:
-                    missing_slots.append(int(slot))
-                elif role != PIN_ROLE_OUTPUT:
-                    wrong_type_slots.append(int(slot))
-            graph_dict["node_attributes"] = normalized_attrs
-            graph_dict["_repair_failure_reason"] = "missing_output_slots"
-            graph_dict["_repair_failure_details"] = {
-                "total_slots": len(expected_output_slots),
-                "missing_count": len(missing_slots) + len(wrong_type_slots),
-                "missing_slots": missing_slots,
-                "wrong_type_slots": wrong_type_slots,
-            }
-            _record_repaired_graph_snapshot()
-            return False
+                claimants = [idx for idx in range(node_count) if _node_pin_slot(idx) == slot_int]
+                if not claimants:
+                    missing_slots.append(slot_int)
+                else:
+                    wrong_type_slots.append(slot_int)
+            if missing_slots or wrong_type_slots:
+                graph_dict["node_attributes"] = normalized_attrs
+                graph_dict["_repair_failure_reason"] = "missing_output_slots"
+                graph_dict["_repair_failure_details"] = {
+                    "total_slots": len(expected_output_slots),
+                    "missing_count": len(missing_slots) + len(wrong_type_slots),
+                    "missing_slots": missing_slots,
+                    "wrong_type_slots": wrong_type_slots,
+                }
+                _record_repaired_graph_snapshot()
+                return False
 
         if not input_nodes:
             input_nodes = list(range(min(2, node_count))) or [0]
         if not output_nodes:
-            valid_outputs = [slot for slot in output_slot_set]
-            output_nodes = valid_outputs or [node_count - 1]
+            coverage = _output_slot_coverage()
+            if coverage:
+                output_nodes = list(coverage.values())
+            else:
+                output_nodes = [node_count - 1]
 
         hidden_nodes = [idx for idx in range(node_count) if idx not in input_nodes and idx not in output_nodes]
         output_set = set(output_nodes)
@@ -1938,42 +2062,39 @@ class GuidedPopulation(Population):
                         queue.append(src)
             return reachable_outputs
 
-        if not hidden_nodes:
-            return
-        fallback_sources = input_nodes or list(range(node_count))
-        if not fallback_sources:
-            fallback_sources = [0]
-        for hidden in hidden_nodes:
-            if hidden in reachable:
-                continue
-            sources = [src for src in reachable if src != hidden]
-            if not sources:
-                sources = fallback_sources
-            ordered_sources = _candidate_order(sources, key=lambda idx: (len(adjacency_out[idx]), idx))
-            for src in ordered_sources:
-                if src == hidden:
+        if hidden_nodes:
+            fallback_sources = input_nodes or list(range(node_count))
+            if not fallback_sources:
+                fallback_sources = [0]
+            for hidden in hidden_nodes:
+                if hidden in reachable:
                     continue
-                if add_edge(src, hidden):
-                    reachable = reachable_nodes()
-                    break
+                sources = [src for src in reachable if src != hidden]
+                if not sources:
+                    sources = fallback_sources
+                ordered_sources = _candidate_order(sources, key=lambda idx: (len(adjacency_out[idx]), idx))
+                for src in ordered_sources:
+                    if src == hidden:
+                        continue
+                    if add_edge(src, hidden):
+                        reachable = reachable_nodes()
+                        break
 
-        if not hidden_nodes:
-            return
-        reverse_reachable = nodes_reaching_outputs()
-        fallback_targets = output_nodes or list(range(node_count)) or [0]
-        for hidden in hidden_nodes:
-            if hidden in reverse_reachable:
-                continue
-            targets = [dst for dst in reverse_reachable if dst != hidden]
-            if not targets:
-                targets = fallback_targets
-            ordered_targets = _candidate_order(targets, key=lambda idx: (len(adjacency_in[idx]), idx))
-            for dst in ordered_targets:
-                if dst == hidden:
+            reverse_reachable = nodes_reaching_outputs()
+            fallback_targets = output_nodes or list(range(node_count)) or [0]
+            for hidden in hidden_nodes:
+                if hidden in reverse_reachable:
                     continue
-                if add_edge(hidden, dst):
-                    reverse_reachable = nodes_reaching_outputs()
-                    break
+                targets = [dst for dst in reverse_reachable if dst != hidden]
+                if not targets:
+                    targets = fallback_targets
+                ordered_targets = _candidate_order(targets, key=lambda idx: (len(adjacency_in[idx]), idx))
+                for dst in ordered_targets:
+                    if dst == hidden:
+                        continue
+                    if add_edge(hidden, dst):
+                        reverse_reachable = nodes_reaching_outputs()
+                        break
 
         graph_dict["node_attributes"] = normalized_attrs
 
@@ -1990,7 +2111,7 @@ class GuidedPopulation(Population):
             tensor = torch.empty((2, 0), dtype=torch.long)
         graph_dict["edge_index"] = tensor
         _record_repaired_graph_snapshot()
-        return bool(edges)
+        return True if len(edges) > 0 else False
 
     def _optimizer_updates_parameters(self, optimizer, check_steps=2, delta_eps=1e-12):
         """Run a short dry-run to ensure the optimizer changes model weights."""

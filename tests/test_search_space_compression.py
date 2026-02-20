@@ -257,3 +257,27 @@ def test_graph_decoder_seeds_input_pin_roles():
     assert attrs[0]["pin_slot_index"] == 0
     assert attrs[1]["pin_role"] == "input"
     assert attrs[1]["pin_slot_index"] == 1
+
+
+def test_graph_decoder_seeds_output_pin_roles():
+    vocab = SharedAttributeVocab([], embedding_dim=4)
+    decoder = GraphDecoder(
+        num_node_types=3,
+        latent_dim=8,
+        shared_attr_vocab=vocab,
+        hidden_dim=4,
+        min_pin_nodes=5,
+        required_input_count=2,
+        required_output_slots=[0, 3],
+    )
+    decoder.eval()
+
+    with torch.no_grad():
+        decoder.stop_head.weight.zero_()
+        decoder.stop_head.bias.fill_(20.0)
+
+    latent = torch.zeros(1, decoder.latent_dim)
+    graph = decoder(latent)[0]
+    outputs = [attrs for attrs in graph["node_attributes"] if attrs.get("pin_role") == "output"]
+    assert any(attr.get("pin_slot_index") == 0 for attr in outputs)
+    assert any(attr.get("pin_slot_index") == 3 for attr in outputs)

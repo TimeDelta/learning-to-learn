@@ -846,6 +846,7 @@ class GraphDecoder(nn.Module):
         max_edges_per_graph: int = 4096,
         min_pin_nodes: int | None = None,
         required_input_count: int | None = None,
+        required_output_slots: Sequence[int] | None = None,
     ):
         super().__init__()
         self.shared_attr_vocab = shared_attr_vocab
@@ -893,6 +894,16 @@ class GraphDecoder(nn.Module):
                 self.required_input_count = max(0, int(required_input_count))
             except (TypeError, ValueError):
                 self.required_input_count = 0
+        self.required_output_slots: List[int] = []
+        if required_output_slots:
+            for slot in required_output_slots:
+                try:
+                    slot_int = int(slot)
+                except (TypeError, ValueError):
+                    continue
+                if slot_int < 0:
+                    continue
+                self.required_output_slots.append(slot_int)
         # Encourage attribute decoder to terminate by progressively biasing the EOS logit.
         self.attr_eos_bias_base = 0.0
         self.attr_eos_bias_slope = 0.1
@@ -1032,6 +1043,9 @@ class GraphDecoder(nn.Module):
                     teacher_force_nodes = self.training and (target_node_count is not None)
                     forced_pin_roles: List[str | None] = []
                     forced_pin_slots: List[int | None] = []
+                    forced_role_locked: List[bool] = []
+                    forced_slot_locked: List[bool] = []
+                    output_slot_index = 0
                     with torch.autograd.profiler.record_function("GraphDecoder.node_loop"):
                         while True:
                             logger.debug(f"Decoding node {t}")
@@ -1084,11 +1098,23 @@ class GraphDecoder(nn.Module):
                             node_index = t
                             forced_role = None
                             forced_slot = None
+                            role_locked = False
+                            slot_locked = False
                             if self.required_input_count and node_index < self.required_input_count:
                                 forced_role = PIN_ROLE_INPUT
                                 forced_slot = node_index
+                                role_locked = True
+                                slot_locked = True
+                            elif output_slot_index < len(self.required_output_slots):
+                                forced_role = PIN_ROLE_OUTPUT
+                                forced_slot = self.required_output_slots[output_slot_index]
+                                role_locked = True
+                                slot_locked = True
+                                output_slot_index += 1
                             forced_pin_roles.append(forced_role)
                             forced_pin_slots.append(forced_slot)
+                            forced_role_locked.append(role_locked)
+                            forced_slot_locked.append(slot_locked)
                             hidden_edge = hidden_node
                             edge_in = torch.zeros(1, 1, device=device)
                             node_edge_budget = 0
@@ -1182,10 +1208,14 @@ class GraphDecoder(nn.Module):
                 target_pin_role = None
                 forced_role = None
                 forced_slot = None
+                role_locked = False
+                slot_locked = False
                 if node_idx < len(forced_pin_roles):
                     forced_role = forced_pin_roles[node_idx]
+                    role_locked = forced_role_locked[node_idx]
                 if node_idx < len(forced_pin_slots):
                     forced_slot = forced_pin_slots[node_idx]
+                    slot_locked = forced_slot_locked[node_idx]
                 if self.pin_role_head is not None:
                     pin_role_vec = self.pin_role_head(embedding)
                     decoded_role = self._infer_pin_role(pin_role_vec, pin_role_reference)
@@ -1202,7 +1232,7 @@ class GraphDecoder(nn.Module):
                 locked_role = False
                 if forced_role is not None:
                     decoded_role = forced_role
-                    locked_role = True
+                    locked_role = role_locked or locked_role
                 if decoded_role is not None:
                     attrs["pin_role"] = decoded_role
                     if locked_role:
@@ -1221,7 +1251,7 @@ class GraphDecoder(nn.Module):
                 locked_slot = False
                 if forced_slot is not None:
                     slot_attr = forced_slot
-                    locked_slot = True
+                    locked_slot = slot_locked or locked_slot
                 elif slot_scalar is not None:
                     slot_value = float(slot_scalar.detach().item())
                     slot_attr = max(0, int(round(abs(slot_value)) - 1))
