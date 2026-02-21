@@ -225,6 +225,7 @@ class GuidedPopulation(Population):
         self._decoder_replay_signatures: Set[str] = set()
         # reservoir keeps the most recent valid graphs to reseed future replay passes
         self._decoder_replay_reservoir: deque[tuple[str | None, dict]] = deque(maxlen=self.decoder_replay_max)
+        self._decoder_replay_seeded = False
         raw_repair_seed = getattr(config, "repair_random_seed", None)
         try:
             repair_seed = int(raw_repair_seed) if raw_repair_seed is not None else None
@@ -441,6 +442,25 @@ class GuidedPopulation(Population):
             if len(self._decoder_replay_reservoir) >= self.decoder_replay_max:
                 self._decoder_replay_reservoir.popleft()
             self._decoder_replay_reservoir.append((signature, cloned))
+
+    def _seed_decoder_replay_from_population(self) -> int:
+        """Populate decoder replay buffers with the current population graphs once."""
+        if self._decoder_replay_seeded or self.decoder_replay_max <= 0:
+            return 0
+        seeded = 0
+        for genome in self.population.values():
+            graph_dict = getattr(genome, "graph_dict", None)
+            if graph_dict is None:
+                self.genome_to_data(genome)
+                graph_dict = getattr(genome, "graph_dict", None)
+            if not graph_dict:
+                continue
+            self._buffer_decoder_replay_dict(graph_dict)
+            seeded += 1
+        if seeded:
+            self.reporters.info(f"Seeded decoder replay with {seeded} initial population graphs")
+        self._decoder_replay_seeded = True
+        return seeded
 
     def _record_decoder_failure(
         self,
@@ -2177,6 +2197,8 @@ class GuidedPopulation(Population):
         while n is None or self.generation < n:
             self.reporters.start_generation(self.generation)
             self._reset_guided_offspring_stats()
+            if not self._decoder_replay_seeded:
+                self._seed_decoder_replay_from_population()
 
             # Evaluate real fitness. Using too few update steps makes every optimizer look identical,
             # so clamp to a minimum to expose behavioral differences early in the run.
