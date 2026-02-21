@@ -125,7 +125,6 @@ class NodeGene(BaseGene):
                 attr = FloatAttribute(generate_random_string(5))
             else:
                 attr = StringAttribute(generate_random_string(5), options=list(ATTRIBUTE_NAMES))
-            print(attr)
             self.add_attribute(attr, config)
 
         if len(self.dynamic_attributes) > 0 and random.random() < config.attribute_delete_prob:
