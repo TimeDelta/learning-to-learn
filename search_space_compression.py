@@ -593,10 +593,21 @@ class NodeAttributeDeepSetEncoder(nn.Module):
     See "Deep Sets" by Zaheer et al. at https://arxiv.org/abs/1703.06114
     """
 
-    def __init__(self, shared_attr_vocab: SharedAttributeVocab, encoder_hdim: int, aggregator_hdim: int, out_dim: int):
+    def __init__(
+        self,
+        shared_attr_vocab: SharedAttributeVocab,
+        encoder_hdim: int,
+        aggregator_hdim: int,
+        out_dim: int,
+        *,
+        max_value_dim: int | None = None,
+    ):
         super().__init__()
         self.shared_attr_vocab = shared_attr_vocab
-        self.max_value_dim = shared_attr_vocab.embedding.embedding_dim
+        value_dim = max_value_dim or shared_attr_vocab.embedding.embedding_dim
+        if value_dim <= 0:
+            raise ValueError("max_value_dim must be positive")
+        self.max_value_dim = int(value_dim)
         self.attr_encoder = nn.Sequential(  # phi
             nn.Linear(shared_attr_vocab.embedding.embedding_dim + self.max_value_dim, encoder_hdim),
             nn.ReLU(),
@@ -847,6 +858,7 @@ class GraphDecoder(nn.Module):
         min_pin_nodes: int | None = None,
         required_input_count: int | None = None,
         required_output_slots: Sequence[int] | None = None,
+        max_attr_value_dim: int = 64,
     ):
         super().__init__()
         self.shared_attr_vocab = shared_attr_vocab
@@ -877,6 +889,7 @@ class GraphDecoder(nn.Module):
         self.gdns = nn.ModuleList([GraphDeconvNet(hidden_dim, hidden_dim) for _ in range(gdn_layers)])
         self.max_nodes = 1000
         self.max_attributes_per_node = 50
+        self.max_attr_value_dim = max(1, int(max_attr_value_dim))
         self.edge_threshold = edge_threshold
         self.max_edges_per_node = max(1, int(max_edges_per_node))
         self.max_edges_per_graph = max(1, int(max_edges_per_graph))
@@ -1282,9 +1295,9 @@ class GraphDecoder(nn.Module):
                     raw_dim = self.attr_dims_head(embedding).squeeze()
                     raw_dim = torch.nan_to_num(raw_dim, nan=0.0, posinf=20.0, neginf=-20.0)
                     dim_val = F.softplus(raw_dim)
-                    dim_val = torch.nan_to_num(dim_val, nan=1.0, posinf=float(self.max_attributes_per_node), neginf=1.0)
-                    attr_dims = int(torch.clamp(dim_val, min=1.0, max=float(self.max_attributes_per_node)).item())
-                    attr_dims = max(1, min(attr_dims, self.max_attributes_per_node))
+                    dim_val = torch.nan_to_num(dim_val, nan=1.0, posinf=float(self.max_attr_value_dim), neginf=1.0)
+                    attr_dims = int(torch.clamp(dim_val, min=1.0, max=float(self.max_attr_value_dim)).item())
+                    attr_dims = max(1, min(attr_dims, self.max_attr_value_dim))
                     values = []
                     value_hidden = embedding.unsqueeze(0).unsqueeze(1)
                     value_input = torch.zeros(1, 1, 1, device=device)
@@ -1295,13 +1308,13 @@ class GraphDecoder(nn.Module):
                         value_input = v.unsqueeze(0).unsqueeze(-1)
                     if DEBUG_DECODER:
                         decode_stats["attr_value_cells"] += attr_dims
-                        if attr_dims >= self.max_attributes_per_node:
+                        if attr_dims >= self.max_attr_value_dim:
                             logger.info(
                                 "Decoder graph %d node %d attribute %s clamped to max dims (%d)",
                                 decode_stats["graph_index"],
                                 node_idx,
                                 name,
-                                self.max_attributes_per_node,
+                                self.max_attr_value_dim,
                             )
                     if name in attrs:
                         warn(name + " is already defined for currently decoding node")

@@ -9,6 +9,7 @@ import torch.nn as nn
 
 from genes import NODE_TYPE_OPTIONS, NodeGene, node_type_name_from_index
 from genome import OptimizerGenome
+from loop_blocks import prime_registry
 from torchscript_utils import load_script_module
 
 
@@ -476,6 +477,8 @@ def rebuild_and_script(
     2) Create ScriptModule, attach `w_src_dst` Parameters
     3) Generate the IR with `build_forward_graph` and hook it up
     """
+    prime_registry(graph_dict.get("block_registry"))
+
     if graph_dict.get("serialized_module") is not None:
         module = load_script_module(graph_dict["serialized_module"])
         _attach_module_metadata(module, graph_dict, config)

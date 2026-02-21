@@ -26,6 +26,13 @@ from neat.reporting import BaseReporter
 from computation_graphs.functions.activation import *
 from computation_graphs.functions.aggregation import *
 from genes import *
+from graph_ir import export_script_module_to_graph_ir
+from loop_blocks import (
+    DEFAULT_BLOCK_PAYLOAD_VALUE_DIM,
+    encode_block_payload,
+    register_graph_blocks,
+    snapshot_registry,
+)
 from population import *
 from population import _INVALID_REASON_COUNTER
 from relative_rank_stagnation import RelativeRankStagnation
@@ -155,15 +162,54 @@ def create_initial_genome(config, optimizer):
     Creates an initial genome that mirrors the structure of the provided TorchScript optimizer computation graph.
     """
 
+    graph_ir, module_state = export_script_module_to_graph_ir(optimizer)
+    node_block_map = register_graph_blocks(graph_ir)
+    block_ids = sorted({block_id for ids in node_block_map.values() for block_id in ids})
+    block_registry = snapshot_registry(block_ids)
+    payload_cap = getattr(config, "attr_value_max_dim", DEFAULT_BLOCK_PAYLOAD_VALUE_DIM)
+    try:
+        payload_cap = int(payload_cap)
+    except (TypeError, ValueError):
+        payload_cap = DEFAULT_BLOCK_PAYLOAD_VALUE_DIM
+    payload_cap = max(DEFAULT_BLOCK_PAYLOAD_VALUE_DIM, payload_cap)
+
+    graph_nodes = list(optimizer.graph.nodes())
+    node_index_map = {node: idx for idx, node in enumerate(graph_nodes)}
+
     def _register_node(node_key: int, ts_node: torch._C.Node | None) -> None:
         new_node_gene = NodeGene(node_key, ts_node)
         new_node_gene.init_attributes(config.genome_config)
         if ts_node is not None:
             _annotate_node_for_speciation(new_node_gene, ts_node)
+            node_idx = node_index_map.get(ts_node)
+            if node_idx is not None:
+                block_ids_for_node = node_block_map.get(node_idx, [])
+                for block_pos, block_id in enumerate(block_ids_for_node):
+                    ref_name = f"{BLOCK_REF_ATTR_PREFIX}{block_pos}"
+                    new_node_gene.dynamic_attributes[ref_name] = torch.tensor([float(block_id)], dtype=torch.float32)
+                    payload = block_registry.get(block_id)
+                    if payload:
+                        payload_name = f"{BLOCK_PAYLOAD_ATTR_PREFIX}{block_pos}"
+                        try:
+                            encoded = encode_block_payload(payload, max_value_dim=payload_cap)
+                        except ValueError as exc:
+                            warn(f"Skipping block payload encoding for node {node_key}: {exc}")
+                        else:
+                            # stash the actual block body alongside the reference so the
+                            # decoder/repair path can round-trip nested control flow
+                            # without consulting external templates
+                            new_node_gene.dynamic_attributes[payload_name] = encoded
         genome.nodes[node_key] = new_node_gene
 
     genome = config.genome_type(0)
     genome.serialized_module = serialize_script_module(optimizer)
+    module_type = optimizer._c._type().qualified_name() if hasattr(optimizer._c._type(), "qualified_name") else None
+    genome.graph_dict = {
+        "graph_ir": graph_ir,
+        "module_state": module_state,
+        "module_type": module_type,
+        "block_registry": block_registry,
+    }
 
     node_mapping = {}  # from TorchScript nodes to genome node keys
     graph_input_values = list(optimizer.graph.inputs())
@@ -202,7 +248,6 @@ def create_initial_genome(config, optimizer):
         _register_node(key, ts_node)
         node_mapping[ts_node] = key
 
-    graph_nodes = list(optimizer.graph.nodes())
     output_producers: List[torch._C.Node] = []
     for value in optimizer.graph.outputs():
         producer = value.node()

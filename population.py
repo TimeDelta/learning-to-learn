@@ -27,6 +27,14 @@ from genes import (
 )
 from genome import OptimizerGenome
 from graph_builder import *
+from graph_ir import export_script_module_to_graph_ir
+from loop_blocks import (
+    DEFAULT_BLOCK_PAYLOAD_VALUE_DIM,
+    prime_registry,
+    register_block_payload_tensor,
+    register_graph_blocks,
+    snapshot_registry,
+)
 from metrics import *
 from models import *
 from pareto import *
@@ -38,6 +46,8 @@ _INVALID_REASON_COUNTER: Counter = Counter()
 _INVALID_REASON_REPORT_REGISTERED = False
 DECODED_GRAPH_DICT_KEY = "_decoded_graph_dict"
 REPAIRED_GRAPH_DICT_KEY = "_repaired_graph_dict"
+BLOCK_REF_ATTR_PREFIX = "__block_ref_"
+BLOCK_PAYLOAD_ATTR_PREFIX = "__block_payload_"
 
 PIN_ROLE_INPUT = "input"
 PIN_ROLE_OUTPUT = "output"
@@ -103,11 +113,25 @@ class GuidedPopulation(Population):
         self.metric_keys = self._evaluation_metric_keys(self.task)
         self.metric_best_values = self._metric_best_values(self.metric_keys)
         self.metric_guidance_weights = self._metric_guidance_weights(self.metric_keys)
+        # Configure how large the decoded attribute tensors may be. This cap must be
+        # high enough to hold serialized loop payloads so the VAE can emit nested
+        # blocks directly instead of pointing at templates.
+        block_value_cap = getattr(config, "attr_value_max_dim", DEFAULT_BLOCK_PAYLOAD_VALUE_DIM)
+        try:
+            block_value_cap = int(block_value_cap)
+        except (TypeError, ValueError):
+            block_value_cap = DEFAULT_BLOCK_PAYLOAD_VALUE_DIM
+        block_value_cap = max(DEFAULT_BLOCK_PAYLOAD_VALUE_DIM, block_value_cap)
+        self.attr_value_max_dim = block_value_cap
         self.shared_attr_vocab = SharedAttributeVocab([], 50)
         # Keep attribute-name embeddings high-dimensional (50d) while compressing the
         # DeepSet attribute summaries down to 20d per node before DAG attention.
         attr_encoder = NodeAttributeDeepSetEncoder(
-            self.shared_attr_vocab, encoder_hdim=10, aggregator_hdim=20, out_dim=20
+            self.shared_attr_vocab,
+            encoder_hdim=10,
+            aggregator_hdim=20,
+            out_dim=20,
+            max_value_dim=self.attr_value_max_dim,
         )
         graph_encoder = GraphEncoder(
             len(NODE_TYPE_OPTIONS),
@@ -139,6 +163,7 @@ class GuidedPopulation(Population):
             min_pin_nodes=decoder_min_pin_nodes,
             required_input_count=len(configured_inputs),
             required_output_slots=output_slots,
+            max_attr_value_dim=self.attr_value_max_dim,
         )
         icnn_hidden_dims = getattr(config, "latent_icnn_hidden_dims", (64, 32))
         if isinstance(icnn_hidden_dims, str):
@@ -617,6 +642,7 @@ class GuidedPopulation(Population):
         preserved_ir = copy.deepcopy(existing_graph.get("graph_ir")) if existing_graph else None
         preserved_state = copy.deepcopy(existing_graph.get("module_state")) if existing_graph else None
         preserved_type = existing_graph.get("module_type") if existing_graph else None
+        preserved_blocks = copy.deepcopy(existing_graph.get("block_registry")) if existing_graph else None
 
         # sort by node id so positions line up
         node_ids = sorted(genome.nodes.keys())
@@ -717,6 +743,8 @@ class GuidedPopulation(Population):
             graph_dict["module_state"] = preserved_state
         if preserved_type is not None:
             graph_dict["module_type"] = preserved_type
+        if preserved_blocks is not None:
+            graph_dict["block_registry"] = preserved_blocks
         genome.graph_dict = graph_dict
         return Data(node_types=node_types, edge_index=edge_index, node_attributes=node_attributes)
 
@@ -763,12 +791,16 @@ class GuidedPopulation(Population):
         module_type = graph_dict.get("module_type")
         if module_type is not None:
             cloned["module_type"] = module_type
+        block_registry = graph_dict.get("block_registry")
+        if block_registry is not None:
+            cloned["block_registry"] = copy.deepcopy(block_registry)
         return cloned
 
     @staticmethod
     def _graph_dict_to_data(graph_dict: dict | None) -> Data | None:
         if not graph_dict:
             return None
+        prime_registry(graph_dict.get("block_registry"))
         node_types = graph_dict.get("node_types")
         edge_index = graph_dict.get("edge_index")
         node_attributes = graph_dict.get("node_attributes")
@@ -856,6 +888,55 @@ class GuidedPopulation(Population):
             cloned = self._clone_graph_dict(graph_dict, include_history=False)
             if cloned is not None:
                 graph_dict[DECODED_GRAPH_DICT_KEY] = cloned
+        # Keep track of every loop block referenced by the decoded graph. The block
+        # registry is *not* a template store; it merely caches the raw payload dicts
+        # so repair/rebuild can rehydrate the exact bodies the decoder emitted
+        block_refs: Set[int] = set()
+        decoded_payloads: Dict[int, Dict[str, Any]] = {}
+        for attrs in graph_dict.get("node_attributes", []) or []:
+            if not isinstance(attrs, dict):
+                continue
+            attr_items = list(attrs.items())
+            for attr_name, value in attr_items:
+                if isinstance(attr_name, str) and attr_name.startswith(BLOCK_PAYLOAD_ATTR_PREFIX):
+                    try:
+                        block_id, payload = register_block_payload_tensor(value)
+                    except ValueError as exc:
+                        graph_dict.setdefault("_repair_failure_details", {})[attr_name] = str(exc)
+                        continue
+                    # Once decoded, we immediately register the payload so future
+                    # rebuilds can look up the block by ID instead of re-decoding the
+                    # tensor every time.
+                    decoded_payloads[block_id] = payload
+                    block_refs.add(block_id)
+                    suffix = attr_name[len(BLOCK_PAYLOAD_ATTR_PREFIX) :]
+                    ref_name = f"{BLOCK_REF_ATTR_PREFIX}{suffix}"
+                    attrs[ref_name] = torch.tensor([float(block_id)], dtype=torch.float32)
+            for attr_name, value in attr_items:
+                if not isinstance(attr_name, str) or not attr_name.startswith(BLOCK_REF_ATTR_PREFIX):
+                    continue
+                block_id: int | None = None
+                if torch.is_tensor(value):
+                    if value.numel() > 0:
+                        block_id = int(round(float(value.view(-1)[0].item())))
+                else:
+                    try:
+                        block_id = int(round(float(value)))
+                    except (TypeError, ValueError):
+                        block_id = None
+                if block_id is not None:
+                    block_refs.add(block_id)
+        if block_refs:
+            existing_registry = graph_dict.get("block_registry") or {}
+            combined_registry = {}
+            combined_registry.update(existing_registry)
+            combined_registry.update(decoded_payloads)
+            missing_ids = [bid for bid in block_refs if bid not in combined_registry]
+            if missing_ids:
+                combined_registry.update(snapshot_registry(missing_ids))
+            # repair writes a consolidated registry entry so downstream calls can
+            # prime the global registry before rebuilding TorchScript modules
+            graph_dict["block_registry"] = copy.deepcopy(combined_registry)
         return node_count, edges
 
     @staticmethod
@@ -965,6 +1046,7 @@ class GuidedPopulation(Population):
                 # Lazily build the cached graph if this genome has never been encoded.
                 self.genome_to_data(g)
                 graph_dict = g.graph_dict
+            prime_registry(graph_dict.get("block_registry"))
             data_list.append(
                 Data(
                     node_types=graph_dict["node_types"].clone().detach().long(),

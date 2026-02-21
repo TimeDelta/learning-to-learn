@@ -16,9 +16,16 @@ import population as population_module
 from attributes import FloatAttribute, IntAttribute
 from genes import NODE_TYPE_TO_INDEX, ConnectionGene, NodeGene
 from genome import OptimizerGenome
+from graph_builder import rebuild_and_script
+from loop_blocks import prime_registry
+from main import create_initial_genome
 from metrics import AreaUnderTaskMetrics, MemoryCost, TimeCost
 from models import ManyLossMinimaModel
-from population import GuidedPopulation
+from population import (
+    BLOCK_PAYLOAD_ATTR_PREFIX,
+    BLOCK_REF_ATTR_PREFIX,
+    GuidedPopulation,
+)
 from relative_rank_stagnation import RelativeRankStagnation
 from reproduction import GuidedReproduction
 from search_space_compression import (
@@ -774,6 +781,70 @@ def test_repair_connects_hidden_nodes_to_inputs_and_outputs():
     for idx in hidden_indices:
         assert idx in forward
         assert idx in backward
+
+
+def test_prepare_decoded_graph_dict_rebuilds_block_registry_from_payload():
+    class LoopTemplate(torch.nn.Module):
+        def forward(self, loss, prev_loss, named_parameters):
+            total = loss
+            i = 0
+            while i < 2:
+                total = total + prev_loss
+                i += 1
+            updates = {}
+            for name, param in named_parameters:
+                updates[name] = param - 0.1 * total
+            return updates
+
+    config = make_config()
+    pop = GuidedPopulation(config)
+    genome = create_initial_genome(config, torch.jit.script(LoopTemplate()))
+    graph_dict = pop._clone_graph_dict(genome.graph_dict, include_history=False)
+    graph_dict.pop("block_registry", None)
+    for attrs in graph_dict.get("node_attributes", []):
+        for key in list(attrs.keys()):
+            if isinstance(key, str) and key.startswith(BLOCK_REF_ATTR_PREFIX):
+                attrs.pop(key)
+    node_count, _ = pop._prepare_decoded_graph_dict(graph_dict)
+    assert node_count > 0
+    registry = graph_dict.get("block_registry")
+    assert registry, "Block registry should be reconstructed from payload tensors"
+    for attrs in graph_dict.get("node_attributes", []):
+        payload_keys = [k for k in attrs if isinstance(k, str) and k.startswith(BLOCK_PAYLOAD_ATTR_PREFIX)]
+        if not payload_keys:
+            continue
+        assert any(
+            isinstance(k, str) and k.startswith(BLOCK_REF_ATTR_PREFIX) for k in attrs
+        ), "Repair should add block references when payloads exist"
+
+
+def test_repair_builds_loop_from_payload_without_registry():
+    class LoopTemplate(torch.nn.Module):
+        def forward(self, loss, prev_loss, named_parameters):
+            total = loss * 0.5 + prev_loss * 0.25
+            i = 0
+            while i < 3:
+                total = total + prev_loss
+                i += 1
+            updates = {}
+            for name, param in named_parameters:
+                updates[name] = param - 0.05 * total
+            return updates
+
+    config = make_config()
+    pop = GuidedPopulation(config)
+    genome = create_initial_genome(config, torch.jit.script(LoopTemplate()))
+    graph_dict = pop._clone_graph_dict(genome.graph_dict, include_history=False)
+    graph_dict.pop("block_registry", None)
+    for attrs in graph_dict.get("node_attributes", []):
+        for key in list(attrs.keys()):
+            if isinstance(key, str) and key.startswith(BLOCK_REF_ATTR_PREFIX):
+                attrs.pop(key)
+    assert pop._repair_graph_dict(graph_dict)
+    assert graph_dict.get("block_registry"), "Repair should derive block registry from payload"
+    prime_registry(graph_dict.get("block_registry"))
+    rebuilt = rebuild_and_script(graph_dict, config.genome_config, key=0)
+    assert "prim::Loop" in str(rebuilt.graph)
 
 
 def test_repair_preserves_seeded_input_pins():

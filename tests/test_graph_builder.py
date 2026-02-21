@@ -17,6 +17,7 @@ from genes import ensure_node_type_registered
 from genome import OptimizerGenome
 from graph_builder import genome_from_graph_dict, rebuild_and_script
 from graph_ir import export_script_module_to_graph_ir
+from loop_blocks import register_graph_blocks, snapshot_registry
 from relative_rank_stagnation import RelativeRankStagnation
 from reproduction import GuidedReproduction
 from torchscript_utils import serialize_script_module
@@ -34,8 +35,11 @@ def make_config():
 
 
 def optimizer_to_graph_dict(opt):
-    data = optimizer_to_data(opt)
     graph_ir, module_state = export_script_module_to_graph_ir(opt)
+    node_block_map = register_graph_blocks(graph_ir)
+    data = optimizer_to_data(opt, node_block_map=node_block_map)
+    block_ids = sorted({bid for bids in node_block_map.values() for bid in bids})
+    block_registry = snapshot_registry(block_ids)
     return {
         "node_types": data.node_types,
         "edge_index": data.edge_index,
@@ -44,10 +48,14 @@ def optimizer_to_graph_dict(opt):
         "graph_ir": graph_ir,
         "module_state": module_state,
         "module_type": opt._c._type().qualified_name() if hasattr(opt._c._type(), "qualified_name") else None,
+        "block_registry": block_registry,
     }
 
 
-def optimizer_to_data(opt):
+def optimizer_to_data(opt, node_block_map=None):
+    if node_block_map is None:
+        graph_ir, _ = export_script_module_to_graph_ir(opt)
+        node_block_map = register_graph_blocks(graph_ir)
     node_map = {}
     node_types = []
     node_attrs = []
@@ -63,6 +71,9 @@ def optimizer_to_data(opt):
                 attrs[FloatAttribute(name)] = node.f(name)
             elif kind == "s":
                 attrs[StringAttribute(name)] = node.s(name)
+        block_ids = node_block_map.get(idx, []) if node_block_map else []
+        for block_pos, block_id in enumerate(block_ids):
+            attrs[f"__block_ref_{block_pos}"] = torch.tensor([float(block_id)], dtype=torch.float32)
         node_attrs.append(attrs)
 
     edges = []
