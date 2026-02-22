@@ -2,7 +2,7 @@ import copy
 import os
 import sys
 from collections import deque
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import neat
 import numpy as np
@@ -308,6 +308,51 @@ def test_generate_guided_offspring_buffers_near_misses(monkeypatch):
 
     assert offspring  # even penalized genomes should be returned
     assert buffered_graphs, "decoder replay buffer did not capture near-miss graphs"
+
+
+def test_seed_decoder_replay_rebuilds_missing_graph_dicts():
+    config = make_config()
+    pop = GuidedPopulation(config)
+
+    population_size = 3
+    genomes = {idx: create_simple_genome(idx) for idx in range(population_size)}
+    for genome in genomes.values():
+        genome.graph_dict = {"graph_ir": {"nodes": []}}
+    pop.population = genomes
+    pop.decoder_replay_max = population_size
+
+    def fake_genome_to_data(self, genome):
+        bias = float(genome.key + 1)
+        graph = make_decoded_graph(bias)
+        cloned = {
+            "node_types": graph["node_types"].clone(),
+            "edge_index": graph["edge_index"].clone(),
+            "node_attributes": [dict(attrs) for attrs in graph["node_attributes"]],
+        }
+        genome.graph_dict = cloned
+        return Data(
+            node_types=graph["node_types"],
+            edge_index=graph["edge_index"],
+            node_attributes=graph["node_attributes"],
+        )
+
+    pop.genome_to_data = MethodType(fake_genome_to_data, pop)
+    pop._decoder_replay_cache.clear()
+    pop._decoder_replay_reservoir.clear()
+    pop._decoder_replay_signatures.clear()
+    pop._decoder_replay_seeded = False
+
+    seeded = pop._seed_decoder_replay_from_population()
+
+    assert seeded == population_size
+    assert len(pop._decoder_replay_cache) == population_size
+
+    payload = pop._consume_decoder_replay_graphs()
+    assert len(payload) == population_size
+    for graph_dict in payload:
+        assert graph_dict.get("node_types") is not None
+        assert graph_dict.get("edge_index") is not None
+        assert graph_dict.get("node_attributes")
 
 
 def test_generation_eval_steps_respects_max_cap():

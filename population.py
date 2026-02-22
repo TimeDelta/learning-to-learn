@@ -468,6 +468,16 @@ class GuidedPopulation(Population):
                 self._decoder_replay_reservoir.popleft()
             self._decoder_replay_reservoir.append((signature, cloned))
 
+    @staticmethod
+    def _graph_dict_has_topology(graph_dict: dict | None) -> bool:
+        if not graph_dict:
+            return False
+        has_nodes = graph_dict.get("node_types") is not None
+        has_edges = graph_dict.get("edge_index") is not None
+        node_attrs = graph_dict.get("node_attributes")
+        has_attrs = node_attrs is not None and len(node_attrs) > 0
+        return has_nodes and has_edges and has_attrs
+
     def _seed_decoder_replay_from_population(self) -> int:
         """Populate decoder replay buffers with the current population graphs once."""
         if self._decoder_replay_seeded or self.decoder_replay_max <= 0:
@@ -475,7 +485,7 @@ class GuidedPopulation(Population):
         seeded = 0
         for genome in self.population.values():
             graph_dict = getattr(genome, "graph_dict", None)
-            if graph_dict is None:
+            if not self._graph_dict_has_topology(graph_dict):
                 self.genome_to_data(genome)
                 graph_dict = getattr(genome, "graph_dict", None)
             if not graph_dict:
