@@ -212,6 +212,17 @@ def create_initial_genome(config, optimizer):
     }
 
     node_mapping = {}  # from TorchScript nodes to genome node keys
+    node_attributes: List[Dict[str, Any]] = genome.graph_dict.setdefault("node_attributes", [])
+
+    def _ensure_attr_slot(slot_index: int) -> Dict[str, Any]:
+        while len(node_attributes) <= slot_index:
+            node_attributes.append({})
+        attrs = node_attributes[slot_index]
+        if not isinstance(attrs, dict):
+            attrs = {}
+            node_attributes[slot_index] = attrs
+        return attrs
+
     graph_input_values = list(optimizer.graph.inputs())
     graph_inputs = {val.node() for val in graph_input_values}
 
@@ -240,13 +251,18 @@ def create_initial_genome(config, optimizer):
             f"({len(user_arg_nodes)} found vs {len(configured_input_keys)} expected)."
         )
 
-    for pin_key, ts_node in zip(configured_input_keys, user_arg_nodes):
+    for slot_index, (pin_key, ts_node) in enumerate(zip(configured_input_keys, user_arg_nodes)):
         try:
             key = int(pin_key)
         except (TypeError, ValueError):
             continue
         _register_node(key, ts_node)
         node_mapping[ts_node] = key
+        attrs = _ensure_attr_slot(slot_index)
+        attrs["pin_role"] = "input"
+        attrs["pin_slot_index"] = slot_index
+        attrs["_pin_role_locked"] = True
+        attrs["_pin_slot_locked"] = True
 
     output_producers: List[torch._C.Node] = []
     for value in optimizer.graph.outputs():
@@ -260,7 +276,8 @@ def create_initial_genome(config, optimizer):
             "TorchScript graph exposes fewer outputs than configured; missing output pin labels may persist "
             f"({len(output_producers)} found vs {len(configured_output_keys)} expected)."
         )
-    for pin_key, producer in zip(configured_output_keys, output_producers):
+    output_attr_offset = len(configured_input_keys)
+    for slot_offset, (pin_key, producer) in enumerate(zip(configured_output_keys, output_producers)):
         try:
             key = int(pin_key)
         except (TypeError, ValueError):
@@ -270,6 +287,11 @@ def create_initial_genome(config, optimizer):
             continue
         _register_node(key, producer)
         node_mapping[producer] = key
+        attrs = _ensure_attr_slot(output_attr_offset + slot_offset)
+        attrs["pin_role"] = "output"
+        attrs["pin_slot_index"] = key
+        attrs["_pin_role_locked"] = True
+        attrs["_pin_slot_locked"] = True
 
     next_node_id = 0
     for node in graph_nodes:

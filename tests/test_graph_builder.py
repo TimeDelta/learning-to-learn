@@ -3,7 +3,6 @@ import os
 import pathlib
 import sys
 
-import neat
 import pytest
 import torch
 from torch.fx.passes.utils.matcher_utils import SubgraphMatcher
@@ -11,6 +10,12 @@ from torch_geometric.data import Data
 
 # allow imports from repo root
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
+tests_dir = pathlib.Path(__file__).resolve().parent
+if str(tests_dir) not in sys.path:
+    sys.path.insert(0, str(tests_dir))
+
+from factories import make_neat_config
 
 from attributes import FloatAttribute, IntAttribute, StringAttribute
 from genes import ensure_node_type_registered
@@ -21,17 +26,6 @@ from loop_blocks import register_graph_blocks, snapshot_registry
 from relative_rank_stagnation import RelativeRankStagnation
 from reproduction import GuidedReproduction
 from torchscript_utils import serialize_script_module
-
-
-def make_config():
-    config_path = os.path.join(pathlib.Path(__file__).resolve().parents[1], "neat-config")
-    return neat.Config(
-        OptimizerGenome,
-        GuidedReproduction,
-        neat.DefaultSpeciesSet,
-        RelativeRankStagnation,
-        config_path,
-    )
 
 
 def optimizer_to_graph_dict(opt):
@@ -251,7 +245,7 @@ def test_graph_builder_rebuilds_pt(pt_path, strip_serialized):
     if strip_serialized:
         graph_dict.pop("serialized_module", None)
 
-    config = make_config()
+    config = make_neat_config()
     rebuilt = rebuild_and_script(graph_dict, config.genome_config, key=0)
 
     assert isinstance(rebuilt, torch.jit.ScriptModule)
@@ -282,7 +276,7 @@ def test_graph_builder_rebuilds_pt(pt_path, strip_serialized):
 
 
 def test_genome_from_graph_dict_hydrates_structure():
-    config = make_config()
+    config = make_neat_config()
     graph_dict = {
         "node_types": torch.tensor([0, 1], dtype=torch.long),
         "edge_index": torch.tensor([[0], [1]], dtype=torch.long),

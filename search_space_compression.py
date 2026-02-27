@@ -10,6 +10,7 @@ import random
 import time
 from collections import Counter, deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from warnings import warn
 
@@ -532,61 +533,6 @@ def build_teacher_adj_targets(
     return per_graph_targets
 
 
-def build_teacher_pin_roles(node_attrs: Sequence[Any], batch_vec: Optional[torch.Tensor]) -> List[List[str | None]]:
-    per_graph_attrs = group_node_attributes(node_attrs, batch_vec)
-    roles: List[List[str | None]] = []
-    for graph_attrs in per_graph_attrs:
-        node_roles: List[str | None] = []
-        for attrs in graph_attrs:
-            if isinstance(attrs, dict):
-                raw_role = attrs.get("pin_role")
-                normalized = _normalize_pin_role(raw_role)
-            else:
-                normalized = None
-            node_roles.append(normalized)
-        roles.append(node_roles)
-    return roles
-
-
-def build_teacher_pin_slots(node_attrs: Sequence[Any], batch_vec: Optional[torch.Tensor]) -> List[List[float | None]]:
-    per_graph_attrs = group_node_attributes(node_attrs, batch_vec)
-    slots: List[List[float | None]] = []
-    for graph_attrs in per_graph_attrs:
-        node_slots: List[float | None] = []
-        for attrs in graph_attrs:
-            if not isinstance(attrs, dict):
-                node_slots.append(None)
-                continue
-            role = _normalize_pin_role(attrs.get("pin_role"))
-            raw_slot = attrs.get("pin_slot_index")
-            if raw_slot is None:
-                node_slots.append(None)
-                continue
-            if torch.is_tensor(raw_slot):
-                if raw_slot.numel() == 0:
-                    node_slots.append(None)
-                    continue
-                value = float(raw_slot.detach().cpu().view(-1)[0].item())
-            else:
-                try:
-                    value = float(raw_slot)
-                except (TypeError, ValueError):
-                    node_slots.append(None)
-                    continue
-            if value < 0:
-                node_slots.append(None)
-                continue
-            rank = int(round(value))
-            if role == PIN_ROLE_INPUT:
-                node_slots.append(float(-(rank + 1)))
-            elif role == PIN_ROLE_OUTPUT:
-                node_slots.append(float(rank + 1))
-            else:
-                node_slots.append(None)
-        slots.append(node_slots)
-    return slots
-
-
 class NodeAttributeDeepSetEncoder(nn.Module):
     """
     Permutation‐invariant encoder for a dictionary of arbitrary node attributes.
@@ -622,6 +568,8 @@ class NodeAttributeDeepSetEncoder(nn.Module):
         self.out_dim = out_dim
 
     def get_value_tensor(self, value: Any):
+        if value is None:
+            value = torch.zeros(1, dtype=torch.float)
         if isinstance(value, (int, float)):
             value = torch.tensor([value], dtype=torch.float)
         elif isinstance(value, str):
@@ -849,7 +797,6 @@ class GraphDecoder(nn.Module):
         num_node_types: int,
         latent_dim: int,
         shared_attr_vocab: SharedAttributeVocab,
-        pin_role_embedding: nn.Embedding | None = None,
         hidden_dim: int = 128,
         gdn_layers: int = 2,
         edge_threshold: float = 0.5,
@@ -887,7 +834,6 @@ class GraphDecoder(nn.Module):
 
         # — GraphDeconvNet stack (learned spectral decoders)
         self.gdns = nn.ModuleList([GraphDeconvNet(hidden_dim, hidden_dim) for _ in range(gdn_layers)])
-        self.max_nodes = 1000
         self.max_attributes_per_node = 50
         self.max_attr_value_dim = max(1, int(max_attr_value_dim))
         self.edge_threshold = edge_threshold
@@ -917,56 +863,110 @@ class GraphDecoder(nn.Module):
                 if slot_int < 0:
                     continue
                 self.required_output_slots.append(slot_int)
+
+        resolved_input_slots = self._resolved_required_input_slots()
+        pin_node_budget = resolved_input_slots + len(self.required_output_slots)
+        if pin_node_budget <= 0:
+            pin_node_budget = 1
+        self._base_required_node_count = max(self.min_pin_nodes, pin_node_budget)
+        self.max_nodes = max(1000, self._base_required_node_count)
         # Encourage attribute decoder to terminate by progressively biasing the EOS logit.
         self.attr_eos_bias_base = 0.0
         self.attr_eos_bias_slope = 0.1
-        self.pin_role_embedding_ref = pin_role_embedding
-        self.pin_role_dim = 0 if pin_role_embedding is None else pin_role_embedding.embedding_dim
-        self.pin_role_head = nn.Linear(hidden_dim, self.pin_role_dim) if self.pin_role_dim > 0 else None
-        self.pin_slot_head = nn.Linear(hidden_dim, 1)
-        self.pin_role_to_index = {role: idx for idx, role in enumerate(PIN_ROLE_ORDER)}
+        self._min_required_nodes = self._base_required_node_count
 
-    def _pin_role_reference(self) -> torch.Tensor | None:
-        if self.pin_role_embedding_ref is None:
-            return None
-        weight = self.pin_role_embedding_ref.weight.detach()
-        if weight.dim() != 2 or weight.size(1) != self.pin_role_dim:
-            return None
-        indices = []
-        for role in PIN_ROLE_ORDER:
-            idx = self.pin_role_to_index.get(role)
-            if idx is None or idx >= weight.size(0):
-                continue
-            indices.append(idx)
-        if not indices:
-            return None
-        reference = weight[indices]
-        return reference.to(weight.device)
+    def _resolved_required_input_slots(self) -> int:
+        configured = 1
+        try:
+            configured = max(0, int(self.required_input_count or 1))
+        except (TypeError, ValueError):
+            configured = 1
+        fallback = 1
+        try:
+            fallback = max(1, int(self.min_pin_nodes or 1) - len(self.required_output_slots))
+        except (TypeError, ValueError):
+            fallback = 1
+        return max(configured, fallback)
 
-    def _infer_pin_role(self, vector: torch.Tensor, reference: torch.Tensor | None) -> str | None:
-        if reference is None or vector is None or vector.numel() == 0:
-            return None
-        sims = F.cosine_similarity(vector.unsqueeze(0), reference, dim=-1)
-        best_idx = int(sims.argmax().item())
-        if best_idx < 0 or best_idx >= len(PIN_ROLE_ORDER):
-            return None
-        return PIN_ROLE_ORDER[best_idx]
+    def _emit_pin_debug_snapshot(self, node_attributes: List[Dict[str, Any]]) -> None:
+        try:
+            base = Path("debug_guided_offspring") / "pin_debug"
+            base.mkdir(parents=True, exist_ok=True)
+            timestamp = int(time.time() * 1000)
+            path = base / f"pin_debug_{timestamp}.json"
+            payload = {
+                "required_inputs": self._resolved_required_input_slots(),
+                "required_outputs": list(self.required_output_slots),
+                "min_pin_nodes": self.min_pin_nodes,
+                "node_attributes": node_attributes,
+            }
+            path.write_text(json.dumps(payload, indent=2, default=str))
+        except Exception as exc:  # pragma: no cover - diagnostic path
+            logger.exception("Failed to write pin debug snapshot: %s", exc)
 
-    def _pin_role_target(self, role: str | None, reference: torch.Tensor | None) -> torch.Tensor | None:
-        if reference is None or role is None:
-            return None
-        idx = self.pin_role_to_index.get(role)
-        if idx is None or idx >= reference.size(0):
-            return None
-        return reference[idx]
+    def _enforce_required_pin_metadata(self, node_attributes: List[Dict[str, Any]]):
+        if not node_attributes:
+            logger.warning("No node_attributes passed")
+            return
+        total = len(node_attributes)
+        required_inputs = self._resolved_required_input_slots()
+        expected_nodes = max(self._min_required_nodes, required_inputs + len(self.required_output_slots))
+        if total < expected_nodes:
+            logger.warning(
+                "Decoder emitted fewer nodes than required before pin enforcement | total=%d expected=%d required_inputs=%d required_outputs=%d min_pin_nodes=%d",
+                total,
+                expected_nodes,
+                required_inputs,
+                len(self.required_output_slots),
+                self.min_pin_nodes,
+            )
+        input_slots = min(required_inputs, total)
+        for slot in range(input_slots):
+            attrs = node_attributes[slot]
+            if not isinstance(attrs, dict):
+                attrs = {}
+            attrs["pin_role"] = PIN_ROLE_INPUT
+            attrs["pin_slot_index"] = slot
+            attrs["_pin_role_locked"] = True
+            attrs["_pin_slot_locked"] = True
+            node_attributes[slot] = attrs
+        if total <= input_slots:
+            logger.warning(
+                "Insufficient node count | total=%d required_inputs=%d required_outputs=%d min_pin_nodes=%d",
+                total,
+                required_inputs,
+                len(self.required_output_slots),
+                self.min_pin_nodes,
+            )
+            self._emit_pin_debug_snapshot(node_attributes)
+            return
+        available_indices = [idx for idx in range(total) if idx >= input_slots]
+        for slot in self.required_output_slots:
+            if not available_indices:
+                logger.warning(
+                    "Insufficient node count | total=%d required_inputs=%d required_outputs=%d min_pin_nodes=%d",
+                    total,
+                    required_inputs,
+                    len(self.required_output_slots),
+                    self.min_pin_nodes,
+                )
+                self._emit_pin_debug_snapshot(node_attributes)
+                break
+            idx = available_indices.pop(0)
+            attrs = node_attributes[idx]
+            if not isinstance(attrs, dict):
+                attrs = {}
+            attrs["pin_role"] = PIN_ROLE_OUTPUT
+            attrs["pin_slot_index"] = int(slot)
+            attrs["_pin_role_locked"] = True
+            attrs["_pin_slot_locked"] = True
+            node_attributes[idx] = attrs
 
     def forward(
         self,
         latent,
         teacher_attr_targets: Optional[List[List[List[int]]]] = None,
         teacher_adj_targets: Optional[List[Optional[torch.Tensor]]] = None,
-        teacher_pin_roles: Optional[List[List[str | None]]] = None,
-        teacher_pin_slots: Optional[List[List[float | None]]] = None,
     ):
         """
         (num_graphs, latent_dim)
@@ -985,11 +985,7 @@ class GraphDecoder(nn.Module):
             node_teacher_tokens = 0
             edge_teacher_loss = latent.new_tensor(0.0)
             edge_teacher_tokens = 0
-            pin_role_teacher_loss = latent.new_tensor(0.0)
-            pin_role_teacher_tokens = 0
-            pin_slot_teacher_loss = latent.new_tensor(0.0)
-            pin_slot_teacher_tokens = 0
-            pin_role_reference = self._pin_role_reference()
+            required_input_slots = self._resolved_required_input_slots()
             if teacher_attr_targets is not None:
                 # ensure decoder caps accommodate teacher supervision
                 max_teacher_nodes = 0
@@ -1026,12 +1022,6 @@ class GraphDecoder(nn.Module):
                         graph_teacher_targets = teacher_attr_targets[l]
                         if graph_teacher_targets is not None:
                             target_node_count = len(graph_teacher_targets)
-                    graph_pin_targets = None
-                    if teacher_pin_roles is not None and l < len(teacher_pin_roles):
-                        graph_pin_targets = teacher_pin_roles[l]
-                    graph_slot_targets = None
-                    if teacher_pin_slots is not None and l < len(teacher_pin_slots):
-                        graph_slot_targets = teacher_pin_slots[l]
                     graph_adj_target = None
                     if teacher_adj_targets is not None and l < len(teacher_adj_targets):
                         graph_adj_target = teacher_adj_targets[l]
@@ -1059,6 +1049,23 @@ class GraphDecoder(nn.Module):
                     forced_role_locked: List[bool] = []
                     forced_slot_locked: List[bool] = []
                     output_slot_index = 0
+                    minimum_required_nodes = max(
+                        self._min_required_nodes,
+                        required_input_slots + len(self.required_output_slots),
+                        1,
+                    )
+                    stop_target_node_count = target_node_count
+                    if teacher_force_nodes and stop_target_node_count is not None:
+                        if stop_target_node_count < minimum_required_nodes:
+                            if DEBUG_DECODER and decode_stats is not None:
+                                decode_stats.setdefault("node_loop_notes", []).append(
+                                    {
+                                        "event": "bump_teacher_target",
+                                        "requested": int(stop_target_node_count),
+                                        "enforced": int(minimum_required_nodes),
+                                    }
+                                )
+                            stop_target_node_count = minimum_required_nodes
                     with torch.autograd.profiler.record_function("GraphDecoder.node_loop"):
                         while True:
                             logger.debug(f"Decoding node {t}")
@@ -1076,21 +1083,23 @@ class GraphDecoder(nn.Module):
                             stop_prob = torch.sigmoid(stop_logit)
                             stop_prob = torch.nan_to_num(stop_prob, nan=1.0).clamp(0.0, 1.0)
                             continue_prob = (1.0 - stop_prob).clamp(0.0, 1.0)
-                            force_min_pins = self.min_pin_nodes > 0 and t < self.min_pin_nodes
+                            force_minimum_nodes = t < minimum_required_nodes
                             if teacher_force_nodes:
-                                target_stop = 1.0 if (target_node_count is not None and t >= target_node_count) else 0.0
+                                target_stop = (
+                                    1.0 if (stop_target_node_count is not None and t >= stop_target_node_count) else 0.0
+                                )
                                 node_teacher_loss = node_teacher_loss + F.binary_cross_entropy_with_logits(
                                     stop_logit, torch.full_like(stop_logit, target_stop)
                                 )
                                 node_teacher_tokens += 1
-                                if target_stop >= 0.5:
+                                if target_stop >= 0.5 and not force_minimum_nodes:
                                     if DEBUG_DECODER and decode_stats is not None:
                                         decode_stats["node_loop_exit"] = (
                                             decode_stats["node_loop_exit"] or "teacher_nodes"
                                         )
                                     break
                             else:
-                                if force_min_pins:
+                                if force_minimum_nodes:
                                     continue_prob = torch.ones_like(continue_prob)
                                 if DEBUG_DECODER and decode_stats is not None:
                                     decode_stats["node_stop_samples"].append(float(continue_prob.item()))
@@ -1113,7 +1122,7 @@ class GraphDecoder(nn.Module):
                             forced_slot = None
                             role_locked = False
                             slot_locked = False
-                            if self.required_input_count and node_index < self.required_input_count:
+                            if required_input_slots and node_index < required_input_slots:
                                 forced_role = PIN_ROLE_INPUT
                                 forced_slot = node_index
                                 role_locked = True
@@ -1177,12 +1186,91 @@ class GraphDecoder(nn.Module):
                                     t,
                                 )
 
+            while len(node_embeddings) < minimum_required_nodes:
+                logger.debug(
+                    "Forcing additional node to satisfy minimum pin quota | current=%d required=%d",
+                    len(node_embeddings),
+                    minimum_required_nodes,
+                )
+                node_loop_iters += 1
+                hidden_node = self.node_rnn(torch.zeros(hidden_node.shape[0], 0, device=device), hidden_node)
+                stop_logit = self.stop_head(hidden_node)
+                stop_prob = torch.sigmoid(stop_logit)
+                stop_prob = torch.nan_to_num(stop_prob, nan=1.0).clamp(0.0, 1.0)
+                continue_prob = (1.0 - stop_prob).clamp(0.0, 1.0)
+                if DEBUG_DECODER and decode_stats is not None:
+                    decode_stats["node_stop_samples"].append(float(continue_prob.item()))
+                new_node = self.node_head(hidden_node).squeeze(0)
+                node_embeddings.append(new_node)
+                node_types.append(self.type_head(new_node).argmax(dim=-1).cpu().tolist())
+                node_index = len(node_embeddings) - 1
+                forced_role = None
+                forced_slot = None
+                role_locked = False
+                slot_locked = False
+                if required_input_slots and node_index < required_input_slots:
+                    forced_role = PIN_ROLE_INPUT
+                    forced_slot = node_index
+                    role_locked = True
+                    slot_locked = True
+                elif output_slot_index < len(self.required_output_slots):
+                    forced_role = PIN_ROLE_OUTPUT
+                    forced_slot = self.required_output_slots[output_slot_index]
+                    role_locked = True
+                    slot_locked = True
+                    output_slot_index += 1
+                forced_pin_roles.append(forced_role)
+                forced_pin_slots.append(forced_slot)
+                forced_role_locked.append(role_locked)
+                forced_slot_locked.append(slot_locked)
+                hidden_edge = hidden_node
+                edge_in = torch.zeros(1, 1, device=device)
+                node_edge_budget = 0
+                total_edge_budget = len(edges)
+                for i in range(node_index):
+                    if node_edge_budget >= self.max_edges_per_node:
+                        break
+                    if total_edge_budget >= self.max_edges_per_graph:
+                        break
+                    hidden_edge = self.edge_rnn(edge_in, hidden_edge)
+                    edge_logit = self.edge_head(hidden_edge).view(-1)
+                    p_edge = torch.sigmoid(edge_logit)
+                    p_edge = torch.nan_to_num(p_edge, nan=0.0).clamp(0.0, 1.0)
+                    edge_sample = torch.bernoulli(p_edge)
+                    edge_active = bool(edge_sample.item())
+                    if edge_active:
+                        edges.append([i, node_index])
+                        node_edge_budget += 1
+                        total_edge_budget += 1
+                    edge_in = p_edge.unsqueeze(0)
+
+            if len(node_embeddings) < minimum_required_nodes:
+                logger.warning(
+                    "Node loop exited below requirement | nodes=%d required=%d teacher_force=%s target_node_count=%s",
+                    len(node_embeddings),
+                    minimum_required_nodes,
+                    bool(teacher_force_nodes),
+                    stop_target_node_count,
+                )
+
             if node_embeddings:
                 node_embeddings = torch.stack(node_embeddings, dim=0)
                 edges = torch.tensor(edges, dtype=torch.long).t().contiguous()
             else:
                 node_embeddings = torch.zeros((0, self.node_head.out_features), device=device)
                 edges = torch.zeros((2, 0), dtype=torch.long, device=device)
+
+            expected_nodes = max(self._min_required_nodes, required_input_slots + len(self.required_output_slots), 1)
+            if node_embeddings.size(0) < expected_nodes:
+                logger.warning(
+                    "Padding decoder output to expected node count | nodes=%d expected=%d",
+                    node_embeddings.size(0),
+                    expected_nodes,
+                )
+                pad = expected_nodes - node_embeddings.size(0)
+                pad_tensor = torch.zeros((pad, node_embeddings.size(1)), device=node_embeddings.device)
+                node_embeddings = torch.cat([node_embeddings, pad_tensor], dim=0)
+                node_types.extend([0] * pad)
 
             if DEBUG_DECODER:
                 decode_stats["node_time"] = time.perf_counter() - decode_stats["node_start"]
@@ -1216,62 +1304,24 @@ class GraphDecoder(nn.Module):
                 if DEBUG_DECODER:
                     decode_stats["attr_nodes"] += 1
                 attrs = {}
-                pin_role_vec = None
-                decoded_role = None
-                target_pin_role = None
-                forced_role = None
-                forced_slot = None
-                role_locked = False
-                slot_locked = False
-                if node_idx < len(forced_pin_roles):
-                    forced_role = forced_pin_roles[node_idx]
-                    role_locked = forced_role_locked[node_idx]
-                if node_idx < len(forced_pin_slots):
-                    forced_slot = forced_pin_slots[node_idx]
-                    slot_locked = forced_slot_locked[node_idx]
-                if self.pin_role_head is not None:
-                    pin_role_vec = self.pin_role_head(embedding)
-                    decoded_role = self._infer_pin_role(pin_role_vec, pin_role_reference)
-                if graph_pin_targets is not None and node_idx < len(graph_pin_targets):
-                    target_pin_role = graph_pin_targets[node_idx]
-                if pin_role_vec is not None and target_pin_role is not None:
-                    target_vec = self._pin_role_target(target_pin_role, pin_role_reference)
-                    if target_vec is not None:
-                        step_loss = F.mse_loss(pin_role_vec, target_vec, reduction="mean")
-                        pin_role_teacher_loss = pin_role_teacher_loss + step_loss
-                        pin_role_teacher_tokens += 1
-                if decoded_role is None:
-                    decoded_role = target_pin_role
+                # Order-based assignment derived from emission index.
                 locked_role = False
-                if forced_role is not None:
-                    decoded_role = forced_role
-                    locked_role = role_locked or locked_role
-                if decoded_role is not None:
-                    attrs["pin_role"] = decoded_role
+                locked_slot = False
+                order_role = None
+                order_slot = None
+                if node_idx < len(forced_pin_roles):
+                    order_role = forced_pin_roles[node_idx]
+                    locked_role = forced_role_locked[node_idx]
+                if node_idx < len(forced_pin_slots):
+                    order_slot = forced_pin_slots[node_idx]
+                    locked_slot = forced_slot_locked[node_idx]
+
+                if order_role is not None:
+                    attrs["pin_role"] = order_role
                     if locked_role:
                         attrs["_pin_role_locked"] = True
-                slot_scalar = self.pin_slot_head(embedding).squeeze()
-                slot_scalar = _sanitize_pin_slot_scalar(slot_scalar)
-                slot_target = None
-                if graph_slot_targets is not None and node_idx < len(graph_slot_targets):
-                    slot_target = graph_slot_targets[node_idx]
-                if slot_scalar is not None and slot_target is not None:
-                    slot_tensor = torch.tensor([float(slot_target)], dtype=slot_scalar.dtype, device=slot_scalar.device)
-                    slot_loss = F.mse_loss(slot_scalar.view(1), slot_tensor, reduction="mean")
-                    pin_slot_teacher_loss = pin_slot_teacher_loss + slot_loss
-                    pin_slot_teacher_tokens += 1
-                slot_attr = None
-                locked_slot = False
-                if forced_slot is not None:
-                    slot_attr = forced_slot
-                    locked_slot = slot_locked or locked_slot
-                elif slot_scalar is not None:
-                    slot_value = float(slot_scalar.detach().item())
-                    slot_attr = max(0, int(round(abs(slot_value)) - 1))
-                elif slot_target is not None:
-                    slot_attr = max(0, int(round(abs(float(slot_target))) - 1))
-                if slot_attr is not None:
-                    attrs["pin_slot_index"] = slot_attr
+                if order_slot is not None:
+                    attrs["pin_slot_index"] = order_slot
                     if locked_slot:
                         attrs["_pin_slot_locked"] = True
                 name_hidden = embedding.unsqueeze(0).unsqueeze(0)
@@ -1497,46 +1547,42 @@ class GraphDecoder(nn.Module):
                             top_logit,
                             top_idx,
                         )
-                all_graphs.append(
-                    {"node_types": torch.as_tensor(node_types), "node_attributes": node_attributes, "edge_index": edges}
+
+            self._enforce_required_pin_metadata(node_attributes)
+            all_graphs.append(
+                {"node_types": torch.as_tensor(node_types), "node_attributes": node_attributes, "edge_index": edges}
+            )
+            if DEBUG_DECODER:
+                attr_time = time.perf_counter() - decode_stats["attr_start"]
+                total_time = decode_stats["node_time"] + attr_time
+                logger.info(
+                    "Decoder graph %d: nodes=%d edges=%d attr_nodes=%d attr_names=%d attr_values=%d | node_time=%.3fs attr_time=%.3fs total=%.3fs",
+                    decode_stats["graph_index"],
+                    decode_stats["node_count"],
+                    decode_stats["edge_count"],
+                    decode_stats["attr_nodes"],
+                    decode_stats["attr_iters"],
+                    decode_stats["attr_value_cells"],
+                    decode_stats["node_time"],
+                    attr_time,
+                    total_time,
                 )
-                if DEBUG_DECODER:
-                    attr_time = time.perf_counter() - decode_stats["attr_start"]
-                    total_time = decode_stats["node_time"] + attr_time
+                attr_cap_hits = 0
+                teacher_cap_hits = 0
+                for event in decode_stats["attr_events"]:
+                    if event["exit_reason"].startswith("max_attr"):
+                        attr_cap_hits += 1
+                        if event["exit_reason"].endswith("teacher"):
+                            teacher_cap_hits += 1
+                if attr_cap_hits:
                     logger.info(
-                        "Decoder graph %d: nodes=%d edges=%d attr_nodes=%d attr_names=%d attr_values=%d | node_time=%.3fs attr_time=%.3fs total=%.3fs",
+                        "Decoder graph %d attr cap hits=%d (teacher=%d, sampling=%d)",
                         decode_stats["graph_index"],
-                        decode_stats["node_count"],
-                        decode_stats["edge_count"],
-                        decode_stats["attr_nodes"],
-                        decode_stats["attr_iters"],
-                        decode_stats["attr_value_cells"],
-                        decode_stats["node_time"],
-                        attr_time,
-                        total_time,
+                        attr_cap_hits,
+                        teacher_cap_hits,
+                        attr_cap_hits - teacher_cap_hits,
                     )
-                    attr_cap_hits = 0
-                    teacher_cap_hits = 0
-                    for event in decode_stats["attr_events"]:
-                        if event["exit_reason"].startswith("max_attr"):
-                            attr_cap_hits += 1
-                            if event["exit_reason"].endswith("teacher"):
-                                teacher_cap_hits += 1
-                    if attr_cap_hits:
-                        logger.info(
-                            "Decoder graph %d attr cap hits=%d (teacher=%d, sampling=%d)",
-                            decode_stats["graph_index"],
-                            attr_cap_hits,
-                            teacher_cap_hits,
-                            attr_cap_hits - teacher_cap_hits,
-                        )
-            if (
-                attr_teacher_tokens
-                or node_teacher_tokens
-                or edge_teacher_tokens
-                or pin_role_teacher_tokens
-                or pin_slot_teacher_tokens
-            ):
+            if attr_teacher_tokens or node_teacher_tokens or edge_teacher_tokens:
                 return all_graphs, {
                     "loss": attr_teacher_loss,
                     "attribute_tokens": attr_teacher_tokens,
@@ -1544,10 +1590,6 @@ class GraphDecoder(nn.Module):
                     "node_tokens": node_teacher_tokens,
                     "edge_loss": edge_teacher_loss,
                     "edge_tokens": edge_teacher_tokens,
-                    "pin_role_loss": pin_role_teacher_loss,
-                    "pin_role_tokens": pin_role_teacher_tokens,
-                    "pin_slot_loss": pin_slot_teacher_loss,
-                    "pin_slot_tokens": pin_slot_teacher_tokens,
                 }
             return all_graphs
         finally:
@@ -1735,15 +1777,11 @@ class SelfCompressingFitnessRegularizedDAGVAE(nn.Module):
         z,
         teacher_attr_targets: Optional[List[List[List[int]]]] = None,
         teacher_adj_targets: Optional[List[Optional[torch.Tensor]]] = None,
-        teacher_pin_roles: Optional[List[List[str | None]]] = None,
-        teacher_pin_slots: Optional[List[List[float | None]]] = None,
     ):
         return self.decoder(
             z,
             teacher_attr_targets=teacher_attr_targets,
             teacher_adj_targets=teacher_adj_targets,
-            teacher_pin_roles=teacher_pin_roles,
-            teacher_pin_slots=teacher_pin_slots,
         )
 
     def forward(
@@ -1754,8 +1792,6 @@ class SelfCompressingFitnessRegularizedDAGVAE(nn.Module):
         batch,
         teacher_attr_targets: Optional[List[List[List[int]]]] = None,
         teacher_adj_targets: Optional[List[Optional[torch.Tensor]]] = None,
-        teacher_pin_roles: Optional[List[List[str | None]]] = None,
-        teacher_pin_slots: Optional[List[List[float | None]]] = None,
         num_graphs: Optional[int] = None,
     ):
         mu_g, lv_g = self.encode(
@@ -1770,8 +1806,6 @@ class SelfCompressingFitnessRegularizedDAGVAE(nn.Module):
             graph_latent,
             teacher_attr_targets=teacher_attr_targets,
             teacher_adj_targets=teacher_adj_targets,
-            teacher_pin_roles=teacher_pin_roles,
-            teacher_pin_slots=teacher_pin_slots,
         )
         if isinstance(decoded, tuple):
             decoded_graphs, decoder_aux = decoded
@@ -2174,14 +2208,6 @@ class OnlineTrainer:
             if edge_tokens > 0:
                 edge_loss = decoder_aux["edge_loss"] / edge_tokens
                 loss_adj = loss_adj + edge_loss.to(loss_adj.device)
-            pin_tokens = float(decoder_aux.get("pin_role_tokens", 0) or 0)
-            if pin_tokens > 0:
-                pin_loss = decoder_aux["pin_role_loss"] / pin_tokens
-                loss_feat = loss_feat + pin_loss.to(loss_feat.device)
-            slot_tokens = float(decoder_aux.get("pin_slot_tokens", 0) or 0)
-            if slot_tokens > 0:
-                slot_loss = decoder_aux["pin_slot_loss"] / slot_tokens
-                loss_feat = loss_feat + slot_loss.to(loss_feat.device)
 
         denom = max(1, int(batch.num_graphs))
         if empty_penalty > 0 and empty_hits:
@@ -2330,8 +2356,6 @@ class OnlineTrainer:
             "fitness",
             "convex_surrogate",
             "wl_structural",
-            "pin_role_recon",
-            "pin_slot_recon",
         ]
         num_loss_terms = len(loss_term_labels)
         prev_loss_terms = torch.zeros(num_loss_terms)
@@ -2364,8 +2388,6 @@ class OnlineTrainer:
                     target_graph_attrs, None, self.model.shared_attr_vocab
                 )
                 teacher_adj_targets = build_teacher_adj_targets(batch.edge_index, batch.batch, per_graph_node_counts)
-                teacher_pin_roles = build_teacher_pin_roles(target_graph_attrs, None)
-                teacher_pin_slots = build_teacher_pin_slots(target_graph_attrs, None)
                 # --- 1) forward pass ---
                 if DEBUG_TRAINER:
                     logger.info(
@@ -2391,8 +2413,6 @@ class OnlineTrainer:
                     batch.batch,
                     teacher_attr_targets=teacher_attr_targets,
                     teacher_adj_targets=teacher_adj_targets,
-                    teacher_pin_roles=teacher_pin_roles,
-                    teacher_pin_slots=teacher_pin_slots,
                     num_graphs=batch.num_graphs,
                 )
                 target_y = batch.y
@@ -2450,24 +2470,12 @@ class OnlineTrainer:
 
                 wl_loss = self._structural_alignment_loss(batch, graph_latent)
 
-                pin_role_recon = torch.tensor(0.0, device=self.device)
-                pin_slot_recon = torch.tensor(0.0, device=self.device)
-                if decoder_aux is not None:
-                    pin_tokens = float(decoder_aux.get("pin_role_tokens", 0) or 0)
-                    if pin_tokens > 0:
-                        pin_role_recon = (decoder_aux["pin_role_loss"] / pin_tokens).to(self.device)
-                    slot_tokens = float(decoder_aux.get("pin_slot_tokens", 0) or 0)
-                    if slot_tokens > 0:
-                        pin_slot_recon = (decoder_aux["pin_slot_loss"] / slot_tokens).to(self.device)
-
                 loss_adj = _finite_loss(loss_adj)
                 loss_feat = _finite_loss(loss_feat)
                 graph_kl_loss = _finite_loss(graph_kl_loss)
                 loss_fitness = _finite_loss(loss_fitness)
                 loss_convex = _finite_loss(loss_convex)
                 wl_loss = _finite_loss(wl_loss)
-                pin_role_recon = _finite_loss(pin_role_recon)
-                pin_slot_recon = _finite_loss(pin_slot_recon)
 
                 # --- 5) total & backward ---
                 loss_terms = [
@@ -2478,10 +2486,9 @@ class OnlineTrainer:
                     convex_weight * loss_convex,
                     self.wl_loss_weight * wl_loss,
                 ]
-                report_terms = loss_terms + [pin_role_recon, pin_slot_recon]
                 sum(loss_terms).backward()
                 self.optimizer.step()
-                total_loss_terms += torch.tensor(report_terms)
+                total_loss_terms += torch.tensor(loss_terms)
                 if DEBUG_TRAINER and batch_timer is not None:
                     logger.info(
                         "Trainer epoch %d batch %d/%d finished | duration=%.3fs",
@@ -2654,8 +2661,6 @@ class OnlineTrainer:
                 teacher_attr_targets = build_teacher_attr_targets(
                     target_graph_attrs, None, self.model.shared_attr_vocab
                 )
-                teacher_pin_roles = build_teacher_pin_roles(target_graph_attrs, None)
-                teacher_pin_slots = build_teacher_pin_slots(target_graph_attrs, None)
                 (
                     decoded_graphs,
                     _fitness_pred,
@@ -2671,8 +2676,6 @@ class OnlineTrainer:
                     batch.node_attributes,
                     batch.batch,
                     teacher_attr_targets=teacher_attr_targets,
-                    teacher_pin_roles=teacher_pin_roles,
-                    teacher_pin_slots=teacher_pin_slots,
                     num_graphs=batch.num_graphs,
                 )
                 loss_adj, loss_feat = self._compute_reconstruction_losses(
@@ -2726,7 +2729,7 @@ if __name__ == "__main__":
     attr_encoder = NodeAttributeDeepSetEncoder(shared_attr_vocab, encoder_hdim=10, aggregator_hdim=20, out_dim=20)
 
     graph_encoder = GraphEncoder(num_node_types, attr_encoder, graph_latent_dim, hidden_dims=[32, 32])
-    decoder = GraphDecoder(num_node_types, graph_latent_dim, shared_attr_vocab, graph_encoder.pin_role_embedding)
+    decoder = GraphDecoder(num_node_types, graph_latent_dim, shared_attr_vocab)
     predictor = FitnessPredictor(
         latent_dim=graph_latent_dim,
         hidden_dim=64,

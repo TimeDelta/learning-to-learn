@@ -413,21 +413,23 @@ def genome_from_graph_dict(graph_dict, genome_config, key=None) -> OptimizerGeno
             continue
         ng = NodeGene(node_key, None)
         attr_dict = node_attrs_seq[nid] if nid < len(node_attrs_seq) else {}
-        node_type_name = attr_dict.get("node_type")
-        if node_type_name is None:
+        node_type_name = attr_dict.get("node_type") if isinstance(attr_dict, dict) else None
+        if isinstance(node_type_name, str):
+            sanitized_type = node_type_name
+        else:
             try:
-                node_type_name = node_type_name_from_index(int(type_idx))
-            except (ValueError, TypeError, KeyError):
-                node_type_name = "hidden"
-        elif not isinstance(node_type_name, str):
-            node_type_name = str(node_type_name)
-            print(node_type_name)
+                sanitized_type = node_type_name_from_index(int(type_idx))
+            except (ValueError, TypeError, KeyError) as exc:
+                raise ValueError(
+                    f"Graph dict node {nid} carries invalid node_type {node_type_name!r} and type index {type_idx!r}"
+                ) from exc
             if isinstance(attr_dict, dict):
-                attr_dict = dict(attr_dict)
-                attr_dict["node_type"] = node_type_name
-                node_attrs_seq[nid] = attr_dict
-        ng.node_type = node_type_name
-        dyn_attrs = dict(attr_dict)
+                updated = dict(attr_dict)
+                updated["node_type"] = sanitized_type
+                node_attrs_seq[nid] = updated
+                attr_dict = updated
+        ng.node_type = sanitized_type
+        dyn_attrs = dict(attr_dict) if isinstance(attr_dict, dict) else {}
         for seq_key in ("__output_types__", "__input_types__", "__input_kinds__", "__getattr_output_types__"):
             val = dyn_attrs.get(seq_key)
             if isinstance(val, (list, tuple)):

@@ -7,12 +7,17 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+TESTS_DIR = pathlib.Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+
+from factories import make_neat_config
+
 from graph_ir import export_script_module_to_graph_ir
 from loop_blocks import decode_block_payload, register_graph_blocks, snapshot_registry
 from main import create_initial_genome
 from population import BLOCK_PAYLOAD_ATTR_PREFIX, GuidedPopulation
 from search_space_compression import attribute_key_to_name
-from tests.test_graph_builder import make_config  # reuse helper
 
 
 class LoopModule(torch.nn.Module):
@@ -38,7 +43,7 @@ def test_loop_blocks_register_and_snapshot():
 
 
 def test_initial_genome_captures_loop_attributes():
-    config = make_config()
+    config = make_neat_config()
     module = torch.jit.script(LoopModule())
     genome = create_initial_genome(config, module)
     assert genome.graph_dict.get("block_registry"), "Graph dict should preserve block registry"
@@ -54,7 +59,7 @@ def test_initial_genome_captures_loop_attributes():
 
 
 def test_block_payload_attribute_round_trip():
-    config = make_config()
+    config = make_neat_config()
     module = torch.jit.script(LoopModule())
     genome = create_initial_genome(config, module)
     payload_tensors = []
@@ -68,7 +73,7 @@ def test_block_payload_attribute_round_trip():
 
 
 def test_guided_population_preserves_block_registry():
-    config = make_config()
+    config = make_neat_config()
     module = torch.jit.script(LoopModule())
     genome = create_initial_genome(config, module)
     pop = GuidedPopulation(config)

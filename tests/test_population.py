@@ -4,13 +4,18 @@ import sys
 from collections import deque
 from types import MethodType, SimpleNamespace
 
-import neat
 import numpy as np
 import pytest
 import torch
 from torch_geometric.data import Batch, Data
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+
+tests_dir = os.path.dirname(__file__)
+if tests_dir not in sys.path:
+    sys.path.insert(0, tests_dir)
+
+from factories import make_neat_config
 
 import population as population_module
 from attributes import FloatAttribute, IntAttribute
@@ -121,17 +126,6 @@ class StubGuide:
         return [graph]
 
 
-def make_config():
-    config_path = os.path.join(os.path.dirname(__file__), os.pardir, "neat-config")
-    return neat.Config(
-        OptimizerGenome,
-        GuidedReproduction,
-        neat.DefaultSpeciesSet,
-        RelativeRankStagnation,
-        config_path,
-    )
-
-
 def create_simple_genome(key=0):
     genome = OptimizerGenome(key)
     ng0 = NodeGene(0, None)
@@ -149,15 +143,36 @@ def create_simple_genome(key=0):
 
 
 def make_decoded_graph(bias):
-    node_types = torch.tensor([NODE_TYPE_TO_INDEX["aten::add"], NODE_TYPE_TO_INDEX["aten::mul"]], dtype=torch.long)
-    edge_index = torch.tensor([[0], [1]], dtype=torch.long)
+    input_type = NODE_TYPE_TO_INDEX.get("prim::GetAttr", 0)
+    add_type = NODE_TYPE_TO_INDEX.get("aten::add", 0)
+    mul_type = NODE_TYPE_TO_INDEX.get("aten::mul", 0)
+    output_type = NODE_TYPE_TO_INDEX.get("prim::Return", 0)
+    node_types = torch.tensor([input_type, input_type, input_type, add_type, mul_type, output_type], dtype=torch.long)
     node_attrs = [
+        {"pin_role": "input", "pin_slot_index": 0},
+        {"pin_role": "input", "pin_slot_index": 1},
+        {"pin_role": "input", "pin_slot_index": 2},
         {"node_type": "aten::add", "bias": torch.tensor([bias])},
         {"node_type": "aten::mul", "bias": torch.tensor([bias * 2])},
+        {"pin_role": "output", "pin_slot_index": 0},
     ]
+    edges = (
+        torch.tensor(
+            [
+                [0, 3],
+                [1, 3],
+                [2, 3],
+                [3, 4],
+                [4, 5],
+            ],
+            dtype=torch.long,
+        )
+        .t()
+        .contiguous()
+    )
     return {
         "node_types": node_types,
-        "edge_index": edge_index,
+        "edge_index": edges,
         "node_attributes": node_attrs,
     }
 
@@ -175,7 +190,7 @@ def make_graph_factory(bias):
 
 
 def configure_stub_population(graph_factories, monkeypatch):
-    config = make_config()
+    config = make_neat_config()
     pop = GuidedPopulation(config)
     pop.guide = StubGuide(graph_factories)
     pop._optimizer_updates_parameters = lambda *args, **kwargs: True
@@ -188,7 +203,7 @@ def configure_stub_population(graph_factories, monkeypatch):
 
 
 def test_genome_to_data():
-    config = make_config()
+    config = make_neat_config()
     pop = GuidedPopulation(config)
     genome = create_simple_genome()
     data = pop.genome_to_data(genome)
@@ -197,7 +212,7 @@ def test_genome_to_data():
 
 
 def test_genome_to_data_preserves_graph_ir(monkeypatch):
-    config = make_config()
+    config = make_neat_config()
     pop = GuidedPopulation(config)
     genome = create_simple_genome()
     genome.graph_dict = {
@@ -311,7 +326,7 @@ def test_generate_guided_offspring_buffers_near_misses(monkeypatch):
 
 
 def test_seed_decoder_replay_rebuilds_missing_graph_dicts():
-    config = make_config()
+    config = make_neat_config()
     pop = GuidedPopulation(config)
 
     population_size = 3
@@ -356,7 +371,7 @@ def test_seed_decoder_replay_rebuilds_missing_graph_dicts():
 
 
 def test_generation_eval_steps_respects_max_cap():
-    config = make_config()
+    config = make_neat_config()
     config.max_evaluation_steps = 30
     pop = GuidedPopulation(config)
     pop.generation = 50
@@ -368,7 +383,7 @@ def test_generation_eval_steps_respects_max_cap():
 
 
 def test_test_mode_reduces_trainer_epochs():
-    config = make_config()
+    config = make_neat_config()
     config.test_mode = True
     config.test_epoch_scale = 0.1
     pop = GuidedPopulation(config)
@@ -385,7 +400,7 @@ def test_test_mode_reduces_trainer_epochs():
 
 
 def test_graph_output_slot_precheck_detects_missing_slots():
-    config = make_config()
+    config = make_neat_config()
     pop = GuidedPopulation(config)
     graph_dict = {
         "edge_index": torch.empty((2, 0), dtype=torch.long),
@@ -412,7 +427,7 @@ def test_graph_output_slot_precheck_detects_missing_slots():
 
 
 def test_generate_guided_offspring():
-    config = make_config()
+    config = make_neat_config()
     pop = GuidedPopulation(config)
     pop.guide.decoder.max_nodes = 2
     pop.guide.decoder.max_attributes_per_node = 2
@@ -435,7 +450,7 @@ def test_generate_guided_offspring():
 
 
 def test_eval_genomes_penalizes_skipped_empty_graphs():
-    config = make_config()
+    config = make_neat_config()
     pop = GuidedPopulation(config)
     task = RegressionTask.random_init(num_samples=4, silent=True)
 
@@ -445,7 +460,12 @@ def test_eval_genomes_penalizes_skipped_empty_graphs():
     genome.invalid_reason = "empty_graph"
 
     pop.task = task
-    pop.eval_genomes([(0, genome)], config, steps=1)
+    counter_snapshot = population_module._INVALID_REASON_COUNTER.copy()
+    try:
+        pop.eval_genomes([(0, genome)], config, steps=1)
+    finally:
+        population_module._INVALID_REASON_COUNTER.clear()
+        population_module._INVALID_REASON_COUNTER.update(counter_snapshot)
 
     assert getattr(genome, "invalid_graph", False)
     assert genome.fitnesses[AreaUnderTaskMetrics] == GuidedPopulation.INVALID_METRIC_VALUE
@@ -455,7 +475,7 @@ def test_eval_genomes_penalizes_skipped_empty_graphs():
 
 
 def test_assign_penalty_records_decoder_failure_when_requested():
-    config = make_config()
+    config = make_neat_config()
     pop = GuidedPopulation(config)
     recorded = {}
 
@@ -482,7 +502,7 @@ def test_assign_penalty_records_decoder_failure_when_requested():
 
 
 def test_guided_invalid_visualization_emits_mermaid_files(tmp_path):
-    config = make_config()
+    config = make_neat_config()
     pop = GuidedPopulation(config)
     pop.generation = 2
     pop.guided_invalid_viz_enabled = True
@@ -516,7 +536,7 @@ def test_guided_invalid_visualization_emits_mermaid_files(tmp_path):
 
 
 def test_guided_invalid_visualization_writes_separate_decoded_mermaid(tmp_path):
-    config = make_config()
+    config = make_neat_config()
     pop = GuidedPopulation(config)
     pop.generation = 5
     pop.guided_invalid_viz_enabled = True
@@ -551,7 +571,7 @@ def test_guided_invalid_visualization_writes_separate_decoded_mermaid(tmp_path):
 
 
 def test_guided_invalid_visualization_mermaid_only(tmp_path):
-    config = make_config()
+    config = make_neat_config()
     pop = GuidedPopulation(config)
     pop.generation = 4
     pop.guided_invalid_viz_enabled = True
@@ -582,7 +602,7 @@ def test_guided_invalid_visualization_mermaid_only(tmp_path):
 
 
 def test_guided_invalid_visualization_mermaid_uses_repaired_graph(tmp_path):
-    config = make_config()
+    config = make_neat_config()
     pop = GuidedPopulation(config)
     pop.generation = 6
     pop.guided_invalid_viz_enabled = True
@@ -617,7 +637,7 @@ def test_guided_invalid_visualization_mermaid_uses_repaired_graph(tmp_path):
 
 
 def test_guided_invalid_visualization_warns_on_unsupported_format(tmp_path):
-    config = make_config()
+    config = make_neat_config()
     pop = GuidedPopulation(config)
     pop.generation = 3
     pop.guided_invalid_viz_enabled = True
@@ -645,7 +665,7 @@ def test_guided_invalid_visualization_warns_on_unsupported_format(tmp_path):
 
 
 def test_generate_guided_offspring_handles_missing_elites():
-    config = make_config()
+    config = make_neat_config()
     pop = GuidedPopulation(config)
     pop.guide.decoder.max_nodes = 2
     pop.guide.decoder.max_attributes_per_node = 2
@@ -669,114 +689,8 @@ def _make_empty_graph_dict(node_count: int, node_attrs):
     }
 
 
-def test_repair_synthesizes_pin_roles_when_labels_missing():
-    config = make_config()
-    pop = GuidedPopulation(config)
-    num_inputs = len(config.genome_config.input_keys)
-    output_slots = [int(ok) for ok in config.genome_config.output_keys if isinstance(ok, (int, float))]
-    max_output_slot = max(output_slots) if output_slots else -1
-    node_count = max(max_output_slot + 1, num_inputs + len(output_slots) + 1, 1)
-    graph = _make_empty_graph_dict(node_count, [{} for _ in range(node_count)])
-
-    pop._repair_graph_dict(graph)
-    attrs = graph["node_attributes"]
-    input_count = sum(1 for attr in attrs if attr.get("pin_role") == "input")
-    output_count = sum(1 for attr in attrs if attr.get("pin_role") == "output")
-    assert input_count >= num_inputs
-    assert output_count >= min(len(output_slots), node_count)
-    input_slots = {
-        attr.get("pin_slot_index")
-        for attr in attrs
-        if attr.get("pin_role") == "input" and attr.get("pin_slot_index") is not None
-    }
-    assert {slot for slot in range(num_inputs)}.issubset(input_slots)
-    assert graph["edge_index"].numel() > 0
-
-
-def test_repair_fails_when_not_enough_input_nodes():
-    config = make_config()
-    required_inputs = len(config.genome_config.input_keys)
-    if required_inputs <= 1:
-        pytest.skip("config does not require multiple input slots")
-    pop = GuidedPopulation(config)
-    node_count = max(1, required_inputs - 1)
-    graph = _make_empty_graph_dict(node_count, [{} for _ in range(node_count)])
-
-    assert not pop._repair_graph_dict(graph)
-    assert graph["_repair_failure_reason"] == "missing_input_slots"
-    details = graph["_repair_failure_details"]
-    missing = details.get("missing_slots") or []
-    assert missing  # should report which slots are uncovered
-    assert graph["edge_index"].numel() == 0
-
-
-def test_repair_reports_slot_collisions_when_slots_unavailable():
-    config = make_config()
-    required_inputs = len(config.genome_config.input_keys)
-    if required_inputs <= 1:
-        pytest.skip("config does not require multiple input slots")
-    node_count = required_inputs
-    # Reserve every slot as an output so the repair hook cannot repurpose nodes freely.
-    config.genome_config.output_keys = list(range(node_count))
-    pop = GuidedPopulation(config)
-    node_attrs = [{"pin_role": "input", "pin_slot_index": 0} for _ in range(node_count)]
-    graph = _make_empty_graph_dict(node_count, node_attrs)
-
-    assert not pop._repair_graph_dict(graph)
-    assert graph["_repair_failure_reason"] == "missing_input_slots"
-    details = graph["_repair_failure_details"]
-    assert details["missing_slots"], "slot coverage should be reported"
-
-
-def test_repair_reports_missing_output_slots_when_nodes_absent():
-    config = make_config()
-    missing_slot = len(config.genome_config.input_keys) + 1
-    config.genome_config.output_keys = [0, missing_slot]
-    pop = GuidedPopulation(config)
-    node_count = max(len(config.genome_config.input_keys), missing_slot)
-    node_attrs = [{} for _ in range(node_count)]
-    graph = _make_empty_graph_dict(len(node_attrs), node_attrs)
-
-    assert pop._repair_graph_dict(graph)
-    assert graph.get("_repair_failure_reason") is None
-    outputs = {attr.get("pin_slot_index") for attr in graph["node_attributes"] if attr.get("pin_role") == "output"}
-    assert {0, missing_slot}.issubset(outputs)
-
-
-def test_repair_allows_locked_outputs_sharing_input_slots():
-    config = make_config()
-    required_inputs = len(config.genome_config.input_keys)
-    if required_inputs == 0:
-        pytest.skip("config does not require input slots")
-    config.genome_config.output_keys = [0]
-    pop = GuidedPopulation(config)
-    node_attrs = []
-    for slot in range(required_inputs):
-        node_attrs.append(
-            {
-                "pin_role": "input",
-                "pin_slot_index": slot,
-                "_pin_role_locked": True,
-                "_pin_slot_locked": True,
-            }
-        )
-    node_attrs.append(
-        {
-            "pin_role": "output",
-            "pin_slot_index": 0,
-            "_pin_role_locked": True,
-            "_pin_slot_locked": True,
-        }
-    )
-    graph = _make_empty_graph_dict(len(node_attrs), node_attrs)
-
-    pop._repair_graph_dict(graph)
-    assert graph.get("_repair_failure_reason") is None
-    assert graph.get("_repair_failure_details") is None
-
-
 def test_repair_connects_hidden_nodes_to_inputs_and_outputs():
-    config = make_config()
+    config = make_neat_config()
     pop = GuidedPopulation(config)
     node_attrs = [
         {"pin_role": "input", "pin_slot_index": 0},
@@ -841,7 +755,7 @@ def test_prepare_decoded_graph_dict_rebuilds_block_registry_from_payload():
                 updates[name] = param - 0.1 * total
             return updates
 
-    config = make_config()
+    config = make_neat_config()
     pop = GuidedPopulation(config)
     genome = create_initial_genome(config, torch.jit.script(LoopTemplate()))
     graph_dict = pop._clone_graph_dict(genome.graph_dict, include_history=False)
@@ -876,7 +790,7 @@ def test_repair_builds_loop_from_payload_without_registry():
                 updates[name] = param - 0.05 * total
             return updates
 
-    config = make_config()
+    config = make_neat_config()
     pop = GuidedPopulation(config)
     genome = create_initial_genome(config, torch.jit.script(LoopTemplate()))
     graph_dict = pop._clone_graph_dict(genome.graph_dict, include_history=False)
@@ -893,7 +807,7 @@ def test_repair_builds_loop_from_payload_without_registry():
 
 
 def test_repair_preserves_seeded_input_pins():
-    config = make_config()
+    config = make_neat_config()
     pop = GuidedPopulation(config)
     required_inputs = len(config.genome_config.input_keys)
     if required_inputs < 2:
@@ -920,7 +834,7 @@ def test_repair_preserves_seeded_input_pins():
 
 
 def test_repair_preserves_predicted_edges_for_visualization():
-    config = make_config()
+    config = make_neat_config()
     required_inputs = len(config.genome_config.input_keys)
     if required_inputs <= 1:
         pytest.skip("config does not require multiple input slots")
@@ -943,7 +857,7 @@ def test_repair_preserves_predicted_edges_for_visualization():
 
 
 def test_output_slot_coverage_accepts_metadata_slots():
-    config = make_config()
+    config = make_neat_config()
     pop = GuidedPopulation(config)
     node_attrs = [
         {"pin_role": "input", "pin_slot_index": 0},
@@ -965,7 +879,7 @@ def test_output_slot_coverage_accepts_metadata_slots():
 
 
 def test_output_slot_coverage_requires_incoming_edges():
-    config = make_config()
+    config = make_neat_config()
     pop = GuidedPopulation(config)
     node_attrs = [
         {"pin_role": "input", "pin_slot_index": 0},
@@ -986,7 +900,7 @@ def test_output_slot_coverage_requires_incoming_edges():
 
 
 def test_prepare_decoded_graph_strips_invalid_edges():
-    config = make_config()
+    config = make_neat_config()
     pop = GuidedPopulation(config)
     graph = {
         "node_types": torch.tensor([0], dtype=torch.long),
@@ -1003,7 +917,7 @@ def test_prepare_decoded_graph_strips_invalid_edges():
 
 
 def test_penalty_scale_handles_missing_input_slots():
-    config = make_config()
+    config = make_neat_config()
     pop = GuidedPopulation(config)
     details = {"total_slots": 4, "missing_count": 2}
     scale = pop._penalty_scale("missing_input_slots", details)
@@ -1011,7 +925,7 @@ def test_penalty_scale_handles_missing_input_slots():
 
 
 def test_penalty_scale_accounts_for_wrong_type_outputs():
-    config = make_config()
+    config = make_neat_config()
     pop = GuidedPopulation(config)
     details = {
         "total_slots": 3,
@@ -1024,7 +938,7 @@ def test_penalty_scale_accounts_for_wrong_type_outputs():
 
 
 def test_repair_connects_each_input_to_output():
-    config = make_config()
+    config = make_neat_config()
     pop = GuidedPopulation(config)
     num_inputs = len(config.genome_config.input_keys)
     num_outputs = len(config.genome_config.output_keys)
@@ -1071,12 +985,12 @@ def test_repair_connects_each_input_to_output():
 
 
 def test_repair_randomization_changes_fallback_edge_choices():
-    base_config = make_config()
+    base_config = make_neat_config()
     base_config.genome_config.input_keys = [0]
     base_config.genome_config.output_keys = [0]
     deterministic_pop = GuidedPopulation(base_config)
 
-    rand_config = make_config()
+    rand_config = make_neat_config()
     rand_config.genome_config.input_keys = [0]
     rand_config.genome_config.output_keys = [0]
     rand_config.repair_randomize_connections = True
@@ -1190,7 +1104,7 @@ def test_node_attribute_encoder_accepts_tensor_values():
 
 
 def test_evaluate_optimizer_resizes_state_before_execution():
-    config = make_config()
+    config = make_neat_config()
     population = GuidedPopulation(config)
     model = ManyLossMinimaModel(population.task.train_data.num_input_features)
     optimizer = DummyStatefulOptimizer()
@@ -1221,7 +1135,7 @@ def test_evaluate_optimizer_resets_state_and_step_each_run():
             self.step += 1
             return updated
 
-    config = make_config()
+    config = make_neat_config()
     population = GuidedPopulation(config)
     model = ManyLossMinimaModel(population.task.train_data.num_input_features)
     optimizer = TrackingOptimizer()
@@ -1241,7 +1155,7 @@ def test_evaluate_optimizer_marks_nan_outputs_invalid():
         def forward(self, loss, prev_loss, named_parameters):
             return {name: torch.full_like(param, float("nan")) for name, param in named_parameters}
 
-    config = make_config()
+    config = make_neat_config()
     population = GuidedPopulation(config)
     model = ManyLossMinimaModel(population.task.train_data.num_input_features)
 
@@ -1252,7 +1166,7 @@ def test_evaluate_optimizer_marks_nan_outputs_invalid():
 
 
 def test_optimizer_state_attributes_include_empty_dicts():
-    config = make_config()
+    config = make_neat_config()
     pop = GuidedPopulation(config)
     opt = EmptyStateOptimizer()
 

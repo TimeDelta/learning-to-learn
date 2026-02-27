@@ -281,3 +281,131 @@ def test_graph_decoder_seeds_output_pin_roles():
     outputs = [attrs for attrs in graph["node_attributes"] if attrs.get("pin_role") == "output"]
     assert any(attr.get("pin_slot_index") == 0 for attr in outputs)
     assert any(attr.get("pin_slot_index") == 3 for attr in outputs)
+
+
+def test_graph_decoder_fallbacks_to_min_pin_nodes_for_inputs():
+    vocab = SharedAttributeVocab([], embedding_dim=4)
+    decoder = GraphDecoder(
+        num_node_types=3,
+        latent_dim=8,
+        shared_attr_vocab=vocab,
+        hidden_dim=4,
+        min_pin_nodes=5,
+        required_input_count=1,
+        required_output_slots=[0],
+    )
+    decoder.eval()
+
+    with torch.no_grad():
+        decoder.stop_head.weight.zero_()
+        decoder.stop_head.bias.fill_(20.0)
+
+    graph = decoder(torch.zeros(1, decoder.latent_dim))[0]
+    attrs = graph["node_attributes"]
+    expected_inputs = 4  # min_pin_nodes (5) - len(output slots) (1)
+    observed_inputs = [idx for idx, attr in enumerate(attrs) if attr.get("pin_role") == "input"]
+    assert len(observed_inputs) >= expected_inputs
+    for slot in range(expected_inputs):
+        assert attrs[slot]["pin_role"] == "input"
+        assert attrs[slot]["pin_slot_index"] == slot
+
+
+def test_graph_decoder_reserves_slot_for_outputs_when_inputs_disabled():
+    vocab = SharedAttributeVocab([], embedding_dim=4)
+    decoder = GraphDecoder(
+        num_node_types=3,
+        latent_dim=8,
+        shared_attr_vocab=vocab,
+        hidden_dim=4,
+        min_pin_nodes=0,
+        required_input_count=0,
+        required_output_slots=[0],
+    )
+    decoder.eval()
+
+    with torch.no_grad():
+        decoder.stop_head.weight.zero_()
+        decoder.stop_head.bias.fill_(20.0)
+
+    graph = decoder(torch.zeros(1, decoder.latent_dim))[0]
+    attrs = graph["node_attributes"]
+    inputs = [attr for attr in attrs if attr.get("pin_role") == "input"]
+    outputs = [attr for attr in attrs if attr.get("pin_role") == "output"]
+
+    assert inputs, "decoder should synthesize at least one input pin"
+    assert outputs, "decoder must leave room for configured outputs"
+    assert attrs[len(inputs)]["pin_role"] == "output"
+    assert outputs[0]["pin_slot_index"] == 0
+
+
+def test_graph_decoder_teacher_forcing_extends_minimum_nodes():
+    vocab = SharedAttributeVocab([], embedding_dim=4)
+    decoder = GraphDecoder(
+        num_node_types=3,
+        latent_dim=8,
+        shared_attr_vocab=vocab,
+        hidden_dim=4,
+        min_pin_nodes=4,
+        required_input_count=3,
+        required_output_slots=[0],
+    )
+    decoder.train()
+
+    with torch.no_grad():
+        decoder.stop_head.weight.zero_()
+        decoder.stop_head.bias.fill_(-20.0)
+
+    teacher_nodes = 2  # deliberately less than min_pin_nodes to force decoder-generated extras
+    eos = decoder.attr_eos_index
+    teacher_attr_targets = [[[eos] for _ in range(teacher_nodes)]]
+
+    graphs, _ = decoder(torch.zeros(1, decoder.latent_dim), teacher_attr_targets=teacher_attr_targets)
+    graph = graphs[0]
+    attrs = graph["node_attributes"]
+
+    assert len(attrs) >= 4
+    inputs = [attr for attr in attrs if attr.get("pin_role") == "input"]
+    outputs = [attr for attr in attrs if attr.get("pin_role") == "output"]
+
+    assert len(inputs) >= 3
+    assert outputs, "decoder must reserve at least one output slot"
+
+
+def test_graph_decoder_invokes_pin_enforcement_once(monkeypatch):
+    vocab = SharedAttributeVocab([], embedding_dim=4)
+    decoder = GraphDecoder(
+        num_node_types=3,
+        latent_dim=8,
+        shared_attr_vocab=vocab,
+        hidden_dim=4,
+        min_pin_nodes=4,
+        required_input_count=3,
+        required_output_slots=[0],
+    )
+    decoder.eval()
+
+    with torch.no_grad():
+        decoder.stop_head.weight.zero_()
+        decoder.stop_head.bias.fill_(20.0)
+
+    call_counts: list[int] = []
+    original = GraphDecoder._enforce_required_pin_metadata
+
+    def tracker(self, node_attributes):
+        call_counts.append(len(node_attributes))
+        return original(self, node_attributes)
+
+    monkeypatch.setattr(GraphDecoder, "_enforce_required_pin_metadata", tracker)
+
+    graphs = decoder(torch.zeros(1, decoder.latent_dim))
+    assert len(graphs) == 1
+
+    expected_nodes = max(
+        decoder._min_required_nodes,
+        decoder._resolved_required_input_slots() + len(decoder.required_output_slots),
+        1,
+    )
+    assert len(call_counts) == 1
+    node_attrs_len = len(graphs[0]["node_attributes"])
+    assert call_counts[0] == node_attrs_len
+    assert node_attrs_len >= expected_nodes
