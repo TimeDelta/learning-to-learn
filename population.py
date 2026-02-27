@@ -932,8 +932,6 @@ class GuidedPopulation(Population):
             entry["pin_role"] = PIN_ROLE_INPUT
             entry["pin_slot_index"] = slot
             entry.setdefault("node_type", PIN_ROLE_INPUT)
-            entry["_pin_role_locked"] = True
-            entry["_pin_slot_locked"] = True
         for offset, slot in enumerate(required_outputs):
             idx = required_inputs + offset
             if idx >= len(node_attrs):
@@ -942,8 +940,6 @@ class GuidedPopulation(Population):
             entry["pin_role"] = PIN_ROLE_OUTPUT
             entry["pin_slot_index"] = slot
             entry.setdefault("node_type", PIN_ROLE_OUTPUT)
-            entry["_pin_role_locked"] = True
-            entry["_pin_slot_locked"] = True
         graph_dict["node_attributes"] = node_attrs
 
     def _prepare_decoded_graph_dict(self, graph_dict: dict | None) -> Tuple[int, List[Tuple[int, int]]]:

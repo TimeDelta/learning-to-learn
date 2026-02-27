@@ -927,8 +927,6 @@ class GraphDecoder(nn.Module):
                 attrs = {}
             attrs["pin_role"] = PIN_ROLE_INPUT
             attrs["pin_slot_index"] = slot
-            attrs["_pin_role_locked"] = True
-            attrs["_pin_slot_locked"] = True
             node_attributes[slot] = attrs
         if total <= input_slots:
             logger.warning(
@@ -958,8 +956,6 @@ class GraphDecoder(nn.Module):
                 attrs = {}
             attrs["pin_role"] = PIN_ROLE_OUTPUT
             attrs["pin_slot_index"] = int(slot)
-            attrs["_pin_role_locked"] = True
-            attrs["_pin_slot_locked"] = True
             node_attributes[idx] = attrs
 
     def forward(
@@ -1046,8 +1042,6 @@ class GraphDecoder(nn.Module):
                     teacher_force_nodes = self.training and (target_node_count is not None)
                     forced_pin_roles: List[str | None] = []
                     forced_pin_slots: List[int | None] = []
-                    forced_role_locked: List[bool] = []
-                    forced_slot_locked: List[bool] = []
                     output_slot_index = 0
                     minimum_required_nodes = max(
                         self._min_required_nodes,
@@ -1120,23 +1114,15 @@ class GraphDecoder(nn.Module):
                             node_index = t
                             forced_role = None
                             forced_slot = None
-                            role_locked = False
-                            slot_locked = False
                             if required_input_slots and node_index < required_input_slots:
                                 forced_role = PIN_ROLE_INPUT
                                 forced_slot = node_index
-                                role_locked = True
-                                slot_locked = True
                             elif output_slot_index < len(self.required_output_slots):
                                 forced_role = PIN_ROLE_OUTPUT
                                 forced_slot = self.required_output_slots[output_slot_index]
-                                role_locked = True
-                                slot_locked = True
                                 output_slot_index += 1
                             forced_pin_roles.append(forced_role)
                             forced_pin_slots.append(forced_slot)
-                            forced_role_locked.append(role_locked)
-                            forced_slot_locked.append(slot_locked)
                             hidden_edge = hidden_node
                             edge_in = torch.zeros(1, 1, device=device)
                             node_edge_budget = 0
@@ -1206,23 +1192,15 @@ class GraphDecoder(nn.Module):
                 node_index = len(node_embeddings) - 1
                 forced_role = None
                 forced_slot = None
-                role_locked = False
-                slot_locked = False
                 if required_input_slots and node_index < required_input_slots:
                     forced_role = PIN_ROLE_INPUT
                     forced_slot = node_index
-                    role_locked = True
-                    slot_locked = True
                 elif output_slot_index < len(self.required_output_slots):
                     forced_role = PIN_ROLE_OUTPUT
                     forced_slot = self.required_output_slots[output_slot_index]
-                    role_locked = True
-                    slot_locked = True
                     output_slot_index += 1
                 forced_pin_roles.append(forced_role)
                 forced_pin_slots.append(forced_slot)
-                forced_role_locked.append(role_locked)
-                forced_slot_locked.append(slot_locked)
                 hidden_edge = hidden_node
                 edge_in = torch.zeros(1, 1, device=device)
                 node_edge_budget = 0
@@ -1305,25 +1283,17 @@ class GraphDecoder(nn.Module):
                     decode_stats["attr_nodes"] += 1
                 attrs = {}
                 # Order-based assignment derived from emission index.
-                locked_role = False
-                locked_slot = False
                 order_role = None
                 order_slot = None
                 if node_idx < len(forced_pin_roles):
                     order_role = forced_pin_roles[node_idx]
-                    locked_role = forced_role_locked[node_idx]
                 if node_idx < len(forced_pin_slots):
                     order_slot = forced_pin_slots[node_idx]
-                    locked_slot = forced_slot_locked[node_idx]
 
                 if order_role is not None:
                     attrs["pin_role"] = order_role
-                    if locked_role:
-                        attrs["_pin_role_locked"] = True
                 if order_slot is not None:
                     attrs["pin_slot_index"] = order_slot
-                    if locked_slot:
-                        attrs["_pin_slot_locked"] = True
                 name_hidden = embedding.unsqueeze(0).unsqueeze(0)
                 val_hidden = None
                 t = 0

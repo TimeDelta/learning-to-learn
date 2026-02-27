@@ -298,8 +298,6 @@ def create_initial_genome(config, optimizer):
         attrs = _bind_slot_to_node(slot_index, key)
         attrs["pin_role"] = "input"
         attrs["pin_slot_index"] = slot_index
-        attrs["_pin_role_locked"] = True
-        attrs["_pin_slot_locked"] = True
 
     output_producers: List[torch._C.Node] = []
     for value in optimizer.graph.outputs():
@@ -327,8 +325,6 @@ def create_initial_genome(config, optimizer):
         attrs = _bind_slot_to_node(output_attr_offset + slot_offset, key)
         attrs["pin_role"] = "output"
         attrs["pin_slot_index"] = key
-        attrs["_pin_role_locked"] = True
-        attrs["_pin_slot_locked"] = True
 
     next_node_id = 0
     for node in graph_nodes:

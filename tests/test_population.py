@@ -818,8 +818,6 @@ def test_repair_preserves_seeded_input_pins():
             {
                 "pin_role": "input",
                 "pin_slot_index": slot,
-                "_pin_role_locked": True,
-                "_pin_slot_locked": True,
             }
         )
     node_attrs.append({})
