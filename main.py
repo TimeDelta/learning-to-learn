@@ -184,9 +184,14 @@ def create_initial_genome(config, optimizer):
             node_idx = node_index_map.get(ts_node)
             if node_idx is not None:
                 block_ids_for_node = node_block_map.get(node_idx, [])
+                graph_block_attrs: Dict[str, Any] | None = None
                 for block_pos, block_id in enumerate(block_ids_for_node):
+                    if graph_block_attrs is None:
+                        graph_block_attrs = _graph_attrs_for_node(node_key)
                     ref_name = f"{BLOCK_REF_ATTR_PREFIX}{block_pos}"
-                    new_node_gene.dynamic_attributes[ref_name] = torch.tensor([float(block_id)], dtype=torch.float32)
+                    ref_tensor = torch.tensor([float(block_id)], dtype=torch.float32)
+                    new_node_gene.dynamic_attributes[ref_name] = ref_tensor
+                    graph_block_attrs[ref_name] = ref_tensor
                     payload = block_registry.get(block_id)
                     if payload:
                         payload_name = f"{BLOCK_PAYLOAD_ATTR_PREFIX}{block_pos}"
@@ -199,6 +204,7 @@ def create_initial_genome(config, optimizer):
                             # decoder/repair path can round-trip nested control flow
                             # without consulting external templates
                             new_node_gene.dynamic_attributes[payload_name] = encoded
+                            graph_block_attrs[payload_name] = encoded
         genome.nodes[node_key] = new_node_gene
 
     genome = config.genome_type(0)
@@ -213,6 +219,15 @@ def create_initial_genome(config, optimizer):
 
     node_mapping = {}  # from TorchScript nodes to genome node keys
     node_attributes: List[Dict[str, Any]] = genome.graph_dict.setdefault("node_attributes", [])
+    node_attr_bindings: Dict[int, Dict[str, Any]] = {}
+    configured_input_keys = list(getattr(config.genome_config, "input_keys", []))
+    configured_output_keys = list(getattr(config.genome_config, "output_keys", []))
+    slot_node_candidates: set[int] = set()
+    for key in itertools.chain(configured_input_keys, configured_output_keys):
+        try:
+            slot_node_candidates.add(int(key))
+        except (TypeError, ValueError):
+            continue
 
     def _ensure_attr_slot(slot_index: int) -> Dict[str, Any]:
         while len(node_attributes) <= slot_index:
@@ -223,11 +238,33 @@ def create_initial_genome(config, optimizer):
             node_attributes[slot_index] = attrs
         return attrs
 
+    def _bind_slot_to_node(slot_index: int, node_key: int) -> Dict[str, Any]:
+        attrs = _ensure_attr_slot(slot_index)
+        existing = node_attr_bindings.get(node_key)
+        if existing is None:
+            node_attr_bindings[node_key] = attrs
+            return attrs
+        if existing is attrs:
+            return attrs
+        # Preserve any previously recorded metadata on both dicts.
+        for key, value in attrs.items():
+            if key not in existing:
+                existing[key] = value
+        node_attributes[slot_index] = existing
+        node_attr_bindings[node_key] = existing
+        return existing
+
+    def _graph_attrs_for_node(node_key: int) -> Dict[str, Any]:
+        attrs = node_attr_bindings.get(node_key)
+        if attrs is None:
+            attrs = {}
+            node_attr_bindings[node_key] = attrs
+            if node_key not in slot_node_candidates:
+                node_attributes.append(attrs)
+        return attrs
+
     graph_input_values = list(optimizer.graph.inputs())
     graph_inputs = {val.node() for val in graph_input_values}
-
-    configured_input_keys = list(getattr(config.genome_config, "input_keys", []))
-    configured_output_keys = list(getattr(config.genome_config, "output_keys", []))
 
     user_arg_nodes: List[torch._C.Node] = []
     for value in graph_input_values:
@@ -258,7 +295,7 @@ def create_initial_genome(config, optimizer):
             continue
         _register_node(key, ts_node)
         node_mapping[ts_node] = key
-        attrs = _ensure_attr_slot(slot_index)
+        attrs = _bind_slot_to_node(slot_index, key)
         attrs["pin_role"] = "input"
         attrs["pin_slot_index"] = slot_index
         attrs["_pin_role_locked"] = True
@@ -287,7 +324,7 @@ def create_initial_genome(config, optimizer):
             continue
         _register_node(key, producer)
         node_mapping[producer] = key
-        attrs = _ensure_attr_slot(output_attr_offset + slot_offset)
+        attrs = _bind_slot_to_node(output_attr_offset + slot_offset, key)
         attrs["pin_role"] = "output"
         attrs["pin_slot_index"] = key
         attrs["_pin_role_locked"] = True
