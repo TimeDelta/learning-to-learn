@@ -1282,10 +1282,10 @@ class GuidedPopulation(Population):
                 new_genomes.append(genome)
                 continue
             self._prepare_decoded_graph_dict(graph_dict)
-            repaired = self._repair_graph_dict(graph_dict)
+            self._repair_graph_dict(graph_dict)
             repair_reason = graph_dict.get("_repair_failure_reason")
             repair_details = graph_dict.get("_repair_failure_details")
-            if repaired is False:
+            if repair_reason:
                 repair_failures += 1
             genome = genome_from_graph_dict(graph_dict, self.config.genome_config, key=i)
             num_edges = len(genome.connections)
@@ -1682,7 +1682,16 @@ class GuidedPopulation(Population):
         decoded_output_nodes = [
             idx for idx, role in enumerate(decoded_role_hints[: max(0, node_count)]) if role == PIN_ROLE_OUTPUT
         ]
+        has_pin_metadata = any(role in {PIN_ROLE_INPUT, PIN_ROLE_OUTPUT} for role in decoded_role_hints)
+        min_required_nodes = self._minimum_required_node_count()
         if node_count <= 0:
+            graph_dict["_repair_failure_reason"] = "empty_graph"
+            graph_dict.setdefault("_repair_failure_details", {})["node_count"] = int(node_count)
+            _record_repaired_graph_snapshot()
+            return False
+        if node_count < min_required_nodes and not has_pin_metadata and edges:
+            # Decoder predicted edges for visualization but did not emit pin metadata.
+            # Leave the graph untouched so callers can inspect the raw prediction.
             _record_repaired_graph_snapshot()
             return False
         edge_set = set(edges)
@@ -1694,6 +1703,7 @@ class GuidedPopulation(Population):
                 adjacency_in[dst].append(src)
 
         normalized_attrs = self._normalize_node_attributes(graph_dict.get("node_attributes"), node_count)
+        repaired_edges = 0
 
         def _candidate_order(indices: Sequence[int], *, key=None, reverse: bool = False) -> List[int]:
             seq = list(indices)
@@ -1797,6 +1807,7 @@ class GuidedPopulation(Population):
         output_set = set(output_nodes)
 
         def add_edge(src: int, dst: int) -> bool:
+            nonlocal repaired_edges
             if src == dst or src < 0 or dst < 0 or src >= node_count or dst >= node_count:
                 return False
             key = (int(src), int(dst))
@@ -1806,6 +1817,7 @@ class GuidedPopulation(Population):
             edges.append(key)
             adjacency_out[src].append(dst)
             adjacency_in[dst].append(src)
+            repaired_edges += 1
             return True
 
         target_pool = hidden_nodes or [node for node in range(node_count) if node not in input_nodes]
@@ -2000,7 +2012,7 @@ class GuidedPopulation(Population):
             tensor = torch.empty((2, 0), dtype=torch.long)
         graph_dict["edge_index"] = tensor
         _record_repaired_graph_snapshot()
-        return True if len(edges) > 0 else False
+        return bool(repaired_edges)
 
     def _optimizer_updates_parameters(self, optimizer, check_steps=2, delta_eps=1e-12):
         """Run a short dry-run to ensure the optimizer changes model weights."""
