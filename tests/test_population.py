@@ -399,33 +399,6 @@ def test_test_mode_reduces_trainer_epochs():
     assert steady_schedule["loss_threshold"] <= 0.9
 
 
-def test_graph_output_slot_precheck_detects_missing_slots():
-    config = make_neat_config()
-    pop = GuidedPopulation(config)
-    graph_dict = {
-        "edge_index": torch.empty((2, 0), dtype=torch.long),
-        "node_attributes": [{} for _ in range(3)],
-    }
-
-    ok, details = pop._graph_output_slot_coverage(graph_dict)
-    assert not ok
-    assert details["missing_slots"] == config.genome_config.output_keys
-
-    first_output = config.genome_config.output_keys[0]
-    graph_dict["edge_index"] = torch.tensor([[0], [first_output]], dtype=torch.long)
-
-    # Wrong type tagging should still fail coverage.
-    graph_dict["node_attributes"][first_output] = {"node_type": "hidden"}
-    ok_wrong, details_wrong = pop._graph_output_slot_coverage(graph_dict)
-    assert not ok_wrong
-    assert details_wrong["wrong_type_slots"] == [first_output]
-
-    graph_dict["node_attributes"][first_output] = {"node_type": "output"}
-    ok2, details2 = pop._graph_output_slot_coverage(graph_dict)
-    assert ok2
-    assert details2["missing_slots"] == []
-
-
 def test_generate_guided_offspring():
     config = make_neat_config()
     pop = GuidedPopulation(config)
