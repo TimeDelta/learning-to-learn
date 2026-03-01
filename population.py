@@ -255,6 +255,12 @@ class GuidedPopulation(Population):
         self.guided_replay_min_graphs = max(0, int(getattr(config, "guided_replay_min_graphs", 4)))
         self.guided_replay_noise_scale = max(0.0, float(getattr(config, "guided_replay_noise_scale", 0.2)))
         self.guided_replay_max_latents = max(0, int(getattr(config, "guided_replay_max_latents", 64)))
+        self.guided_seed_fraction = min(1.0, max(0.0, float(getattr(config, "guided_seed_fraction", 0.25))))
+        self.guided_seed_inactive_threshold = min(
+            1.0, max(0.0, float(getattr(config, "guided_seed_inactive_threshold", 0.3)))
+        )
+        self._seeded_replay_entries: List[dict] = []
+        self._seeded_replay_signatures: Set[str | None] = set()
         self.guided_pareto_enabled = bool(getattr(config, "guided_pareto_enabled", True))
         self.guided_pareto_epsilon = max(0.0, float(getattr(config, "guided_pareto_epsilon", 0.05)))
         self.guided_pareto_constraint_weight = max(0.0, float(getattr(config, "guided_pareto_constraint_weight", 0.6)))
@@ -380,6 +386,17 @@ class GuidedPopulation(Population):
             )
         self._guided_offspring_stats = summary
 
+    def _guided_inactive_ratio(self) -> float:
+        stats = self._prev_guided_offspring_stats or self._guided_offspring_stats
+        if not stats:
+            return 1.0
+        invalid = stats.get("invalid_by_reason", {}) or {}
+        inactive = float(invalid.get("inactive_optimizer", 0))
+        requested = float(stats.get("requested") or 0)
+        if requested <= 0:
+            return 1.0 if inactive else 0.0
+        return inactive / requested
+
     def _emit_dataset_stats(self, valid_size: int, invalid_size: int):
         if not self.dataset_stats_callback:
             return
@@ -453,7 +470,7 @@ class GuidedPopulation(Population):
         scaled["loss_threshold"] = min(schedule["loss_threshold"], 0.9)
         return scaled
 
-    def _buffer_decoder_replay_dict(self, graph_dict: dict | None):
+    def _buffer_decoder_replay_dict(self, graph_dict: dict | None, *, seeded: bool = False):
         if not graph_dict or self.decoder_replay_max <= 0:
             return
         self._ensure_replay_pin_metadata(graph_dict)
@@ -475,6 +492,16 @@ class GuidedPopulation(Population):
             if len(self._decoder_replay_reservoir) >= self.decoder_replay_max:
                 self._decoder_replay_reservoir.popleft()
             self._decoder_replay_reservoir.append((signature, cloned))
+        if seeded:
+            if signature in self._seeded_replay_signatures:
+                return
+            entry = {
+                "signature": signature,
+                "graph": self._clone_graph_dict(cloned, include_history=False) or cloned,
+            }
+            self._seeded_replay_entries.append(entry)
+            if signature:
+                self._seeded_replay_signatures.add(signature)
 
     @staticmethod
     def _graph_dict_has_topology(graph_dict: dict | None) -> bool:
@@ -498,7 +525,7 @@ class GuidedPopulation(Population):
                 graph_dict = getattr(genome, "graph_dict", None)
             if not graph_dict:
                 continue
-            self._buffer_decoder_replay_dict(graph_dict)
+            self._buffer_decoder_replay_dict(graph_dict, seeded=True)
             seeded += 1
         if seeded:
             self.reporters.info(f"Seeded decoder replay with {seeded} initial population graphs")
@@ -640,21 +667,60 @@ class GuidedPopulation(Population):
         return payload
 
     def _sample_decoder_replay_graphs(self, count: int) -> List[dict]:
-        if count <= 0 or not self._decoder_replay_reservoir:
+        if count <= 0:
             return []
+        if not self._decoder_replay_reservoir and not self._seeded_replay_entries:
+            return []
+        graphs: List[dict] = []
+        inactive_ratio = self._guided_inactive_ratio()
+        need_seed_support = (
+            self.guided_seed_fraction > 0.0
+            and self.guided_seed_inactive_threshold > 0.0
+            and inactive_ratio >= self.guided_seed_inactive_threshold
+        )
+        if need_seed_support and self._seeded_replay_entries:
+            seed_quota = min(count, max(1, int(round(count * self.guided_seed_fraction))))
+            seed_graphs = self._sample_seeded_replay_graphs(seed_quota)
+            graphs.extend(seed_graphs)
+        remaining = count - len(graphs)
+        if remaining <= 0:
+            return graphs
         entries = list(self._decoder_replay_reservoir)
         if not entries:
-            return []
-        if count >= len(entries):
-            picks = random.choices(entries, k=count)
+            return graphs
+        picks: List[tuple[str | None, dict]]
+        if remaining >= len(entries):
+            picks = random.choices(entries, k=remaining)
         else:
-            picks = random.sample(entries, count)
-        graphs: List[dict] = []
+            picks = random.sample(entries, remaining)
         for _, graph_dict in picks:
             cloned = self._clone_graph_dict(graph_dict, include_history=False)
             if cloned is not None:
                 graphs.append(cloned)
         return graphs
+
+    def _sample_seeded_replay_graphs(self, count: int) -> List[dict]:
+        if count <= 0 or not self._seeded_replay_entries:
+            return []
+        picks = self._random_draw_entries(self._seeded_replay_entries, count)
+        graphs: List[dict] = []
+        for entry in picks:
+            graph_dict = entry.get("graph")
+            cloned = self._clone_graph_dict(graph_dict, include_history=False)
+            if cloned is not None:
+                graphs.append(cloned)
+        return graphs
+
+    @staticmethod
+    def _random_draw_entries(entries: Sequence, count: int):
+        if count <= 0 or not entries:
+            return []
+        if len(entries) >= count:
+            return random.sample(list(entries), count)
+        picks = list(entries)
+        while len(picks) < count:
+            picks.append(random.choice(entries))
+        return picks
 
     @staticmethod
     def _evaluation_metric_keys(task) -> List[Metric]:
