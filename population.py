@@ -250,6 +250,11 @@ class GuidedPopulation(Population):
         # reservoir keeps the most recent valid graphs to reseed future replay passes
         self._decoder_replay_reservoir: deque[tuple[str | None, dict]] = deque(maxlen=self.decoder_replay_max)
         self._decoder_replay_seeded = False
+        guided_replay_fraction = float(getattr(config, "guided_replay_fraction", 0.3))
+        self.guided_replay_fraction = min(1.0, max(0.0, guided_replay_fraction))
+        self.guided_replay_min_graphs = max(0, int(getattr(config, "guided_replay_min_graphs", 4)))
+        self.guided_replay_noise_scale = max(0.0, float(getattr(config, "guided_replay_noise_scale", 0.2)))
+        self.guided_replay_max_latents = max(0, int(getattr(config, "guided_replay_max_latents", 64)))
         raw_repair_seed = getattr(config, "repair_random_seed", None)
         try:
             repair_seed = int(raw_repair_seed) if raw_repair_seed is not None else None
@@ -631,6 +636,23 @@ class GuidedPopulation(Population):
         self._decoder_replay_signatures.clear()
         return payload
 
+    def _sample_decoder_replay_graphs(self, count: int) -> List[dict]:
+        if count <= 0 or not self._decoder_replay_reservoir:
+            return []
+        entries = list(self._decoder_replay_reservoir)
+        if not entries:
+            return []
+        if count >= len(entries):
+            picks = random.choices(entries, k=count)
+        else:
+            picks = random.sample(entries, count)
+        graphs: List[dict] = []
+        for _, graph_dict in picks:
+            cloned = self._clone_graph_dict(graph_dict, include_history=False)
+            if cloned is not None:
+                graphs.append(cloned)
+        return graphs
+
     @staticmethod
     def _evaluation_metric_keys(task) -> List[Metric]:
         metrics: List[Metric] = list(task.metrics)
@@ -871,6 +893,22 @@ class GuidedPopulation(Population):
             graph_dict["edge_index"] = torch.empty((2, 0), dtype=torch.long)
 
         return len(node_attrs) - original_len
+
+    def _encode_graph_batch(self, data_list: Sequence[Data]) -> torch.Tensor:
+        graph_latent_dim = self.guide.graph_encoder.latent_dim
+        device = self.guide.graph_latent_mask.device
+        if not data_list:
+            return torch.empty((0, graph_latent_dim), device=device, dtype=torch.float32)
+
+        batch = Batch.from_data_list(list(data_list))
+        mu_g, lv_g = self.guide.graph_encoder(
+            batch.node_types,
+            batch.edge_index,
+            batch.node_attributes,
+            batch.batch,
+            num_graphs=batch.num_graphs,
+        )
+        return self.guide.reparameterize(mu_g, lv_g, self.guide.graph_latent_mask)
 
     def _decoder_pin_requirements(self) -> Tuple[int, List[int], int]:
         """Return (required_inputs, required_output_slots, min_nodes)."""
@@ -1127,19 +1165,29 @@ class GuidedPopulation(Population):
 
         # 2) Initialize random graph latents and set requires_grad=True
         graph_latent_dim = self.guide.graph_encoder.latent_dim
-        # encode the optimizer graphs from top half of starting_genomes then optimize, rest are cross-species
         sorted_genomes = sorted(starting_genomes, key=lambda g: g.fitness, reverse=True)
-        num_encode = min(max(n_offspring // 2, 0), len(sorted_genomes))
+        available_replay = len(self._decoder_replay_reservoir)
+        replay_latent_quota = 0
+        if (
+            self.decoder_replay_max > 0
+            and self.guided_replay_fraction > 0.0
+            and available_replay >= self.guided_replay_min_graphs
+        ):
+            replay_latent_quota = int(round(self.guided_replay_fraction * n_offspring))
+            if self.guided_replay_max_latents > 0:
+                replay_latent_quota = min(replay_latent_quota, self.guided_replay_max_latents)
+            replay_latent_quota = min(replay_latent_quota, n_offspring)
+        remaining_for_top = max(0, n_offspring - replay_latent_quota)
+        num_encode = min(max(remaining_for_top // 2, 0), len(sorted_genomes))
         top_genomes = sorted_genomes[:num_encode]
-        data_list = []
+        top_data_list: List[Data] = []
         for g in top_genomes:
             graph_dict = getattr(g, "graph_dict", None)
             if graph_dict is None:
-                # Lazily build the cached graph if this genome has never been encoded.
                 self.genome_to_data(g)
                 graph_dict = g.graph_dict
             prime_registry(graph_dict.get("block_registry"))
-            data_list.append(
+            top_data_list.append(
                 Data(
                     node_types=graph_dict["node_types"].clone().detach().long(),
                     edge_index=graph_dict["edge_index"].clone().detach().long(),
@@ -1147,16 +1195,28 @@ class GuidedPopulation(Population):
                 )
             )
 
-        if data_list:
-            batch = Batch.from_data_list(data_list)
-            mu_g, lv_g = self.guide.graph_encoder(
-                batch.node_types,
-                batch.edge_index,
-                batch.node_attributes,
-                batch.batch,
-                num_graphs=batch.num_graphs,
-            )
-            z_g_encoded = self.guide.reparameterize(mu_g, lv_g, self.guide.graph_latent_mask)
+        encoded_latent_chunks: List[torch.Tensor] = []
+        if top_data_list:
+            encoded_latent_chunks.append(self._encode_graph_batch(top_data_list))
+
+        if replay_latent_quota > 0:
+            replay_graphs = self._sample_decoder_replay_graphs(replay_latent_quota)
+            replay_data_list: List[Data] = []
+            for graph_dict in replay_graphs:
+                data = self._graph_dict_to_data(graph_dict)
+                if data is not None:
+                    replay_data_list.append(data)
+            if replay_data_list:
+                replay_latents = self._encode_graph_batch(replay_data_list)
+                if replay_latents.numel() and self.guided_replay_noise_scale > 0:
+                    noise = torch.randn_like(replay_latents) * self.guided_replay_noise_scale
+                    replay_latents = replay_latents + noise
+                encoded_latent_chunks.append(replay_latents)
+
+        if encoded_latent_chunks:
+            z_g_encoded = torch.cat(encoded_latent_chunks, dim=0)
+            if z_g_encoded.size(0) > n_offspring:
+                z_g_encoded = z_g_encoded[:n_offspring]
             z_g_encoded = z_g_encoded.clone().detach().requires_grad_(True)
         else:
             z_g_encoded = torch.empty(
