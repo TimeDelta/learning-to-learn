@@ -188,6 +188,33 @@ def test_structural_alignment_loss_handles_present_batches():
     assert single_loss.item() == pytest.approx(0.0)
 
 
+def test_reconstruction_loss_handles_none_attribute_values():
+    model = MinimalGuide()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    trainer = OnlineTrainer(model, optimizer, metric_keys=[AreaUnderTaskMetrics])
+    graph = _make_graph(1, [])
+    batch = Batch.from_data_list([graph])
+    decoded_graphs = [
+        {
+            "edge_index": torch.empty((2, 0), dtype=torch.long),
+            "node_attributes": [{"scale": None}],
+        }
+    ]
+    target_graph_attrs = [[{"scale": torch.tensor([1.0])}]]
+
+    loss_adj, loss_feat = trainer._compute_reconstruction_losses(
+        batch=batch,
+        decoded_graphs=decoded_graphs,
+        decoder_aux=None,
+        target_graph_attrs=target_graph_attrs,
+        teacher_force_weight=1.0,
+    )
+
+    assert torch.isfinite(loss_adj)
+    assert torch.isfinite(loss_feat)
+    assert loss_feat.item() > 0.0
+
+
 def test_graph_decoder_respects_node_budget(monkeypatch):
     vocab = SharedAttributeVocab([], embedding_dim=4)
     decoder = GraphDecoder(num_node_types=3, latent_dim=8, shared_attr_vocab=vocab, hidden_dim=4)

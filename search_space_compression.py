@@ -2131,11 +2131,16 @@ class OnlineTrainer:
                 return value
 
             def to_tensor(value):
-                value = convert_string(value)
-                if isinstance(value, torch.Tensor):
-                    tensor = value.detach()
+                if value is None:
+                    tensor = torch.zeros(1, dtype=torch.float)
                 else:
-                    tensor = torch.as_tensor([value], dtype=torch.float)
+                    value = convert_string(value)
+                    if isinstance(value, torch.Tensor):
+                        tensor = value.detach()
+                    else:
+                        tensor = torch.as_tensor([value], dtype=torch.float)
+                if tensor.numel() == 0:
+                    tensor = torch.zeros(1, dtype=torch.float)
                 return tensor.reshape(-1).float().to(self.device)
 
             def attribute_value_loss(value):
