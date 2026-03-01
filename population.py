@@ -255,6 +255,9 @@ class GuidedPopulation(Population):
         self.guided_replay_min_graphs = max(0, int(getattr(config, "guided_replay_min_graphs", 4)))
         self.guided_replay_noise_scale = max(0.0, float(getattr(config, "guided_replay_noise_scale", 0.2)))
         self.guided_replay_max_latents = max(0, int(getattr(config, "guided_replay_max_latents", 64)))
+        self.guided_pareto_enabled = bool(getattr(config, "guided_pareto_enabled", True))
+        self.guided_pareto_epsilon = max(0.0, float(getattr(config, "guided_pareto_epsilon", 0.05)))
+        self.guided_pareto_constraint_weight = max(0.0, float(getattr(config, "guided_pareto_constraint_weight", 0.6)))
         raw_repair_seed = getattr(config, "repair_random_seed", None)
         try:
             repair_seed = int(raw_repair_seed) if raw_repair_seed is not None else None
@@ -910,6 +913,30 @@ class GuidedPopulation(Population):
         )
         return self.guide.reparameterize(mu_g, lv_g, self.guide.graph_latent_mask)
 
+    def _pareto_latent_loss(self, canonical: torch.Tensor, weight_tensor: torch.Tensor) -> torch.Tensor:
+        if canonical.numel() == 0:
+            return torch.zeros((), dtype=canonical.dtype, device=canonical.device)
+        total_latents, metric_dim = canonical.shape
+        if metric_dim == 0:
+            return torch.zeros((), dtype=canonical.dtype, device=canonical.device)
+
+        primary_idx = torch.randint(metric_dim, (total_latents,), device=canonical.device)
+        primary_mask = F.one_hot(primary_idx, num_classes=metric_dim).to(canonical.dtype)
+        canon_sq = canonical.pow(2)
+        weighted = canon_sq * weight_tensor
+        primary_loss = (weighted * primary_mask).sum(dim=1)
+
+        epsilon = self.guided_pareto_epsilon
+        if epsilon > 0:
+            constraint_delta = torch.clamp(canonical.abs() - epsilon, min=0.0)
+        else:
+            constraint_delta = canonical.abs()
+        constraint_sq = constraint_delta.pow(2)
+        constraint_mask = 1.0 - primary_mask
+        constraint_loss = (constraint_sq * weight_tensor * constraint_mask).sum(dim=1)
+        total = primary_loss + self.guided_pareto_constraint_weight * constraint_loss
+        return total.mean()
+
     def _decoder_pin_requirements(self) -> Tuple[int, List[int], int]:
         """Return (required_inputs, required_output_slots, min_nodes)."""
         required_inputs = 0
@@ -1273,8 +1300,11 @@ class GuidedPopulation(Population):
             pred, _, convex_pred = self.guide.fitness_predictor(z_g)
             guiding_pred = convex_pred if convex_pred is not None else pred
             canonical = canonical_log_distance(guiding_pred, best_tensor)
-            weighted = canonical.pow(2) * weight_tensor
-            loss = weighted.sum(dim=1).mean()
+            if self.guided_pareto_enabled and predictor_dim > 1:
+                loss = self._pareto_latent_loss(canonical, weight_tensor)
+            else:
+                weighted = canonical.pow(2) * weight_tensor
+                loss = weighted.sum(dim=1).mean()
             per_latent_tether = F.mse_loss(z_g, z_g_initial, reduction="none").mean(dim=1)
             if learnable_tether and latent_tether_logit is not None:
                 weights = F.softplus(latent_tether_logit).view(-1)
