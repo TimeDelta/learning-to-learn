@@ -945,13 +945,23 @@ class GuidedPopulation(Population):
     def _prepare_decoded_graph_dict(self, graph_dict: dict | None) -> Tuple[int, List[Tuple[int, int]]]:
         if not graph_dict:
             return 0, []
+        node_attrs = graph_dict.get("node_attributes") or []
+        attr_count = len(node_attrs) if isinstance(node_attrs, list) else 0
         node_types = graph_dict.get("node_types")
         if node_types is None:
-            node_count = 0
+            node_count = attr_count
+            if attr_count > 0:
+                graph_dict["node_types"] = torch.zeros(attr_count, dtype=torch.long)
         elif isinstance(node_types, torch.Tensor):
             node_count = int(node_types.numel())
+            if node_count <= 0 and attr_count > 0:
+                node_count = attr_count
+                graph_dict["node_types"] = torch.zeros(attr_count, dtype=torch.long)
         else:
             node_count = len(node_types)
+            if node_count <= 0 and attr_count > 0:
+                node_count = attr_count
+                graph_dict["node_types"] = [0] * attr_count
 
         if node_count <= 0:
             graph_dict["edge_index"] = torch.empty((2, 0), dtype=torch.long)
@@ -978,7 +988,8 @@ class GuidedPopulation(Population):
                 continue
             attr_items = list(attrs.items())
             for attr_name, value in attr_items:
-                if isinstance(attr_name, str) and attr_name.startswith(BLOCK_PAYLOAD_ATTR_PREFIX):
+                attr_key = attribute_key_to_name(attr_name)
+                if attr_key.startswith(BLOCK_PAYLOAD_ATTR_PREFIX):
                     try:
                         block_id, payload = register_block_payload_tensor(value)
                     except ValueError as exc:
@@ -989,11 +1000,12 @@ class GuidedPopulation(Population):
                     # tensor every time.
                     decoded_payloads[block_id] = payload
                     block_refs.add(block_id)
-                    suffix = attr_name[len(BLOCK_PAYLOAD_ATTR_PREFIX) :]
+                    suffix = attr_key[len(BLOCK_PAYLOAD_ATTR_PREFIX) :]
                     ref_name = f"{BLOCK_REF_ATTR_PREFIX}{suffix}"
                     attrs[ref_name] = torch.tensor([float(block_id)], dtype=torch.float32)
             for attr_name, value in attr_items:
-                if not isinstance(attr_name, str) or not attr_name.startswith(BLOCK_REF_ATTR_PREFIX):
+                attr_key = attribute_key_to_name(attr_name)
+                if not attr_key.startswith(BLOCK_REF_ATTR_PREFIX):
                     continue
                 block_id: int | None = None
                 if torch.is_tensor(value):
@@ -1662,7 +1674,76 @@ class GuidedPopulation(Population):
             if cloned is not None:
                 graph_dict[REPAIRED_GRAPH_DICT_KEY] = cloned
 
+        def _registry_ids(registry: Any) -> set[int]:
+            ids: set[int] = set()
+            if isinstance(registry, dict):
+                for key in registry.keys():
+                    try:
+                        ids.add(int(key))
+                    except (TypeError, ValueError):
+                        continue
+            return ids
+
+        def _block_ref_count(attrs_list: Any) -> int:
+            if not isinstance(attrs_list, list):
+                return 0
+            count = 0
+            for attrs in attrs_list:
+                if not isinstance(attrs, dict):
+                    continue
+                for key in attrs.keys():
+                    if attribute_key_to_name(key).startswith(BLOCK_REF_ATTR_PREFIX):
+                        count += 1
+            return count
+
+        def _recover_block_registry_from_payloads() -> bool:
+            recovered: Dict[int, Dict[str, Any]] = {}
+            attrs_list = graph_dict.get("node_attributes") or []
+            if not isinstance(attrs_list, list):
+                return False
+            for attrs in attrs_list:
+                if not isinstance(attrs, dict):
+                    continue
+                for key, value in list(attrs.items()):
+                    attr_name = attribute_key_to_name(key)
+                    if not attr_name.startswith(BLOCK_PAYLOAD_ATTR_PREFIX):
+                        continue
+                    try:
+                        block_id, payload = register_block_payload_tensor(value)
+                    except ValueError as exc:
+                        graph_dict.setdefault("_repair_failure_details", {})[attr_name] = str(exc)
+                        continue
+                    recovered[block_id] = payload
+                    suffix = attr_name[len(BLOCK_PAYLOAD_ATTR_PREFIX) :]
+                    ref_name = f"{BLOCK_REF_ATTR_PREFIX}{suffix}"
+                    if ref_name not in attrs:
+                        attrs[ref_name] = torch.tensor([float(block_id)], dtype=torch.float32)
+            combined = {}
+            had_registry = bool(graph_dict.get("block_registry"))
+            combined.update(graph_dict.get("block_registry") or {})
+            if not recovered and not had_registry:
+                return False
+            combined.update(recovered)
+            graph_dict["block_registry"] = copy.deepcopy(combined)
+            return bool(recovered)
+
+        had_block_registry = bool(graph_dict.get("block_registry"))
+        recovered_blocks = False
+        if not had_block_registry:
+            recovered_blocks = _recover_block_registry_from_payloads()
+        before_registry_ids = _registry_ids(graph_dict.get("block_registry"))
+        before_ref_count = _block_ref_count(graph_dict.get("node_attributes"))
         node_count, edges = self._prepare_decoded_graph_dict(graph_dict)
+        if not graph_dict.get("block_registry"):
+            recovered_blocks = _recover_block_registry_from_payloads() or recovered_blocks
+        after_registry_ids = _registry_ids(graph_dict.get("block_registry"))
+        after_ref_count = _block_ref_count(graph_dict.get("node_attributes"))
+        has_block_registry_now = bool(graph_dict.get("block_registry"))
+        repaired_metadata = recovered_blocks or (has_block_registry_now and not had_block_registry)
+        if not repaired_metadata:
+            repaired_metadata = bool(after_registry_ids - before_registry_ids)
+        if not repaired_metadata:
+            repaired_metadata = after_ref_count > before_ref_count
         initial_node_count = node_count
         original_attrs = graph_dict.get("node_attributes")
         decoded_role_hints: List[str | None] = []
@@ -2012,7 +2093,7 @@ class GuidedPopulation(Population):
             tensor = torch.empty((2, 0), dtype=torch.long)
         graph_dict["edge_index"] = tensor
         _record_repaired_graph_snapshot()
-        return bool(repaired_edges)
+        return bool(repaired_edges or repaired_metadata)
 
     def _optimizer_updates_parameters(self, optimizer, check_steps=2, delta_eps=1e-12):
         """Run a short dry-run to ensure the optimizer changes model weights."""
