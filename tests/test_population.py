@@ -398,6 +398,31 @@ def test_generate_guided_offspring_records_latent_labels(monkeypatch):
     assert any(not flag for flag in recorded)
 
 
+def test_seed_latent_structure_from_population(monkeypatch):
+    config = make_neat_config()
+    config.guided_structure_buffer = 4
+    pop = GuidedPopulation(config)
+    pop.guide = StubGuide([make_graph_factory(0.2)])
+    genome = create_simple_genome(0)
+    genome.graph_dict = make_graph_factory(0.2)()
+    pop.population = {0: genome}
+
+    latents = torch.tensor([[0.5, -0.25]], dtype=torch.float32)
+
+    def fake_encode(data_list):
+        return latents[: len(data_list)]
+
+    monkeypatch.setattr(pop, "_encode_graph_batch", fake_encode)
+
+    seeded = pop._seed_latent_structure_from_population()
+    assert seeded == 1
+    assert len(pop._latent_valid_samples) == 1
+    assert torch.allclose(pop._latent_valid_samples[0], latents[0])
+
+    seeded_again = pop._seed_latent_structure_from_population()
+    assert seeded_again == 0
+
+
 def test_generate_guided_offspring_tracks_structure_penalty(monkeypatch):
     config = make_neat_config()
     config.guided_replay_fraction = 0.0

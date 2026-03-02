@@ -250,6 +250,7 @@ class GuidedPopulation(Population):
         # reservoir keeps the most recent valid graphs to reseed future replay passes
         self._decoder_replay_reservoir: deque[tuple[str | None, dict]] = deque(maxlen=self.decoder_replay_max)
         self._decoder_replay_seeded = False
+        self._latent_structure_seeded = False
         guided_replay_fraction = float(getattr(config, "guided_replay_fraction", 0.3))
         self.guided_replay_fraction = min(1.0, max(0.0, guided_replay_fraction))
         self.guided_replay_min_graphs = max(0, int(getattr(config, "guided_replay_min_graphs", 4)))
@@ -565,6 +566,43 @@ class GuidedPopulation(Population):
         if seeded:
             self.reporters.info(f"Seeded decoder replay with {seeded} initial population graphs")
         self._decoder_replay_seeded = True
+        return seeded
+
+    def _seed_latent_structure_from_population(self) -> int:
+        """Prime the latent structure centroid buffers with existing population graphs."""
+        if self._latent_structure_seeded or self.guided_structure_buffer <= 0:
+            return 0
+        guide = getattr(self, "guide", None)
+        if guide is None or not hasattr(guide, "graph_encoder"):
+            return 0
+        genomes = list(getattr(self, "population", {}).values() or [])
+        if not genomes:
+            return 0
+        data_list: List[Data] = []
+        for genome in genomes:
+            graph_dict = getattr(genome, "graph_dict", None)
+            if not self._graph_dict_has_topology(graph_dict):
+                self.genome_to_data(genome)
+                graph_dict = getattr(genome, "graph_dict", None)
+            data = self._graph_dict_to_data(graph_dict)
+            if data is not None:
+                data_list.append(data)
+        if not data_list:
+            return 0
+        try:
+            latents = self._encode_graph_batch(data_list)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            warn(f"Failed to seed latent structure buffer: {exc}")
+            return 0
+        if latents.dim() == 1:
+            latents = latents.unsqueeze(0)
+        seeded = 0
+        for latent in latents:
+            self._record_latent_label(latent, valid=True)
+            seeded += 1
+        if seeded:
+            self._latent_structure_seeded = True
+            self.reporters.info(f"Seeded latent structure buffer with {seeded} population graphs")
         return seeded
 
     def _record_decoder_failure(
@@ -2439,6 +2477,8 @@ class GuidedPopulation(Population):
             self._reset_guided_offspring_stats()
             if not self._decoder_replay_seeded:
                 self._seed_decoder_replay_from_population()
+            if not self._latent_structure_seeded:
+                self._seed_latent_structure_from_population()
 
             # Evaluate real fitness. Using too few update steps makes every optimizer look identical,
             # so clamp to a minimum to expose behavioral differences early in the run.
