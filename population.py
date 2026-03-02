@@ -1700,9 +1700,10 @@ class GuidedPopulation(Population):
                     new_genomes.append(genome)
                     continue
 
+                repair_applied = bool(graph_dict.pop("_repair_applied", False))
                 if track_latents:
-                    latent_valid_flags[i] = True
-                if graph_dict.pop("_repair_applied", False):
+                    latent_valid_flags[i] = not repair_applied
+                if repair_applied:
                     repair_salvaged += 1
                 genome.optimizer = optimizer
                 genome.graph_dict = graph_dict
@@ -1719,10 +1720,6 @@ class GuidedPopulation(Population):
             self._buffer_decoder_replay_dict(graph_dict)
             if last_valid_graph_dict is not None:
                 self._buffer_decoder_replay_dict(last_valid_graph_dict)
-
-        if track_latents and latent_valid_flags is not None:
-            for idx in range(total_requested):
-                self._record_latent_label(z_g[idx].detach(), valid=latent_valid_flags[idx])
 
         if track_latents and latent_valid_flags is not None:
             for idx in range(total_requested):
