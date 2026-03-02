@@ -959,6 +959,8 @@ if __name__ == "__main__":
                     "guided_children_requested": stats.get("requested"),
                     "guided_children_created": stats.get("accepted"),
                     "guided_children_invalid_total": stats.get("invalid_total"),
+                    "guided_children_repair_salvaged": stats.get("repair_salvaged"),
+                    "guided_children_repair_salvaged_total": stats.get("repair_salvaged_total"),
                 }
                 invalid_by_reason = stats.get("invalid_by_reason", {}) or {}
                 for reason, count in invalid_by_reason.items():
@@ -970,7 +972,8 @@ if __name__ == "__main__":
                 parts = ", ".join(f"{reason}={count}" for reason, count in sorted(invalid_by_reason.items()))
                 summary = (
                     f"Guided offspring gen {generation}: requested={stats.get('requested', 0)}, "
-                    f"created={stats.get('accepted', 0)}, invalid_total={stats.get('invalid_total', 0)}"
+                    f"created={stats.get('accepted', 0)}, invalid_total={stats.get('invalid_total', 0)}, "
+                    f"repair_salvaged={stats.get('repair_salvaged', 0)}"
                 )
                 if parts:
                     summary += f" :: {parts}"

@@ -191,8 +191,19 @@ def make_graph_factory(bias):
 
 def make_invalid_graph_factory():
     def factory():
-        node_types = torch.tensor([NODE_TYPE_TO_INDEX.get("aten::add", 0)], dtype=torch.long)
-        node_attrs = [{}]
+        node_types = torch.tensor(
+            [
+                NODE_TYPE_TO_INDEX.get("prim::GetAttr", 0),
+                NODE_TYPE_TO_INDEX.get("prim::Return", 0),
+                NODE_TYPE_TO_INDEX.get("aten::add", 0),
+            ],
+            dtype=torch.long,
+        )
+        node_attrs = [
+            {"pin_role": "input", "pin_slot_index": 0},
+            {"pin_role": "output", "pin_slot_index": 0},
+            {},
+        ]
         edges = torch.empty((2, 0), dtype=torch.long)
         return {"node_types": node_types, "edge_index": edges, "node_attributes": node_attrs}
 
@@ -385,6 +396,48 @@ def test_generate_guided_offspring_records_latent_labels(monkeypatch):
     assert len(recorded) == 2
     assert any(recorded)
     assert any(not flag for flag in recorded)
+
+
+def test_latent_structure_penalty_uses_cached_centers():
+    config = make_neat_config()
+    config.guided_structure_buffer = 4
+    config.guided_structure_weight = 1.0
+    config.guided_structure_margin = 0.1
+    pop = GuidedPopulation(config)
+
+    pop._record_latent_label(torch.tensor([0.0, 0.0]), valid=False)
+    pop._record_latent_label(torch.tensor([1.0, 0.0]), valid=True)
+
+    latents = torch.tensor([[0.05, 0.0], [0.9, 0.0]], dtype=torch.float32)
+    penalty = pop._latent_structure_penalty(latents)
+
+    assert penalty.item() > 0
+
+
+def test_generate_guided_offspring_tracks_repair_salvage(monkeypatch):
+    config = make_neat_config()
+    config.guided_replay_fraction = 0.0
+    config.guided_seed_fraction = 0.0
+    pop = GuidedPopulation(config)
+    pop.guide = StubGuide([make_invalid_graph_factory(), make_graph_factory(0.2)])
+    pop._optimizer_updates_parameters = lambda *args, **kwargs: True
+    monkeypatch.setattr(
+        population_module,
+        "rebuild_and_script",
+        lambda *args, **kwargs: DummyStatefulOptimizer(),
+    )
+
+    pop.generate_guided_offspring(
+        [],
+        config,
+        n_offspring=2,
+        latent_steps=1,
+        max_decode_attempts=1,
+        decode_jitter_std=0.0,
+    )
+
+    assert pop._last_repair_salvaged >= 1
+    assert pop._total_repair_salvaged >= pop._last_repair_salvaged
 
 
 def test_seed_decoder_replay_rebuilds_missing_graph_dicts():

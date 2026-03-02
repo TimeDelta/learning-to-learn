@@ -304,6 +304,7 @@ class GuidedPopulation(Population):
         self.guided_stats_callback = None
         self._guided_offspring_stats = None
         self._prev_guided_offspring_stats = None
+        self._total_repair_salvaged = 0
         self.dataset_stats_callback = None
         max_evaluation_steps = getattr(config, "max_evaluation_steps", None)
         if max_evaluation_steps is not None:
@@ -315,6 +316,7 @@ class GuidedPopulation(Population):
             max_evaluation_steps = None
         self.max_evaluation_steps = max_evaluation_steps
         self._last_optimizer_delta = 0.0
+        self._last_repair_salvaged = 0
         self.guided_invalid_viz_enabled = bool(getattr(config, "guided_invalid_viz_enabled", True))
         raw_viz_dir = getattr(config, "guided_invalid_viz_dir", None)
         if raw_viz_dir:
@@ -358,9 +360,18 @@ class GuidedPopulation(Population):
             "accepted": 0,
             "invalid_total": 0,
             "invalid_by_reason": Counter(),
+            "repair_salvaged": 0,
+            "repair_salvaged_total": self._total_repair_salvaged,
         }
 
-    def _accumulate_guided_offspring_stats(self, requested: int, accepted: int, invalid_counts: Counter):
+    def _accumulate_guided_offspring_stats(
+        self,
+        requested: int,
+        accepted: int,
+        invalid_counts: Counter,
+        *,
+        repair_salvaged: int = 0,
+    ):
         stats = self._guided_offspring_stats
         if stats is None:
             return
@@ -370,6 +381,9 @@ class GuidedPopulation(Population):
             total_invalid = int(sum(invalid_counts.values()))
             stats["invalid_total"] += total_invalid
             stats["invalid_by_reason"].update(invalid_counts)
+        if repair_salvaged:
+            stats["repair_salvaged"] += int(repair_salvaged)
+        stats["repair_salvaged_total"] = self._total_repair_salvaged
 
     def _emit_guided_offspring_stats(self):
         stats = self._guided_offspring_stats
@@ -381,6 +395,8 @@ class GuidedPopulation(Population):
             "accepted": stats.get("accepted", 0),
             "invalid_total": stats.get("invalid_total", 0),
             "invalid_by_reason": dict(stats.get("invalid_by_reason", {})),
+            "repair_salvaged": stats.get("repair_salvaged", 0),
+            "repair_salvaged_total": self._total_repair_salvaged,
         }
         if self.guided_stats_callback:
             self.guided_stats_callback(summary)
@@ -1439,6 +1455,7 @@ class GuidedPopulation(Population):
         inactive_optimizer_count = 0
         missing_slot_rejections = 0
         repair_failures = 0
+        repair_salvaged = 0
         debug_dir = Path("debug_guided_offspring")
         debug_dir.mkdir(parents=True, exist_ok=True)
         debug_save_limit = 5
@@ -1654,6 +1671,8 @@ class GuidedPopulation(Population):
 
                 if track_latents:
                     latent_valid_flags[i] = True
+                if graph_dict.pop("_repair_applied", False):
+                    repair_salvaged += 1
                 genome.optimizer = optimizer
                 genome.graph_dict = graph_dict
                 last_valid_graph_dict = self._clone_graph_dict(graph_dict)
@@ -1669,6 +1688,10 @@ class GuidedPopulation(Population):
             self._buffer_decoder_replay_dict(graph_dict)
             if last_valid_graph_dict is not None:
                 self._buffer_decoder_replay_dict(last_valid_graph_dict)
+
+        if track_latents and latent_valid_flags is not None:
+            for idx in range(total_requested):
+                self._record_latent_label(z_g[idx].detach(), valid=latent_valid_flags[idx])
 
         if track_latents and latent_valid_flags is not None:
             for idx in range(total_requested):
@@ -1695,6 +1718,11 @@ class GuidedPopulation(Population):
             sample = ", ".join(f"child {idx}: edges={edges}, params={params}" for idx, edges, params in stats[:10])
             self.reporters.info(f"Guided offspring graph stats (first 10): {sample}")
 
+        if repair_salvaged:
+            self.reporters.info(f"Graph repair salvaged {repair_salvaged} decoded offspring before evaluation.")
+        self._total_repair_salvaged += repair_salvaged
+        self._last_repair_salvaged = repair_salvaged
+
         if total_requested:
             self.reporters.info(
                 "Guided offspring summary: %d/%d survived (duplicates=%d, empty=%d, rebuild_failures=%d, inactive=%d)"
@@ -1713,7 +1741,12 @@ class GuidedPopulation(Population):
             duplicate_count += late_duplicates
             warn(f"Guided offspring final dedupe removed {late_duplicates} duplicate graphs.")
 
-        self._accumulate_guided_offspring_stats(total_requested, len(deduped_genomes), invalid_reason_counts)
+        self._accumulate_guided_offspring_stats(
+            total_requested,
+            len(deduped_genomes),
+            invalid_reason_counts,
+            repair_salvaged=repair_salvaged,
+        )
         return deduped_genomes
 
     def _dedupe_genomes_by_signature(self, genomes: Sequence[OptimizerGenome]) -> Tuple[List[OptimizerGenome], int]:
@@ -2302,7 +2335,12 @@ class GuidedPopulation(Population):
             tensor = torch.empty((2, 0), dtype=torch.long)
         graph_dict["edge_index"] = tensor
         _record_repaired_graph_snapshot()
-        return bool(repaired_edges or repaired_metadata)
+        repaired = bool(repaired_edges or repaired_metadata)
+        if repaired:
+            graph_dict["_repair_applied"] = True
+        else:
+            graph_dict.pop("_repair_applied", None)
+        return repaired
 
     def _optimizer_updates_parameters(self, optimizer, check_steps=2, delta_eps=1e-12):
         """Run a short dry-run to ensure the optimizer changes model weights."""
