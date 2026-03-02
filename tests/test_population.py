@@ -189,6 +189,16 @@ def make_graph_factory(bias):
     return factory
 
 
+def make_invalid_graph_factory():
+    def factory():
+        node_types = torch.tensor([NODE_TYPE_TO_INDEX.get("aten::add", 0)], dtype=torch.long)
+        node_attrs = [{}]
+        edges = torch.empty((2, 0), dtype=torch.long)
+        return {"node_types": node_types, "edge_index": edges, "node_attributes": node_attrs}
+
+    return factory
+
+
 def configure_stub_population(graph_factories, monkeypatch):
     config = make_neat_config()
     pop = GuidedPopulation(config)
@@ -323,6 +333,58 @@ def test_generate_guided_offspring_buffers_near_misses(monkeypatch):
 
     assert offspring  # even penalized genomes should be returned
     assert buffered_graphs, "decoder replay buffer did not capture near-miss graphs"
+
+
+def test_latent_structure_penalty_uses_cached_centers():
+    config = make_neat_config()
+    config.guided_structure_buffer = 4
+    config.guided_structure_weight = 1.0
+    config.guided_structure_margin = 0.1
+    pop = GuidedPopulation(config)
+
+    pop._record_latent_label(torch.tensor([0.0, 0.0]), valid=False)
+    pop._record_latent_label(torch.tensor([1.0, 0.0]), valid=True)
+
+    latents = torch.tensor([[0.05, 0.0], [0.9, 0.0]], dtype=torch.float32)
+    penalty = pop._latent_structure_penalty(latents)
+
+    assert penalty.item() > 0
+
+
+def test_generate_guided_offspring_records_latent_labels(monkeypatch):
+    config = make_neat_config()
+    config.guided_structure_buffer = 4
+    config.guided_structure_weight = 0.0
+    config.guided_replay_fraction = 0.0
+    config.guided_seed_fraction = 0.0
+    pop = GuidedPopulation(config)
+    pop.guide = StubGuide([make_invalid_graph_factory(), make_graph_factory(0.3)])
+    pop._optimizer_updates_parameters = lambda *args, **kwargs: True
+    monkeypatch.setattr(
+        population_module,
+        "rebuild_and_script",
+        lambda *args, **kwargs: DummyStatefulOptimizer(),
+    )
+
+    recorded = []
+
+    def fake_record(latent, valid):
+        recorded.append(bool(valid))
+
+    pop._record_latent_label = fake_record
+
+    pop.generate_guided_offspring(
+        [],
+        config,
+        n_offspring=2,
+        latent_steps=1,
+        max_decode_attempts=1,
+        decode_jitter_std=0.0,
+    )
+
+    assert len(recorded) == 2
+    assert any(recorded)
+    assert any(not flag for flag in recorded)
 
 
 def test_seed_decoder_replay_rebuilds_missing_graph_dicts():

@@ -261,6 +261,11 @@ class GuidedPopulation(Population):
         )
         self._seeded_replay_entries: List[dict] = []
         self._seeded_replay_signatures: Set[str | None] = set()
+        self.guided_structure_buffer = max(0, int(getattr(config, "guided_structure_buffer", 512)))
+        self.guided_structure_margin = float(getattr(config, "guided_structure_margin", 0.15))
+        self.guided_structure_weight = max(0.0, float(getattr(config, "guided_structure_weight", 0.6)))
+        self._latent_valid_samples: deque[torch.Tensor] = deque(maxlen=self.guided_structure_buffer)
+        self._latent_invalid_samples: deque[torch.Tensor] = deque(maxlen=self.guided_structure_buffer)
         self.guided_pareto_enabled = bool(getattr(config, "guided_pareto_enabled", True))
         self.guided_pareto_epsilon = max(0.0, float(getattr(config, "guided_pareto_epsilon", 0.05)))
         self.guided_pareto_constraint_weight = max(0.0, float(getattr(config, "guided_pareto_constraint_weight", 0.6)))
@@ -979,6 +984,12 @@ class GuidedPopulation(Population):
         )
         return self.guide.reparameterize(mu_g, lv_g, self.guide.graph_latent_mask)
 
+    def _record_latent_label(self, latent: torch.Tensor, *, valid: bool):
+        if self.guided_structure_buffer <= 0:
+            return
+        target = self._latent_valid_samples if valid else self._latent_invalid_samples
+        target.append(latent.detach().cpu().view(-1))
+
     def _pareto_latent_loss(self, canonical: torch.Tensor, weight_tensor: torch.Tensor) -> torch.Tensor:
         if canonical.numel() == 0:
             return torch.zeros((), dtype=canonical.dtype, device=canonical.device)
@@ -1002,6 +1013,37 @@ class GuidedPopulation(Population):
         constraint_loss = (constraint_sq * weight_tensor * constraint_mask).sum(dim=1)
         total = primary_loss + self.guided_pareto_constraint_weight * constraint_loss
         return total.mean()
+
+    def _latent_structure_penalty(self, latents: torch.Tensor) -> torch.Tensor:
+        if self.guided_structure_weight <= 0 or self.guided_structure_buffer <= 0:
+            return torch.zeros((), dtype=latents.dtype, device=latents.device)
+        valid_center = self._latent_center(self._latent_valid_samples, latents.device, latents.dtype)
+        invalid_center = self._latent_center(self._latent_invalid_samples, latents.device, latents.dtype)
+        if valid_center is None and invalid_center is None:
+            return torch.zeros((), dtype=latents.dtype, device=latents.device)
+        margin = max(0.0, float(self.guided_structure_margin))
+        penalty = torch.zeros(latents.size(0), dtype=latents.dtype, device=latents.device)
+        if invalid_center is not None:
+            dist_invalid = torch.norm(latents - invalid_center, dim=1)
+            penalty = penalty + torch.clamp(margin - dist_invalid, min=0.0)
+        if valid_center is not None and invalid_center is not None:
+            dist_valid = torch.norm(latents - valid_center, dim=1)
+            dist_invalid = torch.norm(latents - invalid_center, dim=1)
+            domination = torch.clamp(margin + dist_valid - dist_invalid, min=0.0)
+            penalty = torch.max(penalty, domination)
+        elif valid_center is not None:
+            dist_valid = torch.norm(latents - valid_center, dim=1)
+            penalty = penalty + torch.clamp(dist_valid - margin, min=0.0)
+        return penalty.mean() * self.guided_structure_weight
+
+    @staticmethod
+    def _latent_center(buffer: Sequence[torch.Tensor], device, dtype) -> torch.Tensor | None:
+        if not buffer:
+            return None
+        stacked = torch.stack([tensor.to(device=device, dtype=dtype) for tensor in buffer], dim=0)
+        if stacked.numel() == 0:
+            return None
+        return stacked.mean(dim=0)
 
     def _decoder_pin_requirements(self) -> Tuple[int, List[int], int]:
         """Return (required_inputs, required_output_slots, min_nodes)."""
@@ -1371,6 +1413,9 @@ class GuidedPopulation(Population):
             else:
                 weighted = canonical.pow(2) * weight_tensor
                 loss = weighted.sum(dim=1).mean()
+            structure_penalty = self._latent_structure_penalty(z_g)
+            if structure_penalty.numel():
+                loss = loss + structure_penalty
             per_latent_tether = F.mse_loss(z_g, z_g_initial, reduction="none").mean(dim=1)
             if learnable_tether and latent_tether_logit is not None:
                 weights = F.softplus(latent_tether_logit).view(-1)
@@ -1403,6 +1448,8 @@ class GuidedPopulation(Population):
         total_requested = z_g.size(0)
         invalid_reason_counts: Counter = Counter()
         last_valid_graph_dict = None
+        track_latents = self.guided_structure_buffer > 0
+        latent_valid_flags = [False] * total_requested if track_latents else None
 
         for i in range(total_requested):
             latent = z_g[i].unsqueeze(0).clone()
@@ -1605,6 +1652,8 @@ class GuidedPopulation(Population):
                     new_genomes.append(genome)
                     continue
 
+                if track_latents:
+                    latent_valid_flags[i] = True
                 genome.optimizer = optimizer
                 genome.graph_dict = graph_dict
                 last_valid_graph_dict = self._clone_graph_dict(graph_dict)
@@ -1620,6 +1669,10 @@ class GuidedPopulation(Population):
             self._buffer_decoder_replay_dict(graph_dict)
             if last_valid_graph_dict is not None:
                 self._buffer_decoder_replay_dict(last_valid_graph_dict)
+
+        if track_latents and latent_valid_flags is not None:
+            for idx in range(total_requested):
+                self._record_latent_label(z_g[idx].detach(), valid=latent_valid_flags[idx])
 
         if empty_graph_count:
             warn(
