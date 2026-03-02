@@ -398,6 +398,50 @@ def test_generate_guided_offspring_records_latent_labels(monkeypatch):
     assert any(not flag for flag in recorded)
 
 
+def test_generate_guided_offspring_tracks_structure_penalty(monkeypatch):
+    config = make_neat_config()
+    config.guided_replay_fraction = 0.0
+    config.guided_seed_fraction = 0.0
+    config.guided_structure_buffer = 4
+    config.guided_structure_weight = 1.0
+    pop = GuidedPopulation(config)
+    pop.guide = StubGuide([make_graph_factory(0.3)])
+    pop._optimizer_updates_parameters = lambda *args, **kwargs: True
+    monkeypatch.setattr(
+        population_module,
+        "rebuild_and_script",
+        lambda *args, **kwargs: DummyStatefulOptimizer(),
+    )
+
+    penalty_values = [0.1, 0.2, 0.0]
+
+    def fake_penalty(latents):
+        idx = min(fake_penalty.calls, len(penalty_values) - 1)
+        fake_penalty.calls += 1
+        return torch.tensor(penalty_values[idx], dtype=torch.float32)
+
+    fake_penalty.calls = 0
+    pop._latent_structure_penalty = fake_penalty
+    pop._reset_guided_offspring_stats()
+
+    pop.generate_guided_offspring(
+        [],
+        config,
+        n_offspring=1,
+        latent_steps=len(penalty_values),
+        max_decode_attempts=1,
+        decode_jitter_std=0.0,
+    )
+
+    stats = pop._guided_offspring_stats
+    expected_samples = fake_penalty.calls
+    assert stats["structure_penalty_samples"] == expected_samples
+    expected_values = [penalty_values[min(i, len(penalty_values) - 1)] for i in range(expected_samples)]
+    assert stats["structure_penalty_last"] == pytest.approx(expected_values[-1])
+    expected_mean = sum(expected_values) / expected_samples
+    assert stats["structure_penalty_mean"] == pytest.approx(expected_mean)
+
+
 def test_latent_structure_penalty_uses_cached_centers():
     config = make_neat_config()
     config.guided_structure_buffer = 4

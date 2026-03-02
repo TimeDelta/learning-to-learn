@@ -362,6 +362,9 @@ class GuidedPopulation(Population):
             "invalid_by_reason": Counter(),
             "repair_salvaged": 0,
             "repair_salvaged_total": self._total_repair_salvaged,
+            "structure_penalty_last": None,
+            "structure_penalty_mean": None,
+            "structure_penalty_samples": 0,
         }
 
     def _accumulate_guided_offspring_stats(
@@ -371,6 +374,9 @@ class GuidedPopulation(Population):
         invalid_counts: Counter,
         *,
         repair_salvaged: int = 0,
+        structure_penalty_last: float | None = None,
+        structure_penalty_sum: float | None = None,
+        structure_penalty_steps: int = 0,
     ):
         stats = self._guided_offspring_stats
         if stats is None:
@@ -384,6 +390,11 @@ class GuidedPopulation(Population):
         if repair_salvaged:
             stats["repair_salvaged"] += int(repair_salvaged)
         stats["repair_salvaged_total"] = self._total_repair_salvaged
+        if structure_penalty_last is not None:
+            stats["structure_penalty_last"] = float(structure_penalty_last)
+        if structure_penalty_steps and structure_penalty_sum is not None:
+            stats["structure_penalty_mean"] = float(structure_penalty_sum) / max(1, structure_penalty_steps)
+            stats["structure_penalty_samples"] = int(structure_penalty_steps)
 
     def _emit_guided_offspring_stats(self):
         stats = self._guided_offspring_stats
@@ -397,6 +408,9 @@ class GuidedPopulation(Population):
             "invalid_by_reason": dict(stats.get("invalid_by_reason", {})),
             "repair_salvaged": stats.get("repair_salvaged", 0),
             "repair_salvaged_total": self._total_repair_salvaged,
+            "structure_penalty_last": stats.get("structure_penalty_last"),
+            "structure_penalty_mean": stats.get("structure_penalty_mean"),
+            "structure_penalty_samples": stats.get("structure_penalty_samples", 0),
         }
         if self.guided_stats_callback:
             self.guided_stats_callback(summary)
@@ -1420,6 +1434,9 @@ class GuidedPopulation(Population):
         opt_params: List[torch.Tensor] = [z_g]
         opt_params.extend(tether_params)
         opt = torch.optim.Adam(opt_params, lr=latent_lr)
+        structure_penalty_sum = 0.0
+        structure_penalty_steps = 0
+        structure_penalty_last = None
         for _ in range(latent_steps):
             pred, _, convex_pred = self.guide.fitness_predictor(z_g)
             guiding_pred = convex_pred if convex_pred is not None else pred
@@ -1430,8 +1447,14 @@ class GuidedPopulation(Population):
                 weighted = canonical.pow(2) * weight_tensor
                 loss = weighted.sum(dim=1).mean()
             structure_penalty = self._latent_structure_penalty(z_g)
+            penalty_value = None
             if structure_penalty.numel():
                 loss = loss + structure_penalty
+                penalty_value = float(structure_penalty.detach().item())
+            if penalty_value is not None:
+                structure_penalty_sum += penalty_value
+                structure_penalty_steps += 1
+                structure_penalty_last = penalty_value
             per_latent_tether = F.mse_loss(z_g, z_g_initial, reduction="none").mean(dim=1)
             if learnable_tether and latent_tether_logit is not None:
                 weights = F.softplus(latent_tether_logit).view(-1)
@@ -1446,6 +1469,14 @@ class GuidedPopulation(Population):
         opt.zero_grad()
         loss.backward()
         opt.step()
+
+        structure_penalty_mean = None
+        if structure_penalty_steps > 0:
+            structure_penalty_mean = structure_penalty_sum / structure_penalty_steps
+            self.reporters.info(
+                "Latent structure penalty mean %.6f (last=%.6f, samples=%d)"
+                % (structure_penalty_mean, structure_penalty_last or 0.0, structure_penalty_steps)
+            )
 
         stats = []
         new_genomes = []
@@ -1746,6 +1777,9 @@ class GuidedPopulation(Population):
             len(deduped_genomes),
             invalid_reason_counts,
             repair_salvaged=repair_salvaged,
+            structure_penalty_last=structure_penalty_last,
+            structure_penalty_sum=structure_penalty_sum if structure_penalty_steps else None,
+            structure_penalty_steps=structure_penalty_steps,
         )
         return deduped_genomes
 

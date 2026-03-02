@@ -961,6 +961,9 @@ if __name__ == "__main__":
                     "guided_children_invalid_total": stats.get("invalid_total"),
                     "guided_children_repair_salvaged": stats.get("repair_salvaged"),
                     "guided_children_repair_salvaged_total": stats.get("repair_salvaged_total"),
+                    "guided_latent_structure_penalty_last": stats.get("structure_penalty_last"),
+                    "guided_latent_structure_penalty_mean": stats.get("structure_penalty_mean"),
+                    "guided_latent_structure_penalty_samples": stats.get("structure_penalty_samples"),
                 }
                 invalid_by_reason = stats.get("invalid_by_reason", {}) or {}
                 for reason, count in invalid_by_reason.items():
@@ -975,6 +978,12 @@ if __name__ == "__main__":
                     f"created={stats.get('accepted', 0)}, invalid_total={stats.get('invalid_total', 0)}, "
                     f"repair_salvaged={stats.get('repair_salvaged', 0)}"
                 )
+                if stats.get("structure_penalty_samples"):
+                    summary += (
+                        f", structure_penalty_mean={stats.get('structure_penalty_mean', 0):.6f}"
+                        f" (last={stats.get('structure_penalty_last', 0):.6f},"
+                        f" samples={stats.get('structure_penalty_samples', 0)})"
+                    )
                 if parts:
                     summary += f" :: {parts}"
                 mlflow_run.append_log_line(summary)
