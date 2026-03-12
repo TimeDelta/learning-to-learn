@@ -1,5 +1,6 @@
 import atexit
 import copy
+import logging
 import math
 import random
 import re
@@ -41,6 +42,7 @@ from pareto import *
 from reproduction import GuidedReproduction
 from search_space_compression import *
 from tasks import *
+from utility import log_timing
 
 _INVALID_REASON_COUNTER: Counter = Counter()
 _INVALID_REASON_REPORT_REGISTERED = False
@@ -57,6 +59,9 @@ _PIN_ROLE_FALLBACKS = {
     PIN_ROLE_OUTPUT: PIN_ROLE_OUTPUT,
     PIN_ROLE_HIDDEN: PIN_ROLE_HIDDEN,
 }
+
+
+logger = logging.getLogger(__name__)
 
 
 def _normalize_pin_role(value: Any) -> str | None:
@@ -181,12 +186,16 @@ class GuidedPopulation(Population):
         self.optimizer = torch.optim.Adam(self.guide.parameters(), lr=0.001)
         self.decoder_empty_penalty = float(getattr(config, "decoder_empty_penalty", 5.0))
         self.decoder_missing_node_penalty = float(getattr(config, "decoder_missing_node_penalty", 2.5))
+        self.decoder_excess_node_penalty = float(getattr(config, "decoder_excess_node_penalty", 2.5))
+        self.decoder_stop_loss_weight = float(getattr(config, "decoder_stop_loss_weight", 2.5))
         self.trainer = OnlineTrainer(
             self.guide,
             self.optimizer,
             metric_keys=self.metric_keys,
             decoder_empty_penalty=self.decoder_empty_penalty,
             decoder_missing_node_penalty=self.decoder_missing_node_penalty,
+            decoder_excess_node_penalty=self.decoder_excess_node_penalty,
+            decoder_stop_loss_weight=self.decoder_stop_loss_weight,
         )
         slice_ratio = getattr(config, "kl_partial_slice_ratio", None)
         if slice_ratio is None and hasattr(config, "reproduction_config"):
@@ -1546,9 +1555,54 @@ class GuidedPopulation(Population):
             else:
                 decoded_graphs = decoded
             graph_dict = decoded_graphs[0]
+            hit_max_nodes_cap = bool(graph_dict.pop("_max_nodes_hit", False))
+            decoder_max_nodes = graph_dict.pop("_decoder_max_nodes", None)
             min_nodes_required = self._minimum_required_node_count()
             original_node_count = len(graph_dict.get("node_attributes") or [])
             self._ensure_graph_node_capacity(graph_dict, min_nodes_required)
+            if hit_max_nodes_cap:
+                max_nodes_value = None
+                if decoder_max_nodes is not None:
+                    try:
+                        max_nodes_value = int(decoder_max_nodes)
+                    except (TypeError, ValueError):
+                        max_nodes_value = None
+                if max_nodes_value is None:
+                    try:
+                        max_nodes_value = int(getattr(self.guide.decoder, "max_nodes", 0))
+                    except (TypeError, ValueError):
+                        max_nodes_value = None
+                genome = genome_from_graph_dict(graph_dict, self.config.genome_config, key=i)
+                num_edges = len(genome.connections)
+                self._maybe_visualize_guided_invalid_graph(
+                    genome,
+                    graph_dict,
+                    reason="decoder_max_nodes",
+                    child_index=i,
+                    num_edges=num_edges,
+                )
+                genome.graph_dict = graph_dict
+                penalty_details = {
+                    "decoded_nodes": original_node_count,
+                    "max_nodes": max_nodes_value,
+                }
+                self._assign_penalty(
+                    genome,
+                    reason="decoder_max_nodes",
+                    skip_evaluation=True,
+                    penalty_details=penalty_details,
+                    graph_dict=graph_dict,
+                    record_decoder_failure=True,
+                )
+                self._buffer_decoder_replay_dict(graph_dict)
+                if last_valid_graph_dict is not None:
+                    self._buffer_decoder_replay_dict(last_valid_graph_dict)
+                invalid_reason_counts["decoder_max_nodes"] += 1
+                graph_signature = graph_signature_from_dict(graph_dict)
+                if graph_signature:
+                    seen_graph_signatures.add(graph_signature)
+                new_genomes.append(genome)
+                continue
             if original_node_count < min_nodes_required:
                 reason = "insufficient_node_count"
                 genome = genome_from_graph_dict(graph_dict, self.config.genome_config, key=i)
@@ -2484,7 +2538,12 @@ class GuidedPopulation(Population):
             # so clamp to a minimum to expose behavioral differences early in the run.
             eval_steps = self._generation_eval_steps()
             print(f"Evaluating genomes on {self.task.name()} for {eval_steps} steps")
-            self.eval_genomes(list(self.population.items()), self.config, steps=eval_steps)
+            with log_timing(
+                logger,
+                f"Generation {self.generation} genome evaluation",
+            ) as timing:
+                self.eval_genomes(list(self.population.items()), self.config, steps=eval_steps)
+                timing.set_details(f"genomes={len(self.population)} steps={eval_steps}")
 
             # Termination check
             if not self.config.no_fitness_termination:
@@ -2495,16 +2554,18 @@ class GuidedPopulation(Population):
                     return best
 
             # Train surrogate on all evaluated genomes
-            valid_graphs, valid_fits = [], []
-            invalid_graphs, invalid_fits = [], []
-            for gid, genome in self.population.items():
-                data = self.genome_to_data(genome)
-                if getattr(genome, "invalid_graph", False):
-                    invalid_graphs.append(data)
-                    invalid_fits.append(genome.fitnesses)
-                else:
-                    valid_graphs.append(data)
-                    valid_fits.append(genome.fitnesses)
+            with log_timing(logger, f"Generation {self.generation} dataset assembly") as timing:
+                valid_graphs, valid_fits = [], []
+                invalid_graphs, invalid_fits = [], []
+                for gid, genome in self.population.items():
+                    data = self.genome_to_data(genome)
+                    if getattr(genome, "invalid_graph", False):
+                        invalid_graphs.append(data)
+                        invalid_fits.append(genome.fitnesses)
+                    else:
+                        valid_graphs.append(data)
+                        valid_fits.append(genome.fitnesses)
+                timing.set_details(f"valid_graphs={len(valid_graphs)} invalid_graphs={len(invalid_graphs)}")
             if valid_graphs:
                 self.trainer.add_data(valid_graphs, valid_fits)
             if invalid_graphs:
@@ -2519,15 +2580,17 @@ class GuidedPopulation(Population):
             if self.generation == 0:
                 mode_note = " (test mode)" if self.test_mode else ""
                 self.reporters.info(f"Running initial SCAE warmup ({schedule['epochs']} epochs{mode_note})")
-            self.trainer.train(
-                epochs=schedule["epochs"],
-                batch_size=batch,
-                generation=self.generation,
-                convex_weight=self.convex_surrogate_weight,
-                warmup_epochs=schedule["warmup_epochs"],
-                loss_threshold=schedule["loss_threshold"],
-                baseline_window=schedule["baseline_window"],
-            )
+            with log_timing(logger, f"Generation {self.generation} surrogate training") as timing:
+                self.trainer.train(
+                    epochs=schedule["epochs"],
+                    batch_size=batch,
+                    generation=self.generation,
+                    convex_weight=self.convex_surrogate_weight,
+                    warmup_epochs=schedule["warmup_epochs"],
+                    loss_threshold=schedule["loss_threshold"],
+                    baseline_window=schedule["baseline_window"],
+                )
+                timing.set_details(f"dataset={len(self.trainer.dataset)} epochs={schedule['epochs']} batch={batch}")
             decoder_epochs, decoder_weight = self._decoder_refresh_schedule()
             replay_payload = self._consume_decoder_replay_graphs()
             if decoder_epochs > 0 and (self.trainer.dataset or replay_payload):
@@ -2537,14 +2600,16 @@ class GuidedPopulation(Population):
                     f"Decoder refresh: epochs={decoder_epochs} weight={decoder_weight:.3f} "
                     f"empty_ratio={empty_ratio:.3f} replay_graphs={len(replay_payload)}"
                 )
-                self.trainer.decoder_teacher_force_pass(
-                    epochs=decoder_epochs,
-                    batch_size=decoder_batch,
-                    teacher_force_weight=decoder_weight,
-                    generation=self.generation,
-                    verbose=self.decoder_teacher_verbose,
-                    extra_graphs=replay_payload,
-                )
+                with log_timing(logger, f"Generation {self.generation} decoder refresh") as timing:
+                    self.trainer.decoder_teacher_force_pass(
+                        epochs=decoder_epochs,
+                        batch_size=decoder_batch,
+                        teacher_force_weight=decoder_weight,
+                        generation=self.generation,
+                        verbose=self.decoder_teacher_verbose,
+                        extra_graphs=replay_payload,
+                    )
+                    timing.set_details(f"epochs={decoder_epochs} batch={decoder_batch} replay={len(replay_payload)}")
             valid_size = len(self.trainer.dataset)
             invalid_size = len(self.trainer.invalid_dataset)
             total_size = valid_size + invalid_size
@@ -2555,9 +2620,12 @@ class GuidedPopulation(Population):
             self._emit_dataset_stats(valid_size, invalid_size)
 
             # Build next‐gen population by species
-            self.population = self.reproduction.reproduce(
-                self.config, self.species, self.config.pop_size, self.generation, self.task
-            )
+            with log_timing(logger, f"Generation {self.generation} reproduction") as timing:
+                new_population = self.reproduction.reproduce(
+                    self.config, self.species, self.config.pop_size, self.generation, self.task
+                )
+                timing.set_details(f"offspring={len(new_population)}")
+            self.population = new_population
 
             # Handle possible extinction
             if not self.species.species:
@@ -2572,7 +2640,9 @@ class GuidedPopulation(Population):
                     raise CompleteExtinctionException()
 
             # Re‐speciate and finalize generation
-            self.species.speciate(self.config, self.population, self.generation)
+            with log_timing(logger, f"Generation {self.generation} speciation") as timing:
+                self.species.speciate(self.config, self.population, self.generation)
+                timing.set_details(f"species={len(self.species.species)}")
             self._adjust_compatibility_threshold(len(self.species.species))
             self._emit_guided_offspring_stats()
             self.reporters.end_generation(self.config, self.population, self.species)
@@ -2807,6 +2877,8 @@ class GuidedPopulation(Population):
             scale = min_scale + (max_scale - min_scale) * miss_ratio
         elif reason == "inactive_optimizer":
             scale = self.INACTIVE_OPTIMIZER_PENALTY_SCALE
+        elif reason == "decoder_max_nodes":
+            scale = self.INVALID_PENALTY_MAX_SCALE
         clamped = max(self.INVALID_PENALTY_MIN_SCALE, min(self.INVALID_PENALTY_MAX_SCALE, scale))
         return float(clamped)
 

@@ -869,7 +869,7 @@ class GraphDecoder(nn.Module):
         if pin_node_budget <= 0:
             pin_node_budget = 1
         self._base_required_node_count = max(self.min_pin_nodes, pin_node_budget)
-        self.max_nodes = max(1000, self._base_required_node_count)
+        self.max_nodes = max(250, self._base_required_node_count)
         # Encourage attribute decoder to terminate by progressively biasing the EOS logit.
         self.attr_eos_bias_base = 0.0
         self.attr_eos_bias_slope = 0.1
@@ -1039,6 +1039,7 @@ class GraphDecoder(nn.Module):
                     t = 0
                     node_loop_timer = time.perf_counter()
                     node_loop_iters = 0
+                    hit_max_nodes_cap = False
                     teacher_force_nodes = self.training and (target_node_count is not None)
                     forced_pin_roles: List[str | None] = []
                     forced_pin_slots: List[int | None] = []
@@ -1065,6 +1066,7 @@ class GraphDecoder(nn.Module):
                             logger.debug(f"Decoding node {t}")
                             node_loop_iters += 1
                             if t > self.max_nodes:
+                                hit_max_nodes_cap = True
                                 warn("max nodes reached")
                                 if DEBUG_DECODER and decode_stats is not None:
                                     decode_stats["node_loop_exit"] = decode_stats["node_loop_exit"] or "max_nodes_pre"
@@ -1103,6 +1105,7 @@ class GraphDecoder(nn.Module):
                                     else:
                                         break
                             if t > self.max_nodes:
+                                hit_max_nodes_cap = True
                                 warn("max nodes reached")
                                 if DEBUG_DECODER and decode_stats is not None:
                                     decode_stats["node_loop_exit"] = decode_stats["node_loop_exit"] or "max_nodes_post"
@@ -1519,9 +1522,15 @@ class GraphDecoder(nn.Module):
                         )
 
             self._enforce_required_pin_metadata(node_attributes)
-            all_graphs.append(
-                {"node_types": torch.as_tensor(node_types), "node_attributes": node_attributes, "edge_index": edges}
-            )
+            graph_payload = {
+                "node_types": torch.as_tensor(node_types),
+                "node_attributes": node_attributes,
+                "edge_index": edges,
+            }
+            if hit_max_nodes_cap:
+                graph_payload["_max_nodes_hit"] = True
+                graph_payload["_decoder_max_nodes"] = int(self.max_nodes)
+            all_graphs.append(graph_payload)
             if DEBUG_DECODER:
                 attr_time = time.perf_counter() - decode_stats["attr_start"]
                 total_time = decode_stats["node_time"] + attr_time
@@ -1907,6 +1916,8 @@ class OnlineTrainer:
         metric_keys: Optional[Sequence] = None,
         decoder_empty_penalty: float = 0.0,
         decoder_missing_node_penalty: float = 0.0,
+        decoder_excess_node_penalty: float = 0.0,
+        decoder_stop_loss_weight: float = 1.0,
     ):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = model.to(self.device)
@@ -1930,6 +1941,8 @@ class OnlineTrainer:
         self.prune_callback = None
         self.decoder_empty_penalty = float(decoder_empty_penalty or 0.0)
         self.decoder_missing_node_penalty = float(decoder_missing_node_penalty or 0.0)
+        self.decoder_excess_node_penalty = float(decoder_excess_node_penalty or 0.0)
+        self.decoder_stop_loss_weight = float(decoder_stop_loss_weight or 1.0)
         self.wl_kernel_iterations = 2
         self.wl_loss_weight = 0.0
         self.kl_partial_slice_ratio: Optional[float] = None
@@ -2089,6 +2102,7 @@ class OnlineTrainer:
         loss_feat = torch.tensor(0.0, device=self.device)
         empty_penalty = float(getattr(self, "decoder_empty_penalty", 0.0) or 0.0)
         missing_node_penalty = float(getattr(self, "decoder_missing_node_penalty", 0.0) or 0.0)
+        excess_node_penalty = float(getattr(self, "decoder_excess_node_penalty", 0.0) or 0.0)
         empty_hits = 0
 
         for i in range(graphs_to_compare):
@@ -2102,6 +2116,9 @@ class OnlineTrainer:
             missing_nodes = max(0, num_target_nodes - num_pred_nodes)
             if missing_node_penalty > 0 and missing_nodes > 0:
                 loss_adj = loss_adj + missing_node_penalty * missing_nodes
+            excess_nodes = max(0, num_pred_nodes - num_target_nodes)
+            if excess_node_penalty > 0 and excess_nodes > 0:
+                loss_adj = loss_adj + excess_node_penalty * excess_nodes
             if num_nodes == 0:
                 empty_hits += 1
                 continue
@@ -2178,7 +2195,8 @@ class OnlineTrainer:
             node_tokens = float(decoder_aux.get("node_tokens", 0) or 0)
             if node_tokens > 0:
                 node_loss = decoder_aux["node_loss"] / node_tokens
-                loss_adj = loss_adj + node_loss.to(loss_adj.device)
+                weight = float(getattr(self, "decoder_stop_loss_weight", 1.0) or 1.0)
+                loss_adj = loss_adj + weight * node_loss.to(loss_adj.device)
             edge_tokens = float(decoder_aux.get("edge_tokens", 0) or 0)
             if edge_tokens > 0:
                 edge_loss = decoder_aux["edge_loss"] / edge_tokens

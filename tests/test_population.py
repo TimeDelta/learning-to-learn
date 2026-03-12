@@ -346,6 +346,29 @@ def test_generate_guided_offspring_buffers_near_misses(monkeypatch):
     assert buffered_graphs, "decoder replay buffer did not capture near-miss graphs"
 
 
+def test_generate_guided_offspring_penalizes_max_nodes(monkeypatch):
+    base_factory = make_graph_factory(0.1)
+
+    def capped_factory():
+        graph = base_factory()
+        graph["_max_nodes_hit"] = True
+        graph["_decoder_max_nodes"] = 4
+        return graph
+
+    pop, config = configure_stub_population([capped_factory], monkeypatch)
+
+    offspring = pop.generate_guided_offspring(
+        [], config, n_offspring=1, latent_steps=1, max_decode_attempts=1, decode_jitter_std=0.0
+    )
+
+    assert offspring
+    genome = offspring[0]
+    assert getattr(genome, "invalid_graph", False)
+    assert genome.invalid_reason == "decoder_max_nodes"
+    assert genome.skip_evaluation is True
+    assert genome.invalid_penalty_details.get("max_nodes") == 4
+
+
 def test_latent_structure_penalty_uses_cached_centers():
     config = make_neat_config()
     config.guided_structure_buffer = 4

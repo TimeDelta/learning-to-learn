@@ -38,8 +38,12 @@ from population import _INVALID_REASON_COUNTER
 from relative_rank_stagnation import RelativeRankStagnation
 from reproduction import *
 from torchscript_utils import serialize_script_module
+from utility import log_timing
 
 GUIDED_POPULATION_SECTION = "GuidedPopulation"
+
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_bool(value: str) -> bool:
@@ -363,28 +367,33 @@ def override_initial_population(population, config):
     """
     Overrides the initial genomes in the population with copies of the exact initial genome.
     """
-    new_population = {}
-    unique_paths = []
-    seen_hashes = set()
-    for fname in os.listdir("computation_graphs/optimizers/"):
-        if not fname.endswith(".pt"):
-            continue
-        path = f"computation_graphs/optimizers/{fname}"
-        with open(path, "rb") as fh:
-            md5_hash = hashlib.md5(fh.read()).hexdigest()
-        if md5_hash in seen_hashes:
-            continue
-        seen_hashes.add(md5_hash)
-        unique_paths.append(path)
-    for key, path in zip(population.population.keys(), unique_paths):
-        optimizer = torch.jit.load(path)
-        new_genome = create_initial_genome(config, optimizer)
-        new_genome.key = key
-        new_genome.optimizer_path = path
-        new_population[key] = new_genome
-    population.population = new_population
-    population.shared_attr_vocab.add_names(ATTRIBUTE_NAMES)
-    population.species.speciate(config, population.population, population.generation)
+    with log_timing(logger, "Loading TorchScript seed optimizers") as timing:
+        new_population = {}
+        unique_paths = []
+        seen_hashes = set()
+        for fname in os.listdir("computation_graphs/optimizers/"):
+            if not fname.endswith(".pt"):
+                continue
+            path = f"computation_graphs/optimizers/{fname}"
+            with open(path, "rb") as fh:
+                md5_hash = hashlib.md5(fh.read()).hexdigest()
+            if md5_hash in seen_hashes:
+                continue
+            seen_hashes.add(md5_hash)
+            unique_paths.append(path)
+        for key, path in zip(population.population.keys(), unique_paths):
+            optimizer = torch.jit.load(path)
+            new_genome = create_initial_genome(config, optimizer)
+            new_genome.key = key
+            new_genome.optimizer_path = path
+            new_population[key] = new_genome
+        population.population = new_population
+        population.shared_attr_vocab.add_names(ATTRIBUTE_NAMES)
+        timing.set_details(f"assigned={len(new_population)} unique_seeds={len(unique_paths)}")
+
+    with log_timing(logger, "Initial speciation pass") as timing:
+        population.species.speciate(config, population.population, population.generation)
+        timing.set_details(f"species={len(population.species.species)}")
 
 
 class MLflowRunManager:
@@ -825,22 +834,38 @@ if __name__ == "__main__":
     _configure_root_logger(args.log_level)
     guided_population_overrides = load_guided_population_overrides(args.config_file)
 
-    config = neat.Config(
-        OptimizerGenome, GuidedReproduction, neat.DefaultSpeciesSet, RelativeRankStagnation, args.config_file
-    )
-    override_keys = tuple(GUIDED_POPULATION_FIELDS.keys())
-    for key in override_keys:
-        value = guided_population_overrides.get(key)
-        if value is None and hasattr(config, "reproduction_config"):
-            value = getattr(config.reproduction_config, key, None)
-        if value is not None:
-            setattr(config, key, value)
-    if getattr(args, "test_mode", False):
-        setattr(config, "test_mode", True)
-    if args.max_evaluation_steps is not None:
-        max_epochs = max(1, int(args.max_evaluation_steps))
-        setattr(config, "max_evaluation_steps", max_epochs)
-    population = GuidedPopulation(config)
+    with log_timing(logger, f"Loading NEAT config ({args.config_file})") as timing:
+        config = neat.Config(
+            OptimizerGenome, GuidedReproduction, neat.DefaultSpeciesSet, RelativeRankStagnation, args.config_file
+        )
+        override_keys = tuple(GUIDED_POPULATION_FIELDS.keys())
+        applied_override_keys: list[str] = []
+        for key in override_keys:
+            value = guided_population_overrides.get(key)
+            if value is None and hasattr(config, "reproduction_config"):
+                value = getattr(config.reproduction_config, key, None)
+            if value is not None:
+                setattr(config, key, value)
+                applied_override_keys.append(key)
+        test_mode_enabled = bool(getattr(args, "test_mode", False))
+        if test_mode_enabled:
+            setattr(config, "test_mode", True)
+        max_eval_epochs: int | None = None
+        if args.max_evaluation_steps is not None:
+            max_eval_epochs = max(1, int(args.max_evaluation_steps))
+            setattr(config, "max_evaluation_steps", max_eval_epochs)
+        details = [f"pop_size={config.pop_size}"]
+        if applied_override_keys:
+            details.append(f"overrides={len(applied_override_keys)}")
+        if test_mode_enabled:
+            details.append("test_mode=1")
+        if max_eval_epochs is not None:
+            details.append(f"max_eval_steps={max_eval_epochs}")
+        timing.set_details(", ".join(details))
+
+    with log_timing(logger, "Constructing GuidedPopulation") as timing:
+        population = GuidedPopulation(config)
+        timing.set_details(f"initial_pop={len(population.population)}")
 
     override_initial_population(population, config)
 
@@ -1035,19 +1060,23 @@ if __name__ == "__main__":
 
             population.trainer.set_prune_callback(_log_latent_prune_event)
 
-        winner = population.run(args.num_generations)
+        with log_timing(logger, f"Evolution loop ({args.num_generations} generations)") as timing:
+            winner = population.run(args.num_generations)
+            timing.set_details(f"completed_generations={population.generation}")
         print("\nBest genome:\n{!s}".format(winner))
 
         snapshot_path = None
         try:
-            population_snapshot = population.snapshot_population()
-            final_dir = Path(args.final_population_dir).expanduser()
-            final_dir.mkdir(parents=True, exist_ok=True)
-            timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-            filename = f"population_gen{population.generation:05d}_{timestamp}.pt"
-            snapshot_path = final_dir / filename
-            torch.save(population_snapshot, snapshot_path)
-            print(f"Final population snapshot saved to {snapshot_path}")
+            with log_timing(logger, "Serializing final population snapshot") as timing:
+                population_snapshot = population.snapshot_population()
+                final_dir = Path(args.final_population_dir).expanduser()
+                final_dir.mkdir(parents=True, exist_ok=True)
+                timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+                filename = f"population_gen{population.generation:05d}_{timestamp}.pt"
+                snapshot_path = final_dir / filename
+                torch.save(population_snapshot, snapshot_path)
+                timing.set_details(f"path={snapshot_path}")
+                print(f"Final population snapshot saved to {snapshot_path}")
         except Exception as exc:
             snapshot_path = None
             print(f"WARNING: Failed to save final population snapshot: {exc}")

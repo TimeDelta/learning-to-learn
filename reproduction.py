@@ -1,3 +1,4 @@
+import logging
 import math
 import random
 from collections import defaultdict
@@ -7,6 +8,10 @@ import numpy as np
 import torch
 from neat.config import *
 from neat.reproduction import DefaultReproduction
+
+from utility import log_timing
+
+logger = logging.getLogger(__name__)
 
 
 class GuidedReproduction(DefaultReproduction):
@@ -55,6 +60,10 @@ class GuidedReproduction(DefaultReproduction):
         return self.guided_max_fraction * ramp_progress
 
     def reproduce(self, config, species, pop_size, generation, task):
+        with log_timing(logger, f"Reproduction gen {generation}") as timing:
+            return self._reproduce_impl(config, species, pop_size, generation, task, timing)
+
+    def _reproduce_impl(self, config, species, pop_size, generation, task, timing=None):
         # Filter out stagnated species, collect the set of non-stagnated
         # species members, and compute their average adjusted fitness.
         # The average adjusted fitness scheme (normalized to the interval
@@ -75,6 +84,8 @@ class GuidedReproduction(DefaultReproduction):
 
         # No species left.
         if not remaining_species:
+            if timing is not None:
+                timing.set_details("remaining_species=0")
             return {}
 
         # Find minimum/maximum fitness across the entire population, for use in
@@ -104,6 +115,7 @@ class GuidedReproduction(DefaultReproduction):
         spawn_amounts = self.compute_spawn(adjusted_fitnesses, previous_sizes, pop_size, min_species_size)
 
         new_population = {}
+        guided_children_total = 0
         for spawn, s in zip(spawn_amounts, remaining_species):
             spawn = max(spawn, self.reproduction_config.elitism)
             old_members = sorted(s.members.items(), key=lambda item: item[1].fitness, reverse=True)
@@ -124,6 +136,7 @@ class GuidedReproduction(DefaultReproduction):
             guided_children = []
             if guided_quota > 0 and self.guide_fn is not None and generation >= self.guided_start_generation:
                 guided_children = self.guide_fn(list(s.members.values()), self.reproduction_config, guided_quota)
+                guided_children_total += len(guided_children)
 
             for kid in guided_children:
                 existing_key = getattr(kid, "key", None)
@@ -205,6 +218,11 @@ class GuidedReproduction(DefaultReproduction):
                             f"Inserted fallback minimum graph for species {s.key} after {attempts} unsuccessful attempts."
                         )
 
+        if timing is not None:
+            timing.set_details(
+                f"offspring={len(new_population)} surviving_species={len(remaining_species)} "
+                f"guided_fraction={self._guided_fraction(generation):.2f} guided={guided_children_total}"
+            )
         return new_population
 
     def _build_random_minimum_genome(self, config, key):

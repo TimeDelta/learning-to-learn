@@ -239,6 +239,22 @@ def test_graph_decoder_respects_node_budget(monkeypatch):
     assert graph["node_types"].shape[0] == 1  # budget enforces a single node even though sampling never stops.
 
 
+def test_graph_decoder_marks_max_nodes_hit():
+    vocab = SharedAttributeVocab([], embedding_dim=4)
+    decoder = GraphDecoder(num_node_types=3, latent_dim=8, shared_attr_vocab=vocab, hidden_dim=4)
+    decoder.max_nodes = 0
+    decoder.eval()
+
+    latent = torch.zeros(1, decoder.latent_dim)
+    graphs = decoder(latent)
+
+    assert isinstance(graphs, list)
+    assert graphs, "decoder returned no graphs"
+    graph = graphs[0]
+    assert graph.get("_max_nodes_hit") is True
+    assert graph.get("_decoder_max_nodes") == 0
+
+
 def test_graph_decoder_enforces_min_pin_nodes():
     vocab = SharedAttributeVocab([], embedding_dim=4)
     decoder = GraphDecoder(
