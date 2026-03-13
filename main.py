@@ -886,7 +886,224 @@ if __name__ == "__main__":
     )
 
     with run_context as mlflow_run:
-        if mlflow_run:
+        try:
+            if mlflow_run:
+                mlflow_run.log_params(
+                    {
+                        "config_file": args.config_file,
+                        "population_size": config.pop_size,
+                        "num_generations": args.num_generations,
+                        "fitness_threshold": getattr(config, "fitness_threshold", None),
+                    }
+                )
+                kl_slice_params = {}
+                trainer = getattr(population, "trainer", None)
+                if trainer is not None:
+                    ratio = getattr(trainer, "kl_partial_slice_ratio", None)
+                    dims = getattr(trainer, "kl_partial_slice_dims", None)
+                    start = getattr(trainer, "kl_partial_slice_start", None)
+                    if ratio is not None:
+                        kl_slice_params["kl_partial_slice_ratio"] = ratio
+                    if dims is not None:
+                        kl_slice_params["kl_partial_slice_dims"] = dims
+                    if (ratio is not None or dims is not None) and start is not None:
+                        kl_slice_params["kl_partial_slice_start"] = start
+                if kl_slice_params:
+                    mlflow_run.log_params(kl_slice_params)
+                mlflow_run.log_artifact(args.config_file)
+                mlflow_reporter = MLflowLoggingReporter(mlflow_run)
+                population.add_reporter(mlflow_reporter)
+                trainer_step_counter = itertools.count(start=1)
+                trainer_last_step = {"value": 0}
+                trainer_metrics_history: list[dict[str, object]] = []
+
+                def _log_trainer_progress(**kwargs):
+                    generation = kwargs.get("generation", 0) or 0
+                    epoch = kwargs.get("epoch", 0) or 0
+                    total_epochs = kwargs.get("total_epochs")
+                    total_loss = kwargs.get("total_loss")
+                    loss_terms = kwargs.get("loss_terms", {})
+                    kl_beta = kwargs.get("kl_beta")
+                    per_metric_losses = kwargs.get("per_metric_losses") or {}
+                    active_modules = tuple(kwargs.get("active_modules") or ())
+                    available_modules = tuple(
+                        kwargs.get("available_modules")
+                        or getattr(trainer, "module_names_for_logging", ("encoder", "decoder", "predictor"))
+                    )
+                    step = next(trainer_step_counter)
+                    trainer_last_step["value"] = step
+                    metrics = {
+                        "trainer_generation": generation,
+                        "trainer_epoch": epoch,
+                        "trainer_total_epochs": total_epochs,
+                        "trainer_total_loss": total_loss,
+                        "trainer_kl_beta": kl_beta,
+                        "trainer_learning_rate": kwargs.get("lr"),
+                    }
+                    metrics.update({f"trainer_loss_{name}": value for name, value in loss_terms.items()})
+                    for idx, name in enumerate(available_modules):
+                        metrics[f"trainer_module_active_{name}"] = 1 if name in active_modules else 0
+                    clean_metrics = {k: v for k, v in metrics.items() if v is not None}
+                    if clean_metrics:
+                        mlflow_run.log_metrics(clean_metrics, step=step)
+                    if epoch == 1:
+                        mlflow_run.log_metrics({"generation_marker": generation}, step=step)
+                    if per_metric_losses:
+                        metric_updates = {
+                            f"fitness_predictor_loss_for_{name}": value for name, value in per_metric_losses.items()
+                        }
+                        mlflow_run.log_metrics(metric_updates, step=step)
+                    loss_str = ", ".join(f"{name}={value:.4f}" for name, value in loss_terms.items()) or "none"
+                    if total_epochs is None:
+                        epoch_header = f"Epoch {epoch}"
+                    else:
+                        epoch_header = f"Epoch {epoch}/{total_epochs}"
+                    log_line = f"{epoch_header}, Loss terms per batch: [{loss_str}] (total={total_loss:.4f})"
+                    if active_modules:
+                        log_line += f" | active_modules={','.join(active_modules)}"
+                    mlflow_run.append_log_line(log_line)
+                    mlflow_run.flush_log()
+
+                population.trainer.set_progress_callback(_log_trainer_progress)
+
+                def _log_guided_stats(stats: dict):
+                    if not stats:
+                        return
+                    step = trainer_last_step.get("value", 0)
+                    metrics = {
+                        "guided_children_requested": stats.get("requested"),
+                        "guided_children_created": stats.get("accepted"),
+                        "guided_children_invalid_total": stats.get("invalid_total"),
+                        "guided_children_repair_salvaged": stats.get("repair_salvaged"),
+                        "guided_children_repair_salvaged_total": stats.get("repair_salvaged_total"),
+                        "guided_latent_structure_penalty_last": stats.get("structure_penalty_last"),
+                        "guided_latent_structure_penalty_mean": stats.get("structure_penalty_mean"),
+                        "guided_latent_structure_penalty_samples": stats.get("structure_penalty_samples"),
+                        "guided_decoder_max_nodes_hits": stats.get("decoder_max_nodes_hits"),
+                        "guided_decoder_max_nodes_invalid": stats.get("decoder_max_nodes_invalid"),
+                        "guided_inactive_details_total": stats.get("inactive_details_total"),
+                        "guided_inactive_repair_salvaged": stats.get("inactive_repair_salvaged"),
+                        "guided_inactive_repair_salvaged_total": stats.get("inactive_repair_salvaged_total"),
+                    }
+                    invalid_by_reason = stats.get("invalid_by_reason", {}) or {}
+                    for reason, count in invalid_by_reason.items():
+                        metrics[f"guided_children_invalid_{reason}"] = count
+                    clean_metrics = {k: v for k, v in metrics.items() if v is not None}
+                    if clean_metrics:
+                        mlflow_run.log_metrics(clean_metrics, step=step)
+                    generation = stats.get("generation")
+                    parts = ", ".join(f"{reason}={count}" for reason, count in sorted(invalid_by_reason.items()))
+                    summary = (
+                        f"Guided offspring gen {generation}: requested={stats.get('requested', 0)}, "
+                        f"created={stats.get('accepted', 0)}, invalid_total={stats.get('invalid_total', 0)}, "
+                        f"repair_salvaged={stats.get('repair_salvaged', 0)}"
+                    )
+                    if stats.get("decoder_max_nodes_hits"):
+                        summary += f", max_nodes_hits={stats.get('decoder_max_nodes_hits')}"
+                    if stats.get("inactive_details_total"):
+                        summary += f", inactive_cases={stats.get('inactive_details_total')}"
+                    if stats.get("inactive_repair_salvaged"):
+                        summary += f", inactive_repair_salvaged={stats.get('inactive_repair_salvaged')}"
+                    if stats.get("structure_penalty_samples"):
+                        summary += (
+                            f", structure_penalty_mean={stats.get('structure_penalty_mean', 0):.6f}"
+                            f" (last={stats.get('structure_penalty_last', 0):.6f},"
+                            f" samples={stats.get('structure_penalty_samples', 0)})"
+                        )
+                    if parts:
+                        summary += f" :: {parts}"
+                    mlflow_run.append_log_line(summary)
+                    mlflow_run.flush_log()
+
+                population.guided_stats_callback = _log_guided_stats
+
+                def _log_dataset_stats(stats: dict):
+                    if not stats:
+                        return
+                    step = trainer_last_step.get("value", 0)
+                    metrics = {
+                        "trainer_valid_dataset_size": stats.get("valid"),
+                        "trainer_invalid_dataset_size": stats.get("invalid"),
+                        "trainer_total_dataset_size": stats.get("total"),
+                    }
+                    metrics = {k: v for k, v in metrics.items() if v is not None}
+                    if metrics:
+                        mlflow_run.log_metrics(metrics, step=step)
+                    summary = (
+                        f"Dataset sizes gen {stats.get('generation')}: "
+                        f"valid={stats.get('valid', 0)}, invalid={stats.get('invalid', 0)}, total={stats.get('total', 0)}"
+                    )
+                    mlflow_run.append_log_line(summary)
+                    mlflow_run.flush_log()
+
+                population.dataset_stats_callback = _log_dataset_stats
+
+                def _log_latent_prune_event(event: dict):
+                    if not event:
+                        return
+                    step = trainer_last_step.get("value", 0)
+                    metrics = {
+                        "latent_active_dims": event.get("active_after"),
+                        "latent_pruned_dims": event.get("pruned_dims"),
+                        "latent_prune_epoch": event.get("epoch"),
+                        "latent_prune_generation": event.get("generation"),
+                    }
+                    metrics = {k: v for k, v in metrics.items() if v is not None}
+                    if metrics:
+                        mlflow_run.log_metrics(metrics, step=step)
+                    summary = (
+                        f"Latent pruning gen {event.get('generation')} epoch {event.get('epoch')}: "
+                        f"active_before={event.get('active_before')}, active_after={event.get('active_after')}, "
+                        f"pruned={event.get('pruned_dims')}"
+                    )
+                    mlflow_run.append_log_line(summary)
+                    mlflow_run.flush_log()
+
+                population.trainer.set_prune_callback(_log_latent_prune_event)
+
+            with log_timing(logger, f"Evolution loop ({args.num_generations} generations)") as timing:
+                winner = population.run(args.num_generations)
+                timing.set_details(f"completed_generations={population.generation}")
+            print("\nBest genome:\n{!s}".format(winner))
+
+            snapshot_path = None
+            try:
+                with log_timing(logger, "Serializing final population snapshot") as timing:
+                    population_snapshot = population.snapshot_population()
+                    final_dir = Path(args.final_population_dir).expanduser()
+                    final_dir.mkdir(parents=True, exist_ok=True)
+                    timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+                    filename = f"population_gen{population.generation:05d}_{timestamp}.pt"
+                    snapshot_path = final_dir / filename
+                    torch.save(population_snapshot, snapshot_path)
+                    timing.set_details(f"path={snapshot_path}")
+                    print(f"Final population snapshot saved to {snapshot_path}")
+            except Exception as exc:
+                snapshot_path = None
+                print(f"WARNING: Failed to save final population snapshot: {exc}")
+
+            if mlflow_run:
+                num_nodes, num_connections = _genome_complexity(winner)
+                final_metrics = {
+                    "winner_fitness": getattr(winner, "fitness", None),
+                    "winner_num_nodes": num_nodes or 0,
+                    "winner_num_enabled_connections": num_connections or 0,
+                    "total_generations": args.num_generations,
+                }
+                mlflow_run.log_metrics(final_metrics, step=args.num_generations)
+                mlflow_run.log_text(str(winner), "best_genome.txt")
+                if _INVALID_REASON_COUNTER:
+                    mlflow_run.log_dict(_INVALID_REASON_COUNTER, "invalid_offspring_summary.json")
+                _log_trainer_history_artifacts(mlflow_run, trainer_metrics_history)
+                if snapshot_path and snapshot_path.exists():
+                    mlflow_run.log_artifact(str(snapshot_path))
+        finally:
+            log_artifact_fn = getattr(population, "log_inactive_detail_artifact", None)
+            if mlflow_run and callable(log_artifact_fn):
+                try:
+                    log_artifact_fn(mlflow_run)
+                except Exception as exc:  # pragma: no cover - logging safety net
+                    logger.exception("Failed to log inactive optimizer artifact: %s", exc)
             mlflow_run.log_params(
                 {
                     "config_file": args.config_file,
@@ -989,6 +1206,11 @@ if __name__ == "__main__":
                     "guided_latent_structure_penalty_last": stats.get("structure_penalty_last"),
                     "guided_latent_structure_penalty_mean": stats.get("structure_penalty_mean"),
                     "guided_latent_structure_penalty_samples": stats.get("structure_penalty_samples"),
+                    "guided_decoder_max_nodes_hits": stats.get("decoder_max_nodes_hits"),
+                    "guided_decoder_max_nodes_invalid": stats.get("decoder_max_nodes_invalid"),
+                    "guided_inactive_details_total": stats.get("inactive_details_total"),
+                    "guided_inactive_repair_salvaged": stats.get("inactive_repair_salvaged"),
+                    "guided_inactive_repair_salvaged_total": stats.get("inactive_repair_salvaged_total"),
                 }
                 invalid_by_reason = stats.get("invalid_by_reason", {}) or {}
                 for reason, count in invalid_by_reason.items():
@@ -1003,6 +1225,12 @@ if __name__ == "__main__":
                     f"created={stats.get('accepted', 0)}, invalid_total={stats.get('invalid_total', 0)}, "
                     f"repair_salvaged={stats.get('repair_salvaged', 0)}"
                 )
+                if stats.get("decoder_max_nodes_hits"):
+                    summary += f", max_nodes_hits={stats.get('decoder_max_nodes_hits')}"
+                if stats.get("inactive_details_total"):
+                    summary += f", inactive_cases={stats.get('inactive_details_total')}"
+                if stats.get("inactive_repair_salvaged"):
+                    summary += f", inactive_repair_salvaged={stats.get('inactive_repair_salvaged')}"
                 if stats.get("structure_penalty_samples"):
                     summary += (
                         f", structure_penalty_mean={stats.get('structure_penalty_mean', 0):.6f}"

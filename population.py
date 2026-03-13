@@ -1,10 +1,12 @@
 import atexit
 import copy
+import json
 import logging
 import math
 import random
 import re
 import signal
+import tempfile
 import time
 import tracemalloc
 import weakref
@@ -315,6 +317,8 @@ class GuidedPopulation(Population):
         self._guided_offspring_stats = None
         self._prev_guided_offspring_stats = None
         self._total_repair_salvaged = 0
+        self._total_inactive_repair_salvaged = 0
+        self._inactive_detail_history: List[dict] = []
         self.dataset_stats_callback = None
         max_evaluation_steps = getattr(config, "max_evaluation_steps", None)
         if max_evaluation_steps is not None:
@@ -360,6 +364,15 @@ class GuidedPopulation(Population):
         self._guided_invalid_viz_generation: int | None = None
         self._guided_invalid_viz_used = 0
         self._guided_invalid_viz_import_failed = False
+        # Keep only a bounded sample of per-child diagnostic payloads when
+        # inactive optimizers appear; the full count still gets recorded in stats.
+        raw_inactive_detail_limit = getattr(config, "guided_inactive_detail_limit", 32)
+        try:
+            inactive_limit = int(raw_inactive_detail_limit)
+        except (TypeError, ValueError):
+            inactive_limit = 32
+        self.guided_inactive_detail_limit = max(0, inactive_limit)
+        self.track_inactive_repair_salvage = bool(getattr(config, "track_inactive_repair_salvage", True))
 
     def _reset_guided_offspring_stats(self):
         if self._guided_offspring_stats is not None:
@@ -375,7 +388,72 @@ class GuidedPopulation(Population):
             "structure_penalty_last": None,
             "structure_penalty_mean": None,
             "structure_penalty_samples": 0,
+            "decoder_max_nodes_hits": 0,
+            "decoder_max_nodes_invalid": 0,
+            "inactive_details_total": 0,
+            "inactive_details": [],
+            "inactive_repair_salvaged": 0,
+            "inactive_repair_salvaged_total": self._total_inactive_repair_salvaged,
         }
+
+    def _summarize_inactive_details(self, stats: dict | None) -> dict | None:
+        if not stats:
+            return None
+        invalid_by_reason = dict(stats.get("invalid_by_reason", {}))
+        inactive_invalid = int(invalid_by_reason.get("inactive_optimizer", 0) or 0)
+        inactive_details_total = int(stats.get("inactive_details_total", 0) or 0)
+        inactive_details = stats.get("inactive_details") or []
+        inactive_repair_salvaged = int(stats.get("inactive_repair_salvaged", 0) or 0)
+        inactive_repair_total = int(stats.get("inactive_repair_salvaged_total", 0) or 0)
+        if not inactive_invalid and not inactive_details_total and not inactive_repair_salvaged:
+            return None
+        record = {
+            "generation": int(stats.get("generation", getattr(self, "generation", -1)) or 0),
+            "requested": int(stats.get("requested", 0) or 0),
+            "accepted": int(stats.get("accepted", 0) or 0),
+            "invalid_total": int(stats.get("invalid_total", 0) or 0),
+            "inactive_invalid": inactive_invalid,
+            "inactive_details_total": inactive_details_total,
+            "inactive_repair_salvaged": inactive_repair_salvaged,
+            "inactive_repair_salvaged_total": inactive_repair_total,
+            "decoder_max_nodes_hits": int(stats.get("decoder_max_nodes_hits", 0) or 0),
+        }
+        if inactive_details:
+            record["inactive_details"] = copy.deepcopy(inactive_details)
+        return record
+
+    def _record_inactive_detail_history(self, stats: dict | None) -> None:
+        record = self._summarize_inactive_details(stats)
+        if record:
+            self._inactive_detail_history.append(record)
+
+    def export_inactive_detail_history(self, include_current: bool = True) -> List[dict]:
+        records = [copy.deepcopy(entry) for entry in self._inactive_detail_history]
+        if include_current:
+            snapshot = self._summarize_inactive_details(self._guided_offspring_stats)
+            if snapshot:
+                records.append(snapshot)
+        return records
+
+    def log_inactive_detail_artifact(
+        self,
+        mlflow_run,
+        artifact_file: str = "inactive_optimizer_details.json",
+    ) -> None:
+        if not mlflow_run:
+            return
+        records = self.export_inactive_detail_history(include_current=True)
+        if not records:
+            return
+        payload = {
+            "generated_at": datetime.utcnow().isoformat(timespec="seconds"),
+            "population_generation": int(getattr(self, "generation", -1)),
+            "records": records,
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / artifact_file
+            path.write_text(json.dumps(payload, indent=2))
+            mlflow_run.log_artifact(str(path))
 
     def _accumulate_guided_offspring_stats(
         self,
@@ -387,6 +465,10 @@ class GuidedPopulation(Population):
         structure_penalty_last: float | None = None,
         structure_penalty_sum: float | None = None,
         structure_penalty_steps: int = 0,
+        decoder_max_nodes_hits: int = 0,
+        decoder_max_nodes_invalid: int = 0,
+        inactive_details: Sequence[dict] | None = None,
+        inactive_repair_salvaged: int = 0,
     ):
         stats = self._guided_offspring_stats
         if stats is None:
@@ -405,6 +487,21 @@ class GuidedPopulation(Population):
         if structure_penalty_steps and structure_penalty_sum is not None:
             stats["structure_penalty_mean"] = float(structure_penalty_sum) / max(1, structure_penalty_steps)
             stats["structure_penalty_samples"] = int(structure_penalty_steps)
+        if decoder_max_nodes_hits:
+            stats["decoder_max_nodes_hits"] += int(decoder_max_nodes_hits)
+        if decoder_max_nodes_invalid:
+            stats["decoder_max_nodes_invalid"] += int(decoder_max_nodes_invalid)
+        if inactive_details:
+            stats["inactive_details_total"] += len(inactive_details)
+            limit = self.guided_inactive_detail_limit
+            if limit > 0:
+                recorded = stats.setdefault("inactive_details", [])
+                available = max(0, limit - len(recorded))
+                if available > 0:
+                    recorded.extend(inactive_details[:available])
+        if inactive_repair_salvaged:
+            stats["inactive_repair_salvaged"] += int(inactive_repair_salvaged)
+        stats["inactive_repair_salvaged_total"] = self._total_inactive_repair_salvaged
 
     def _emit_guided_offspring_stats(self):
         stats = self._guided_offspring_stats
@@ -421,9 +518,18 @@ class GuidedPopulation(Population):
             "structure_penalty_last": stats.get("structure_penalty_last"),
             "structure_penalty_mean": stats.get("structure_penalty_mean"),
             "structure_penalty_samples": stats.get("structure_penalty_samples", 0),
+            "decoder_max_nodes_hits": stats.get("decoder_max_nodes_hits", 0),
+            "decoder_max_nodes_invalid": stats.get("decoder_max_nodes_invalid", 0),
+            "inactive_details_total": stats.get("inactive_details_total", 0),
+            "inactive_repair_salvaged": stats.get("inactive_repair_salvaged", 0),
+            "inactive_repair_salvaged_total": stats.get("inactive_repair_salvaged_total", 0),
         }
+        if stats.get("inactive_details"):
+            summary["inactive_details"] = list(stats["inactive_details"])
+        summary["spawn_generation"] = summary.get("generation", self.generation) + 1
         if self.guided_stats_callback:
             self.guided_stats_callback(summary)
+        self._record_inactive_detail_history(summary)
         if summary["invalid_total"]:
             parts = ", ".join(f"{reason}={count}" for reason, count in sorted(summary["invalid_by_reason"].items()))
             self.reporters.info(
@@ -997,6 +1103,21 @@ class GuidedPopulation(Population):
         data = Data(node_types=node_types, edge_index=edge_index, node_attributes=node_attributes)
         return data
 
+    def _graph_dict_would_be_inactive(self, graph_dict: dict | None, *, key: int) -> bool:
+        if not graph_dict:
+            return False
+        genome_config = getattr(self.config, "genome_config", None)
+        if genome_config is None:
+            return False
+        try:
+            genome = genome_from_graph_dict(graph_dict, genome_config, key=key)
+        except Exception:
+            return False
+        optimizer = rebuild_and_script(graph_dict, genome_config, key=key, genome=genome)
+        if optimizer is None:
+            return False
+        return not self._optimizer_updates_parameters(optimizer, check_steps=2)
+
     def _minimum_required_node_count(self) -> int:
         config = getattr(self.config, "genome_config", None)
         if config is None:
@@ -1534,6 +1655,10 @@ class GuidedPopulation(Population):
         missing_slot_rejections = 0
         repair_failures = 0
         repair_salvaged = 0
+        decoder_max_nodes_hits = 0
+        decoder_max_nodes_invalid = 0
+        inactive_detail_samples: List[dict] = []
+        inactive_repair_salvaged = 0
         debug_dir = Path("debug_guided_offspring")
         debug_dir.mkdir(parents=True, exist_ok=True)
         debug_save_limit = 5
@@ -1561,6 +1686,7 @@ class GuidedPopulation(Population):
             original_node_count = len(graph_dict.get("node_attributes") or [])
             self._ensure_graph_node_capacity(graph_dict, min_nodes_required)
             if hit_max_nodes_cap:
+                decoder_max_nodes_hits += 1
                 max_nodes_value = None
                 if decoder_max_nodes is not None:
                     try:
@@ -1597,6 +1723,7 @@ class GuidedPopulation(Population):
                 self._buffer_decoder_replay_dict(graph_dict)
                 if last_valid_graph_dict is not None:
                     self._buffer_decoder_replay_dict(last_valid_graph_dict)
+                decoder_max_nodes_invalid += 1
                 invalid_reason_counts["decoder_max_nodes"] += 1
                 graph_signature = graph_signature_from_dict(graph_dict)
                 if graph_signature:
@@ -1637,7 +1764,19 @@ class GuidedPopulation(Population):
                 new_genomes.append(genome)
                 continue
             self._prepare_decoded_graph_dict(graph_dict)
+            pre_repair_graph_dict = (
+                self._clone_graph_dict(graph_dict, include_history=False)
+                if self.track_inactive_repair_salvage
+                else None
+            )
             self._repair_graph_dict(graph_dict)
+            repair_applied_flag = bool(graph_dict.get("_repair_applied"))
+            pre_repair_inactive = False
+            if self.track_inactive_repair_salvage and repair_applied_flag and pre_repair_graph_dict is not None:
+                pre_repair_inactive = self._graph_dict_would_be_inactive(
+                    pre_repair_graph_dict,
+                    key=i,
+                )
             repair_reason = graph_dict.get("_repair_failure_reason")
             repair_details = graph_dict.get("_repair_failure_details")
             if repair_reason:
@@ -1789,6 +1928,23 @@ class GuidedPopulation(Population):
                     invalid_reason_counts["inactive_optimizer"] += 1
                     if graph_signature:
                         seen_graph_signatures.add(graph_signature)
+                    latent_flat = latent.detach().view(-1)
+                    latent_norm = float(latent_flat.norm().detach().cpu().item()) if latent_flat.numel() else 0.0
+                    latent_mean = float(latent_flat.mean().detach().cpu().item()) if latent_flat.numel() else 0.0
+                    detail = {
+                        "child_index": int(i),
+                        "param_delta": float(getattr(self, "_last_optimizer_delta", 0.0) or 0.0),
+                        "latent_norm": latent_norm,
+                        "latent_mean": latent_mean,
+                        "decoder_max_nodes_hit": bool(hit_max_nodes_cap),
+                        "invalid_reason": "inactive_optimizer",
+                        "num_edges": int(num_edges),
+                    }
+                    if graph_signature:
+                        detail["graph_signature"] = graph_signature
+                    if latent_valid_flags is not None:
+                        detail["latent_marked_valid"] = bool(latent_valid_flags[i])
+                    inactive_detail_samples.append(detail)
                     new_genomes.append(genome)
                     continue
 
@@ -1797,6 +1953,9 @@ class GuidedPopulation(Population):
                     latent_valid_flags[i] = not repair_applied
                 if repair_applied:
                     repair_salvaged += 1
+                if pre_repair_inactive and repair_applied:
+                    inactive_repair_salvaged += 1
+                    self._total_inactive_repair_salvaged += 1
                 genome.optimizer = optimizer
                 genome.graph_dict = graph_dict
                 last_valid_graph_dict = self._clone_graph_dict(graph_dict)
@@ -1861,14 +2020,25 @@ class GuidedPopulation(Population):
             duplicate_count += late_duplicates
             warn(f"Guided offspring final dedupe removed {late_duplicates} duplicate graphs.")
 
+        final_invalid_counts: Counter = Counter()
+        for genome in deduped_genomes:
+            if getattr(genome, "invalid_graph", False):
+                reason = getattr(genome, "invalid_reason", "invalid_graph") or "invalid_graph"
+                final_invalid_counts[reason] += 1
+        effective_invalid_counts = final_invalid_counts or invalid_reason_counts
+
         self._accumulate_guided_offspring_stats(
             total_requested,
             len(deduped_genomes),
-            invalid_reason_counts,
+            effective_invalid_counts,
             repair_salvaged=repair_salvaged,
             structure_penalty_last=structure_penalty_last,
             structure_penalty_sum=structure_penalty_sum if structure_penalty_steps else None,
             structure_penalty_steps=structure_penalty_steps,
+            decoder_max_nodes_hits=decoder_max_nodes_hits,
+            decoder_max_nodes_invalid=decoder_max_nodes_invalid,
+            inactive_details=inactive_detail_samples,
+            inactive_repair_salvaged=inactive_repair_salvaged,
         )
         return deduped_genomes
 
@@ -2791,13 +2961,29 @@ class GuidedPopulation(Population):
                 genome_map[genome_id].fitness = (len(fronts) - front_idx + 1) + composite
                 print(f"    {genome_id}: {genome_map[genome_id].fitness}")
                 genome_map[genome_id].fitnesses = raw_metrics[genome_id]
+        effective_invalid_counts = invalid_reason_counts
+        stats_source = None
+        summary = getattr(self, "_prev_guided_offspring_stats", None)
+        if summary:
+            summary_counts = summary.get("invalid_by_reason") or {}
+            if summary_counts:
+                effective_invalid_counts = Counter(summary_counts)
+                stats_source = summary
+
         if invalid_genomes:
             self.reporters.info(
                 f"Invalid or skipped guided offspring penalized: {len(invalid_genomes)}/{len(genome_map)}"
             )
-        if invalid_reason_counts:
-            parts = ", ".join(f"{reason}={count}" for reason, count in sorted(invalid_reason_counts.items()))
-            self.reporters.info(f"Invalid guided offspring reasons: {parts}")
+        if effective_invalid_counts:
+            parts = ", ".join(f"{reason}={count}" for reason, count in sorted(effective_invalid_counts.items()))
+            if stats_source:
+                spawn_gen = stats_source.get("spawn_generation") or stats_source.get("generation")
+                if spawn_gen is not None:
+                    self.reporters.info(f"Invalid guided offspring reasons (spawned gen {spawn_gen}): {parts}")
+                else:
+                    self.reporters.info(f"Invalid guided offspring reasons (from guided stats): {parts}")
+            else:
+                self.reporters.info(f"Invalid guided offspring reasons: {parts}")
         return genomes
 
     def _assign_penalty(

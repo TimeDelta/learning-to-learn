@@ -1,7 +1,9 @@
 import copy
+import json
 import os
 import sys
-from collections import deque
+from collections import Counter, deque
+from pathlib import Path
 from types import MethodType, SimpleNamespace
 
 import numpy as np
@@ -124,6 +126,17 @@ class StubGuide:
         graph = self._graph_factories[idx]()
         self._decode_calls += 1
         return [graph]
+
+
+class RecordingReporters:
+    def __init__(self):
+        self.messages: list[str] = []
+
+    def info(self, message):
+        self.messages.append(str(message))
+
+    def __getattr__(self, name):  # pragma: no cover - passthrough for unused hooks
+        return lambda *args, **kwargs: None
 
 
 def create_simple_genome(key=0):
@@ -356,6 +369,7 @@ def test_generate_guided_offspring_penalizes_max_nodes(monkeypatch):
         return graph
 
     pop, config = configure_stub_population([capped_factory], monkeypatch)
+    pop._reset_guided_offspring_stats()
 
     offspring = pop.generate_guided_offspring(
         [], config, n_offspring=1, latent_steps=1, max_decode_attempts=1, decode_jitter_std=0.0
@@ -367,6 +381,122 @@ def test_generate_guided_offspring_penalizes_max_nodes(monkeypatch):
     assert genome.invalid_reason == "decoder_max_nodes"
     assert genome.skip_evaluation is True
     assert genome.invalid_penalty_details.get("max_nodes") == 4
+    stats = pop._guided_offspring_stats
+    assert stats["decoder_max_nodes_hits"] == 1
+    assert stats["decoder_max_nodes_invalid"] == 1
+
+
+def test_generate_guided_offspring_records_inactive_details(monkeypatch):
+    config = make_neat_config()
+    config.guided_replay_fraction = 0.0
+    config.guided_seed_fraction = 0.0
+    config.guided_inactive_detail_limit = 1
+    pop = GuidedPopulation(config)
+    pop.guide = StubGuide([make_graph_factory(0.1)])
+    pop._optimizer_updates_parameters = lambda *args, **kwargs: False
+    monkeypatch.setattr(
+        population_module,
+        "rebuild_and_script",
+        lambda *args, **kwargs: DummyStatefulOptimizer(),
+    )
+    pop._reset_guided_offspring_stats()
+
+    pop.generate_guided_offspring(
+        [],
+        config,
+        n_offspring=1,
+        latent_steps=1,
+        max_decode_attempts=1,
+        decode_jitter_std=0.0,
+    )
+
+    stats = pop._guided_offspring_stats
+    assert stats["inactive_details_total"] >= 1
+    assert len(stats["inactive_details"]) == 1
+    detail = stats["inactive_details"][0]
+    assert detail["invalid_reason"] == "inactive_optimizer"
+    assert "latent_norm" in detail
+    assert "param_delta" in detail
+
+
+def test_export_inactive_detail_history_includes_current(monkeypatch):
+    pop, config = configure_stub_population([make_graph_factory(0.1)], monkeypatch)
+    stats = {
+        "generation": 1,
+        "requested": 4,
+        "accepted": 1,
+        "invalid_total": 3,
+        "invalid_by_reason": Counter({"inactive_optimizer": 3}),
+        "inactive_details_total": 2,
+        "inactive_details": [{"child_index": 0}],
+        "inactive_repair_salvaged": 1,
+        "inactive_repair_salvaged_total": 1,
+    }
+    pop._record_inactive_detail_history(stats)
+    exported = pop.export_inactive_detail_history(include_current=True)
+    assert exported
+    assert exported[0]["inactive_invalid"] == 3
+
+
+def test_log_inactive_detail_artifact_writes_json(monkeypatch, tmp_path):
+    pop, config = configure_stub_population([make_graph_factory(0.1)], monkeypatch)
+    stats = {
+        "generation": 2,
+        "requested": 5,
+        "accepted": 1,
+        "invalid_total": 4,
+        "invalid_by_reason": Counter({"inactive_optimizer": 4}),
+        "inactive_details_total": 1,
+        "inactive_details": [{"child_index": 0, "param_delta": 0.0}],
+        "inactive_repair_salvaged": 0,
+        "inactive_repair_salvaged_total": 0,
+    }
+    pop._record_inactive_detail_history(stats)
+
+    captured = {}
+
+    class DummyRun:
+        def log_artifact(self, path: str):
+            payload = json.loads(Path(path).read_text())
+            captured.update(payload)
+
+    pop.log_inactive_detail_artifact(DummyRun(), artifact_file="inactive.json")
+    assert captured["records"]
+
+
+def test_generate_guided_offspring_counts_inactive_repair_salvage(monkeypatch):
+    pop, config = configure_stub_population([make_graph_factory(0.15)], monkeypatch)
+    pop.track_inactive_repair_salvage = True
+    monkeypatch.setattr(
+        population_module,
+        "rebuild_and_script",
+        lambda *args, **kwargs: DummyStatefulOptimizer(),
+    )
+    pop._optimizer_updates_parameters = lambda *args, **kwargs: True
+    pop._graph_dict_would_be_inactive = lambda graph_dict, key: True
+
+    real_repair = pop._repair_graph_dict
+
+    def forced_repair(graph_dict):
+        real_repair(graph_dict)
+        graph_dict["_repair_applied"] = True
+        return True
+
+    pop._repair_graph_dict = forced_repair
+    pop._reset_guided_offspring_stats()
+
+    pop.generate_guided_offspring(
+        [],
+        config,
+        n_offspring=1,
+        latent_steps=1,
+        max_decode_attempts=1,
+        decode_jitter_std=0.0,
+    )
+
+    stats = pop._guided_offspring_stats
+    assert stats["inactive_repair_salvaged"] == 1
+    assert stats["inactive_repair_salvaged_total"] >= 1
 
 
 def test_latent_structure_penalty_uses_cached_centers():
@@ -652,6 +782,49 @@ def test_eval_genomes_penalizes_skipped_empty_graphs():
     assert genome.fitnesses[TimeCost] == GuidedPopulation.INVALID_METRIC_VALUE
     assert genome.fitnesses[MemoryCost] == GuidedPopulation.INVALID_METRIC_VALUE
     assert genome.fitness == -0.1
+
+
+def test_eval_genomes_logs_prev_guided_invalid_summary(monkeypatch):
+    config = make_neat_config()
+    pop = GuidedPopulation(config)
+    pop.reporters = RecordingReporters()
+    task = RegressionTask.random_init(num_samples=4, silent=True)
+    pop.task = task
+
+    valid_genome = create_simple_genome(0)
+    valid_genome.optimizer = DummyStatefulOptimizer()
+
+    invalid_genome = create_simple_genome(1)
+    invalid_genome.skip_evaluation = True
+    invalid_genome.invalid_reason = "inactive_optimizer"
+
+    pop._prev_guided_offspring_stats = {
+        "generation": 12,
+        "spawn_generation": 13,
+        "invalid_total": 7,
+        "invalid_by_reason": Counter({"inactive_optimizer": 6, "decoder_max_nodes": 1}),
+    }
+
+    def fake_evaluate_optimizer(self, optimizer, model, steps=0):
+        return 0.5, {AreaUnderTaskMetrics: 0.4}, 0.1, 0.2
+
+    monkeypatch.setattr(
+        pop,
+        "evaluate_optimizer",
+        MethodType(fake_evaluate_optimizer, pop),
+    )
+
+    counter_snapshot = population_module._INVALID_REASON_COUNTER.copy()
+    try:
+        pop.eval_genomes([(0, valid_genome), (1, invalid_genome)], config, steps=1)
+    finally:
+        population_module._INVALID_REASON_COUNTER.clear()
+        population_module._INVALID_REASON_COUNTER.update(counter_snapshot)
+
+    all_messages = "\n".join(pop.reporters.messages)
+    assert "inactive_optimizer=6" in all_messages
+    assert "decoder_max_nodes=1" in all_messages
+    assert "spawned gen 13" in all_messages
 
 
 def test_assign_penalty_records_decoder_failure_when_requested():
