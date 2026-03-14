@@ -123,7 +123,7 @@ Example: `trainer_freeze_cycle = decoder,encoder+fitness,icnn,all` spends one ep
 These phases are also logged to MLflow via the `trainer_module_active_*` metrics and the `active_modules=...` suffix in trainer log lines.
 
 Leaving the cycle unset defaults to a balanced round-robin across whatever modules exist in the current guide.
-The decoder teacher-forcing refresh temporarily unfreezes all heads so the auxiliary rehearsal can update the entire stack regardless of the main-cycle state.
+The teacher-forcing refresh temporarily unfreezes all heads so the auxiliary rehearsal can update the entire stack regardless of the main-cycle state.
 
 ### Generative Cross-Species Crossover (Graph-VAE)
 
@@ -181,8 +181,8 @@ This keeps gradients for wildly different metrics (e.g., memory cost vs. AU task
 *Learnable latent tether.* Guided decoding now keeps each latent within the encoder’s posterior by penalizing `||z_g - z_g^0||_2` with a softplus-parameterized weight that is optimized alongside the latents (and softly regularized toward a prior).
 This lets “trust region” radii expand for confident tasks and tighten whenever the decoder starts collapsing to empty graphs.
 
-*Decoder reconstruction refresh.* After every generation, the self-compressing autoencoder now runs an additional decoder-only teacher-forcing pass on the valid graph replay buffer.
-This stage replays ground-truth node/attribute sequences for a few extra epochs (`decoder_teacher_epochs`, default 5) with an amplified cross-entropy weight (`decoder_teacher_force_weight`, default 2.0) so the decoder keeps producing non-empty graphs even as the latent mask prunes dimensions.
+*Teacher-forcing reconstruction refresh.* After every generation, the self-compressing autoencoder now runs an additional joint teacher-forcing pass on the valid graph replay buffer, temporarily unfreezing every module so the decoder, encoder, and surrogate heads stay synchronized.
+This stage replays ground-truth node/attribute sequences for a few extra epochs (`teacher_force_epochs`, default 5) with an amplified cross-entropy weight (`teacher_force_weight`, default 2.0) so the decoder keeps producing non-empty graphs even as the latent mask prunes dimensions.
 The refresh automatically ramps up to more epochs/weight when the previous generation reported many `empty_graph` failures and also mixes in “near-miss” decoder outputs (graphs that decoded with edges but failed later slot/optimizer checks) plus an explicit penalty whenever a decode terminates before creating edges.
 That combination keeps the decoder anchored to the latent manifold that actually yields usable optimizers.
 *Partial latent KL.* The `[GuidedPopulation]` block inside `neat-config` accepts `kl_partial_slice_ratio` (or an explicit `kl_partial_slice_dims`) plus `kl_partial_slice_start`, letting you clamp the KL divergence term to a contiguous slice of the latent bottleneck.

@@ -255,15 +255,15 @@ class GuidedPopulation(Population):
             self.test_epoch_scale = max(0.01, min(1.0, scale))
         else:
             self.test_epoch_scale = None
-        self.decoder_teacher_epochs_base = int(getattr(config, "decoder_teacher_epochs", 5))
-        self.decoder_teacher_epochs_max = int(
-            getattr(config, "decoder_teacher_epochs_max", max(5, self.decoder_teacher_epochs_base * 3))
+        self.teacher_force_epochs_base = int(getattr(config, "teacher_force_epochs", 5))
+        self.teacher_force_epochs_max = int(
+            getattr(config, "teacher_force_epochs_max", max(5, self.teacher_force_epochs_base * 3))
         )
-        self.decoder_teacher_force_weight_base = float(getattr(config, "decoder_teacher_force_weight", 2.0))
-        self.decoder_teacher_force_weight_max = float(
-            getattr(config, "decoder_teacher_force_weight_max", max(2.0, self.decoder_teacher_force_weight_base * 2))
+        self.teacher_force_weight_base = float(getattr(config, "teacher_force_weight", 2.0))
+        self.teacher_force_weight_max = float(
+            getattr(config, "teacher_force_weight_max", max(2.0, self.teacher_force_weight_base * 2))
         )
-        self.decoder_teacher_verbose = bool(getattr(config, "decoder_teacher_verbose", True))
+        self.teacher_force_verbose = bool(getattr(config, "teacher_force_verbose", True))
         self.decoder_replay_max = int(getattr(config, "decoder_replay_max", 256))
         # graph_signature_from_dict can legitimately return None (e.g., tensors with unsupported dtypes) even for validated graphs
         self._decoder_replay_cache: deque[tuple[str | None, dict]] = deque()
@@ -578,14 +578,14 @@ class GuidedPopulation(Population):
             return 0.0
         return max(0.0, min(1.0, empties / requested))
 
-    def _decoder_refresh_schedule(self) -> tuple[int, float]:
+    def _teacher_force_schedule(self) -> tuple[int, float]:
         ratio = self._guided_empty_ratio()
-        epochs_span = max(0, self.decoder_teacher_epochs_max - self.decoder_teacher_epochs_base)
-        weight_span = max(0.0, self.decoder_teacher_force_weight_max - self.decoder_teacher_force_weight_base)
-        epochs = int(round(self.decoder_teacher_epochs_base + epochs_span * ratio))
-        weight = float(self.decoder_teacher_force_weight_base + weight_span * ratio)
-        epochs = max(self.decoder_teacher_epochs_base, min(self.decoder_teacher_epochs_max, epochs))
-        weight = max(self.decoder_teacher_force_weight_base, min(self.decoder_teacher_force_weight_max, weight))
+        epochs_span = max(0, self.teacher_force_epochs_max - self.teacher_force_epochs_base)
+        weight_span = max(0.0, self.teacher_force_weight_max - self.teacher_force_weight_base)
+        epochs = int(round(self.teacher_force_epochs_base + epochs_span * ratio))
+        weight = float(self.teacher_force_weight_base + weight_span * ratio)
+        epochs = max(self.teacher_force_epochs_base, min(self.teacher_force_epochs_max, epochs))
+        weight = max(self.teacher_force_weight_base, min(self.teacher_force_weight_max, weight))
         return epochs, weight
 
     def _trainer_epoch_schedule(self) -> Dict[str, float]:
@@ -2771,25 +2771,27 @@ class GuidedPopulation(Population):
                     baseline_window=schedule["baseline_window"],
                 )
                 timing.set_details(f"dataset={len(self.trainer.dataset)} epochs={schedule['epochs']} batch={batch}")
-            decoder_epochs, decoder_weight = self._decoder_refresh_schedule()
+            teacher_force_epochs, teacher_force_weight = self._teacher_force_schedule()
             replay_payload = self._consume_decoder_replay_graphs()
-            if decoder_epochs > 0 and (self.trainer.dataset or replay_payload):
-                decoder_batch = min(batch, max(1, len(self.trainer.dataset)))
+            if teacher_force_epochs > 0 and (self.trainer.dataset or replay_payload):
+                teacher_force_batch = min(batch, max(1, len(self.trainer.dataset)))
                 empty_ratio = self._guided_empty_ratio()
                 self.reporters.info(
-                    f"Decoder refresh: epochs={decoder_epochs} weight={decoder_weight:.3f} "
+                    f"Teacher-forcing refresh: epochs={teacher_force_epochs} weight={teacher_force_weight:.3f} "
                     f"empty_ratio={empty_ratio:.3f} replay_graphs={len(replay_payload)}"
                 )
-                with log_timing(logger, f"Generation {self.generation} decoder refresh") as timing:
+                with log_timing(logger, f"Generation {self.generation} teacher-forcing refresh") as timing:
                     self.trainer.decoder_teacher_force_pass(
-                        epochs=decoder_epochs,
-                        batch_size=decoder_batch,
-                        teacher_force_weight=decoder_weight,
+                        epochs=teacher_force_epochs,
+                        batch_size=teacher_force_batch,
+                        teacher_force_weight=teacher_force_weight,
                         generation=self.generation,
-                        verbose=self.decoder_teacher_verbose,
+                        verbose=self.teacher_force_verbose,
                         extra_graphs=replay_payload,
                     )
-                    timing.set_details(f"epochs={decoder_epochs} batch={decoder_batch} replay={len(replay_payload)}")
+                    timing.set_details(
+                        f"epochs={teacher_force_epochs} batch={teacher_force_batch} replay={len(replay_payload)}"
+                    )
             valid_size = len(self.trainer.dataset)
             invalid_size = len(self.trainer.invalid_dataset)
             total_size = valid_size + invalid_size
