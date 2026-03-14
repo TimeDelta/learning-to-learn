@@ -620,6 +620,38 @@ def test_generate_guided_offspring_tracks_structure_penalty(monkeypatch):
     assert stats["structure_penalty_mean"] == pytest.approx(expected_mean)
 
 
+def test_decoder_replay_seed_support_follows_validator_fail_ratio():
+    config = make_neat_config()
+    config.guided_replay_fraction = 0.0
+    config.guided_seed_fraction = 0.5
+    config.guided_seed_fail_threshold = 0.25
+    pop = GuidedPopulation(config)
+
+    seed_graph = make_graph_factory(0.1)()
+    seed_graph["node_attributes"][0]["tag"] = "seed"
+    pop._seeded_replay_entries = [{"graph": seed_graph}]
+
+    reservoir_graph = make_graph_factory(0.2)()
+    reservoir_graph["node_attributes"][0]["tag"] = "reservoir"
+    pop._decoder_replay_reservoir.clear()
+    pop._decoder_replay_reservoir.extend([(None, reservoir_graph)])
+
+    pop._reset_guided_offspring_stats()
+    pop._guided_offspring_stats["requested"] = 4
+    pop._guided_offspring_stats["validator_failures"] = 2
+
+    seeded_draw = pop._sample_decoder_replay_graphs(1)
+    assert any(attr.get("tag") == "seed" for g in seeded_draw for attr in g.get("node_attributes", []))
+
+    pop._reset_guided_offspring_stats()
+    pop._guided_offspring_stats["requested"] = 4
+    pop._guided_offspring_stats["validator_failures"] = 0
+    pop._prev_guided_offspring_stats = None
+
+    regular_draw = pop._sample_decoder_replay_graphs(1)
+    assert all(attr.get("tag") != "seed" for g in regular_draw for attr in g.get("node_attributes", []))
+
+
 def test_latent_structure_penalty_uses_cached_centers():
     config = make_neat_config()
     config.guided_structure_buffer = 4

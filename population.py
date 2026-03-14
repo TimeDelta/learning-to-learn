@@ -278,9 +278,10 @@ class GuidedPopulation(Population):
         self.guided_replay_noise_scale = max(0.0, float(getattr(config, "guided_replay_noise_scale", 0.2)))
         self.guided_replay_max_latents = max(0, int(getattr(config, "guided_replay_max_latents", 64)))
         self.guided_seed_fraction = min(1.0, max(0.0, float(getattr(config, "guided_seed_fraction", 0.25))))
-        self.guided_seed_inactive_threshold = min(
-            1.0, max(0.0, float(getattr(config, "guided_seed_inactive_threshold", 0.3)))
-        )
+        raw_seed_fail_threshold = getattr(config, "guided_seed_fail_threshold", None)
+        if raw_seed_fail_threshold is None:
+            raw_seed_fail_threshold = getattr(config, "guided_seed_inactive_threshold", 0.3)
+        self.guided_seed_fail_threshold = min(1.0, max(0.0, float(raw_seed_fail_threshold)))
         self._seeded_replay_entries: List[dict] = []
         self._seeded_replay_signatures: Set[str | None] = set()
         self.guided_structure_buffer = max(0, int(getattr(config, "guided_structure_buffer", 512)))
@@ -393,6 +394,7 @@ class GuidedPopulation(Population):
             "inactive_details": [],
             "inactive_repair_salvaged": 0,
             "inactive_repair_salvaged_total": self._total_inactive_repair_salvaged,
+            "validator_failures": 0,
         }
 
     def _summarize_inactive_details(self, stats: dict | None) -> dict | None:
@@ -468,6 +470,7 @@ class GuidedPopulation(Population):
         decoder_max_nodes_invalid: int = 0,
         inactive_details: Sequence[dict] | None = None,
         inactive_repair_salvaged: int = 0,
+        validator_failures: int = 0,
     ):
         stats = self._guided_offspring_stats
         if stats is None:
@@ -501,6 +504,8 @@ class GuidedPopulation(Population):
         if inactive_repair_salvaged:
             stats["inactive_repair_salvaged"] += int(inactive_repair_salvaged)
         stats["inactive_repair_salvaged_total"] = self._total_inactive_repair_salvaged
+        if validator_failures:
+            stats["validator_failures"] += int(validator_failures)
 
     def _emit_guided_offspring_stats(self):
         stats = self._guided_offspring_stats
@@ -522,6 +527,7 @@ class GuidedPopulation(Population):
             "inactive_details_total": stats.get("inactive_details_total", 0),
             "inactive_repair_salvaged": stats.get("inactive_repair_salvaged", 0),
             "inactive_repair_salvaged_total": stats.get("inactive_repair_salvaged_total", 0),
+            "validator_failures": stats.get("validator_failures", 0),
         }
         if stats.get("inactive_details"):
             summary["inactive_details"] = list(stats["inactive_details"])
@@ -536,16 +542,15 @@ class GuidedPopulation(Population):
             )
         self._guided_offspring_stats = summary
 
-    def _guided_inactive_ratio(self) -> float:
+    def _guided_validator_fail_ratio(self) -> float:
         stats = self._prev_guided_offspring_stats or self._guided_offspring_stats
         if not stats:
-            return 1.0
-        invalid = stats.get("invalid_by_reason", {}) or {}
-        inactive = float(invalid.get("inactive_optimizer", 0))
+            return 0.0
+        failures = float(stats.get("validator_failures", 0) or 0)
         requested = float(stats.get("requested") or 0)
         if requested <= 0:
-            return 1.0 if inactive else 0.0
-        return inactive / requested
+            return 0.0
+        return max(0.0, min(1.0, failures / requested))
 
     def _emit_dataset_stats(self, valid_size: int, invalid_size: int):
         if not self.dataset_stats_callback:
@@ -850,11 +855,11 @@ class GuidedPopulation(Population):
         if not self._decoder_replay_reservoir and not self._seeded_replay_entries:
             return []
         graphs: List[dict] = []
-        inactive_ratio = self._guided_inactive_ratio()
+        fail_ratio = self._guided_validator_fail_ratio()
         need_seed_support = (
             self.guided_seed_fraction > 0.0
-            and self.guided_seed_inactive_threshold > 0.0
-            and inactive_ratio >= self.guided_seed_inactive_threshold
+            and self.guided_seed_fail_threshold > 0.0
+            and fail_ratio >= self.guided_seed_fail_threshold
         )
         if need_seed_support and self._seeded_replay_entries:
             seed_quota = min(count, max(1, int(round(count * self.guided_seed_fraction))))
@@ -2033,6 +2038,7 @@ class GuidedPopulation(Population):
             decoder_max_nodes_invalid=decoder_max_nodes_invalid,
             inactive_details=inactive_detail_samples,
             inactive_repair_salvaged=inactive_repair_salvaged,
+            validator_failures=inactive_optimizer_count,
         )
         return deduped_genomes
 
