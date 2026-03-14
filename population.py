@@ -353,19 +353,6 @@ class GuidedPopulation(Population):
         except (TypeError, ValueError):
             limit = 6
         self.guided_invalid_viz_limit = max(0, limit)
-        raw_formats = getattr(config, "guided_invalid_viz_formats", ("mermaid",))
-        if isinstance(raw_formats, str):
-            format_candidates = [part.strip().lower() for part in raw_formats.split(",")]
-        else:
-            try:
-                format_candidates = [str(part).strip().lower() for part in raw_formats]
-            except TypeError:
-                format_candidates = []
-        formats: List[str] = [fmt for fmt in format_candidates if fmt]
-        if not formats:
-            formats = ["mermaid"]
-        # Preserve order without duplicates.
-        self.guided_invalid_viz_formats = tuple(dict.fromkeys(formats))
         rankdir = str(getattr(config, "guided_invalid_viz_rankdir", "LR"))
         rankdir = rankdir.upper()
         if rankdir not in {"LR", "RL", "TB", "BT"}:
@@ -383,6 +370,8 @@ class GuidedPopulation(Population):
             inactive_limit = 32
         self.guided_inactive_detail_limit = max(0, inactive_limit)
         self.track_inactive_repair_salvage = bool(getattr(config, "track_inactive_repair_salvage", True))
+        self.guided_debug_dump_enabled = bool(getattr(config, "guided_debug_dump_enabled", False))
+        self.guided_debug_dump_limit = max(0, int(getattr(config, "guided_debug_dump_limit", 5)))
 
     def _reset_guided_offspring_stats(self):
         if self._guided_offspring_stats is not None:
@@ -816,15 +805,6 @@ class GuidedPopulation(Population):
             task=getattr(self.task, "name", None),
         )
         produced_any = False
-
-        supported_format = False
-        for fmt in self.guided_invalid_viz_formats:
-            if fmt == "mermaid":
-                supported_format = True
-            else:
-                warn(f"Unsupported guided invalid visualization format '{fmt}'; only 'mermaid' is available.")
-        if not supported_format:
-            return
 
         variants: List[Tuple[str, dict]] = []
         if decoded_graph is not None:
@@ -1669,10 +1649,13 @@ class GuidedPopulation(Population):
         decoder_max_nodes_invalid = 0
         inactive_detail_samples: List[dict] = []
         inactive_repair_salvaged = 0
-        debug_dir = Path("debug_guided_offspring")
-        debug_dir.mkdir(parents=True, exist_ok=True)
-        debug_save_limit = 5
+        debug_dir: Path | None = None
+        debug_save_limit = 0
         debug_saved = 0
+        if self.guided_debug_dump_enabled:
+            debug_dir = Path("debug_guided_offspring")
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            debug_save_limit = self.guided_debug_dump_limit
         generation_idx = getattr(self, "generation", -1)
         seen_graph_signatures: Set[str] = set()
         total_requested = z_g.size(0)
@@ -1823,10 +1806,11 @@ class GuidedPopulation(Population):
                 new_genomes.append(genome)
                 continue
 
-            if num_edges == 0 or debug_saved < debug_save_limit:
-                debug_path = debug_dir / f"gen{generation_idx}_child{i}_edges{num_edges}.pt"
-                torch.save(graph_dict, debug_path)
-                debug_saved += 1
+            if self.guided_debug_dump_enabled and debug_dir is not None:
+                if num_edges == 0 or debug_saved < debug_save_limit:
+                    debug_path = debug_dir / f"gen{generation_idx}_child{i}_edges{num_edges}.pt"
+                    torch.save(graph_dict, debug_path)
+                    debug_saved += 1
 
             if num_edges == 0:
                 empty_graph_count += 1

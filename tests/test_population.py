@@ -860,7 +860,6 @@ def test_guided_invalid_visualization_emits_mermaid_files(tmp_path):
     pop.generation = 2
     pop.guided_invalid_viz_enabled = True
     pop.guided_invalid_viz_dir = tmp_path
-    pop.guided_invalid_viz_formats = ("mermaid",)
     pop.guided_invalid_viz_limit = 4
     pop._guided_invalid_viz_generation = None
     pop._guided_invalid_viz_used = 0
@@ -894,7 +893,6 @@ def test_guided_invalid_visualization_writes_separate_decoded_mermaid(tmp_path):
     pop.generation = 5
     pop.guided_invalid_viz_enabled = True
     pop.guided_invalid_viz_dir = tmp_path
-    pop.guided_invalid_viz_formats = ("mermaid",)
     genome = create_simple_genome()
 
     decoded_graph = {
@@ -929,7 +927,6 @@ def test_guided_invalid_visualization_mermaid_only(tmp_path):
     pop.generation = 4
     pop.guided_invalid_viz_enabled = True
     pop.guided_invalid_viz_dir = tmp_path
-    pop.guided_invalid_viz_formats = ("mermaid",)
     pop.guided_invalid_viz_limit = 2
 
     genome = create_simple_genome()
@@ -960,7 +957,6 @@ def test_guided_invalid_visualization_mermaid_uses_repaired_graph(tmp_path):
     pop.generation = 6
     pop.guided_invalid_viz_enabled = True
     pop.guided_invalid_viz_dir = tmp_path
-    pop.guided_invalid_viz_formats = ("mermaid",)
     genome = create_simple_genome()
     decoded_graph = {
         "node_types": torch.tensor([0, 1], dtype=torch.long),
@@ -987,34 +983,6 @@ def test_guided_invalid_visualization_mermaid_uses_repaired_graph(tmp_path):
     text = repaired_files[0].read_text()
     assert "%% Graph has no edges" in text
     assert "node_0 --> node_1" not in text
-
-
-def test_guided_invalid_visualization_warns_on_unsupported_format(tmp_path):
-    config = make_neat_config()
-    pop = GuidedPopulation(config)
-    pop.generation = 3
-    pop.guided_invalid_viz_enabled = True
-    pop.guided_invalid_viz_dir = tmp_path
-    pop.guided_invalid_viz_formats = ("png",)
-    pop.guided_invalid_viz_limit = 1
-
-    genome = create_simple_genome()
-    graph_dict = {
-        "node_types": torch.tensor([0, 1], dtype=torch.long),
-        "edge_index": torch.tensor([[0, 0], [1, 1]], dtype=torch.long),
-        "node_attributes": [{"node_type": "input"}, {"node_type": "output"}],
-    }
-
-    with pytest.warns(UserWarning, match="Unsupported guided invalid visualization format"):
-        pop._maybe_visualize_guided_invalid_graph(
-            genome,
-            graph_dict,
-            reason="inactive_optimizer",
-            child_index=5,
-            num_edges=2,
-        )
-
-    assert not list(tmp_path.glob("*.mmd"))
 
 
 def test_generate_guided_offspring_handles_missing_elites():
