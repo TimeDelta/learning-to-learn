@@ -983,7 +983,7 @@ class GraphDecoder(nn.Module):
             edge_teacher_tokens = 0
             required_input_slots = self._resolved_required_input_slots()
             if teacher_attr_targets is not None:
-                # ensure decoder caps accommodate teacher supervision
+                # ensure caps accommodate teacher supervision
                 max_teacher_nodes = 0
                 max_teacher_attrs = 0
                 for graph_targets in teacher_attr_targets:
@@ -2611,7 +2611,7 @@ class OnlineTrainer:
             )
         return self.loss_history
 
-    def decoder_teacher_force_pass(
+    def teacher_force_pass(
         self,
         epochs: int,
         batch_size: int,
@@ -2633,11 +2633,9 @@ class OnlineTrainer:
         if not refresh_samples:
             return
         loader = DataLoader(refresh_samples, batch_size=batch_size, shuffle=True)
-        self._apply_module_freeze(self._module_order, reason="decoder_teacher_force")
+        self._apply_module_freeze(self._module_order, reason="teacher_force")
         if verbose:
-            print(
-                f"Decoder teacher-forcing pass: epochs={epochs} batch_size={batch_size} weight={teacher_force_weight}"
-            )
+            print(f"Teacher-forcing pass: epochs={epochs} batch_size={batch_size} weight={teacher_force_weight}")
         for epoch in range(1, epochs + 1):
             self.model.train()
             epoch_adj = 0.0

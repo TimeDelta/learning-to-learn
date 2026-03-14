@@ -2765,7 +2765,7 @@ class GuidedPopulation(Population):
                     f"empty_ratio={empty_ratio:.3f} replay_graphs={len(replay_payload)}"
                 )
                 with log_timing(logger, f"Generation {self.generation} teacher-forcing refresh") as timing:
-                    self.trainer.decoder_teacher_force_pass(
+                    self.trainer.teacher_force_pass(
                         epochs=teacher_force_epochs,
                         batch_size=teacher_force_batch,
                         teacher_force_weight=teacher_force_weight,

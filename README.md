@@ -102,14 +102,17 @@ The operator only executes when every required input and output node is present 
 It reconstructs role labels for nodes using decoded attributes plus the configured IO slot set, runs forward/backward reachability to detect outputs lacking an ancestral input, and injects the minimal set of additional edges required so that **each input has a path to at least one output and each output has a path from some input**, all while leaving previously enabled connections intact.
 Otherwise, the repaired graph replaces the original latent sample for evaluation.
 
-### Stabilizing Graph Attribute Decoding
+### Stabilizing Graph Decoding
 
-To avoid decoder stalls from attr-name loops that never received a termination signal, teacher forcing is used for those sequences:
+The teacher-forced attribute pass is there because the attr-name GRU kept collapsing to immediate `<EOS>` tokens once the latent ARD mask pruned dimensions: nodes were still emitted, but their hyperparameter dictionaries were empty so the replay buffer could not rebuild optimizers.
+Attribute values are only reconstructed after the GRU first names a field, so without positive supervision the sampler never leaves `<EOS>` and the reconstruction loss silently goes to zero.
+Teacher forcing injects real attribute-name sequences so the decoder keeps emitting optimizer knobs while also keeping the node stop head synchronized with the enforced `min_pin_nodes`/required-IO quotas:
 
 - The shared attribute vocabulary assigns explicit `<SOS>`/`<EOS>` tokens and exposes helpers that serialize each node’s dynamic attributes into deterministic name sequences.
   These targets supervise the attr-name GRU whenever ground-truth graphs exist.
 - The graph decoder optionally consumes those targets, drives the GRU with embedded ground-truth tokens, and accumulates a per-step cross-entropy loss.
 - The trainer groups batched node attributes, builds the token targets, passes them through the guide model, and blends the decoder’s cross-entropy into the feature reconstruction term.
+- During that same pass the node-loop stop head is clamped to the larger of the teacher-provided node count and the enforced `min_pin_nodes`/IO quota, ensuring the decoder still synthesizes enough input/output pins even when the replay sample omitted them (mirrors `test_graph_decoder_teacher_forcing_extends_minimum_nodes`).
 
 ### Module Freeze Scheduling
 
