@@ -499,6 +499,44 @@ def test_generate_guided_offspring_counts_inactive_repair_salvage(monkeypatch):
     assert stats["inactive_repair_salvaged_total"] >= 1
 
 
+def test_inactive_repair_probe_limit_applies_per_generation(monkeypatch):
+    pop, config = configure_stub_population(
+        [make_graph_factory(0.2), make_graph_factory(0.25)],
+        monkeypatch,
+    )
+    pop.track_inactive_repair_salvage = True
+    pop.inactive_repair_probe_limit = 1
+
+    probe_calls = {"count": 0}
+
+    def fake_probe(graph_dict, key):
+        probe_calls["count"] += 1
+        return True
+
+    pop._graph_dict_would_be_inactive = fake_probe
+
+    real_repair = pop._repair_graph_dict
+
+    def forced_repair(graph_dict):
+        real_repair(graph_dict)
+        graph_dict["_repair_applied"] = True
+        return True
+
+    pop._repair_graph_dict = forced_repair
+    pop._reset_guided_offspring_stats()
+
+    pop.generate_guided_offspring(
+        [], config, n_offspring=1, latent_steps=1, max_decode_attempts=1, decode_jitter_std=0.0
+    )
+    pop.generate_guided_offspring(
+        [], config, n_offspring=1, latent_steps=1, max_decode_attempts=1, decode_jitter_std=0.0
+    )
+
+    assert probe_calls["count"] == 1
+    stats = pop._guided_offspring_stats
+    assert stats["inactive_repair_probe_used"] == 1
+
+
 def test_latent_structure_penalty_uses_cached_centers():
     config = make_neat_config()
     config.guided_structure_buffer = 4

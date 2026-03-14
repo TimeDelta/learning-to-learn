@@ -382,6 +382,7 @@ class GuidedPopulation(Population):
         self._inactive_repair_dump_paths: deque[Path] = deque()
         self._inactive_repair_dump_initialized = False
         self._inactive_repair_dump_errors_logged = False
+        self._inactive_repair_probes_used = 0
         self.guided_debug_dump_enabled = bool(getattr(config, "guided_debug_dump_enabled", False))
         self.guided_debug_dump_limit = max(0, int(getattr(config, "guided_debug_dump_limit", 5)))
 
@@ -1819,7 +1820,6 @@ class GuidedPopulation(Population):
         inactive_detail_samples: List[dict] = []
         inactive_repair_salvaged = 0
         inactive_repair_samples_buffered = 0
-        inactive_repair_probes_used = 0
         debug_dir: Path | None = None
         debug_save_limit = 0
         debug_saved = 0
@@ -1938,13 +1938,13 @@ class GuidedPopulation(Population):
             if self.track_inactive_repair_salvage and repair_applied_flag and pre_repair_graph_dict is not None:
                 if (
                     self.inactive_repair_probe_limit > 0
-                    and inactive_repair_probes_used < self.inactive_repair_probe_limit
+                    and self._inactive_repair_probes_used < self.inactive_repair_probe_limit
                 ):
                     pre_repair_inactive = self._graph_dict_would_be_inactive(
                         pre_repair_graph_dict,
                         key=i,
                     )
-                    inactive_repair_probes_used += 1
+                    self._inactive_repair_probes_used += 1
                 else:
                     pending_pre_repair_sample = {
                         "graph_dict": pre_repair_graph_dict,
@@ -2231,7 +2231,6 @@ class GuidedPopulation(Population):
             inactive_details=inactive_detail_samples,
             inactive_repair_salvaged=inactive_repair_salvaged,
             inactive_repair_buffered=inactive_repair_samples_buffered,
-            inactive_repair_probe_used=inactive_repair_probes_used,
             validator_failures=inactive_optimizer_count,
         )
         return deduped_genomes
