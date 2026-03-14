@@ -38,7 +38,6 @@ class GuidedReproduction(DefaultReproduction):
         self.guide_fn = None
         self.guided_start_generation = getattr(config, "guided_start_generation", 0)
         self.guided_max_fraction = float(getattr(config, "guided_max_fraction", 0.5))
-        self.guided_ramp_generations = max(1, int(getattr(config, "guided_ramp_generations", 20)))
         self.optimizer_validator = None
         self.optimizer_validation_retries = getattr(config, "optimizer_validation_retries", 3)
 
@@ -55,9 +54,7 @@ class GuidedReproduction(DefaultReproduction):
     def _guided_fraction(self, generation: int) -> float:
         if generation < self.guided_start_generation:
             return 0.0
-        steps_since_start = generation - self.guided_start_generation + 1
-        ramp_progress = min(1.0, max(0.0, steps_since_start / self.guided_ramp_generations))
-        return self.guided_max_fraction * ramp_progress
+        return self.guided_max_fraction
 
     def reproduce(self, config, species, pop_size, generation, task):
         with log_timing(logger, f"Reproduction gen {generation}") as timing:
