@@ -171,6 +171,16 @@ class GuidedPopulation(Population):
             required_output_slots=output_slots,
             max_attr_value_dim=self.attr_value_max_dim,
         )
+        decoder_max_nodes = int(getattr(decoder, "max_nodes", 0) or 0)
+        decoder_max_attrs = int(getattr(decoder, "max_attributes_per_node", 0) or 0)
+        genome_config = getattr(config, "genome_config", None)
+        if genome_config is not None:
+            if decoder_max_nodes > 0:
+                setattr(genome_config, "max_graph_nodes", decoder_max_nodes)
+            if decoder_max_attrs > 0:
+                setattr(genome_config, "max_attributes_per_node", decoder_max_attrs)
+        self.decoder_max_nodes_cap = decoder_max_nodes
+        self.decoder_max_attributes_cap = decoder_max_attrs
         icnn_hidden_dims = getattr(config, "latent_icnn_hidden_dims", (64, 32))
         if isinstance(icnn_hidden_dims, str):
             icnn_hidden_dims = [int(part) for part in icnn_hidden_dims.split(",") if part.strip()]

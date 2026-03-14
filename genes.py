@@ -133,7 +133,22 @@ class NodeGene(BaseGene):
 
     def add_attribute(self, attr: BaseAttribute, config):
         """Add a new attribute to this gene at runtime."""
+        max_attrs = getattr(config, "max_attributes_per_node", None)
+        if max_attrs is not None:
+            try:
+                max_attrs = int(max_attrs)
+            except (TypeError, ValueError):
+                max_attrs = None
+        if max_attrs is not None and max_attrs > 0 and len(self.dynamic_attributes) >= max_attrs:
+            logger.debug(
+                "Skipping attribute add for node %s; already has %d attributes (limit=%d)",
+                self.key,
+                len(self.dynamic_attributes),
+                max_attrs,
+            )
+            return False
         self.dynamic_attributes[attr] = attr.init_value(config)
+        return True
 
     def remove_attribute(self, attr_to_remove: BaseAttribute):
         """Remove a dynamically added attribute."""

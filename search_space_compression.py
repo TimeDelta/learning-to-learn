@@ -992,10 +992,6 @@ class GraphDecoder(nn.Module):
                         if node_seq:
                             # sequences include EOS token; actual attribute count is len - 1
                             max_teacher_attrs = max(max_teacher_attrs, max(len(node_seq) - 1, 0))
-                if max_teacher_nodes > self.max_nodes:
-                    self.max_nodes = max_teacher_nodes
-                if max_teacher_attrs > self.max_attributes_per_node:
-                    self.max_attributes_per_node = max_teacher_attrs
 
             def make_name_input(token_idx: int) -> torch.Tensor:
                 token_tensor = torch.tensor([token_idx], dtype=torch.long, device=device)

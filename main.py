@@ -389,6 +389,7 @@ def override_initial_population(population, config):
             new_population[key] = new_genome
         population.population = new_population
         population.shared_attr_vocab.add_names(ATTRIBUTE_NAMES)
+        _warn_seed_limit_violations(population, new_population)
         timing.set_details(f"assigned={len(new_population)} unique_seeds={len(unique_paths)}")
 
     with log_timing(logger, "Initial speciation pass") as timing:
@@ -722,6 +723,50 @@ def _log_trainer_history_artifacts(run_manager, history):
                     row.append(entry.get("per_metric_losses", {}).get(name))
                 writer.writerow(row)
         run_manager.log_artifact(str(csv_path))
+
+
+def _warn_seed_limit_violations(population, genomes: dict[int, OptimizerGenome]):
+    decoder = getattr(getattr(population, "guide", None), "decoder", None)
+    if decoder is None:
+        return
+    max_nodes = getattr(decoder, "max_nodes", None)
+    max_attrs = getattr(decoder, "max_attributes_per_node", None)
+    try:
+        max_nodes = int(max_nodes) if max_nodes is not None else None
+    except (TypeError, ValueError):
+        max_nodes = None
+    try:
+        max_attrs = int(max_attrs) if max_attrs is not None else None
+    except (TypeError, ValueError):
+        max_attrs = None
+    if (max_nodes is None or max_nodes <= 0) and (max_attrs is None or max_attrs <= 0):
+        return
+    for genome in genomes.values():
+        identifier = getattr(genome, "optimizer_path", None) or f"seed_genome_{genome.key}"
+        if max_nodes is not None and max_nodes > 0:
+            node_total = len(getattr(genome, "nodes", {}))
+            if node_total > max_nodes:
+                logger.warning(
+                    "Seed optimizer %s defines %d nodes which exceeds decoder max_nodes=%d; guided decoder caps will truncate these graphs.",
+                    identifier,
+                    node_total,
+                    max_nodes,
+                )
+        if max_attrs is not None and max_attrs > 0:
+            violating = [
+                ng.key
+                for ng in getattr(genome, "nodes", {}).values()
+                if len(getattr(ng, "dynamic_attributes", {})) > max_attrs
+            ]
+            if violating:
+                sample = ", ".join(str(key) for key in violating[:5])
+                logger.warning(
+                    "Seed optimizer %s has %d node attribute sets exceeding cap (%d); example node ids: %s",
+                    identifier,
+                    len(violating),
+                    max_attrs,
+                    sample,
+                )
 
 
 if __name__ == "__main__":

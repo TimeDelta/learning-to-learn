@@ -1,8 +1,10 @@
 import copy
+import logging
 import sys
 from itertools import count
 from random import choice, random, shuffle
 from typing import Dict, List, Tuple
+from warnings import warn
 
 import torch
 from neat.aggregations import AggregationFunctionSet
@@ -13,6 +15,8 @@ from attributes import BoolAttribute, FloatAttribute, IntAttribute, StringAttrib
 from computation_graphs.functions.activation import *
 from computation_graphs.functions.aggregation import *
 from genes import NODE_TYPE_TO_INDEX, ConnectionGene, NodeGene
+
+logger = logging.getLogger(__name__)
 
 
 class OptimizerGenomeConfig(object):
@@ -237,6 +241,9 @@ class OptimizerGenome(object):
             ng.mutate(config)
 
     def mutate_add_node(self, config):
+        if self._max_nodes_reached(config):
+            warn("mutate_add_node skipped because genome already reached max_graph_nodes cap")
+            return
         if not self.connections:
             if config.check_structural_mutation_surer():
                 self.mutate_add_connection(config)
@@ -330,6 +337,18 @@ class OptimizerGenome(object):
         if self.connections:
             key = choice(list(self.connections.keys()))
             del self.connections[key]
+
+    def _max_nodes_reached(self, config) -> bool:
+        limit = getattr(config, "max_graph_nodes", None)
+        if limit is None:
+            return False
+        try:
+            limit_int = int(limit)
+        except (TypeError, ValueError):
+            return False
+        if limit_int <= 0:
+            return False
+        return len(self.nodes) >= limit_int
 
     def distance(self, other, config):
         """
