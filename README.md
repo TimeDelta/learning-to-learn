@@ -95,12 +95,24 @@ To keep these failures from overwhelming the surrogate model:
 
 This subsampling keeps the decoder from collapsing onto invalid DAGs while still providing a clear gradient signal to steer it back toward feasible graphs.
 
-Whenever a guided graph fails these validity filters you can optionally snapshot the offending graph under `debug_guided_offspring/`. Enable this by setting `[GuidedPopulation] guided_debug_dump_enabled = true` in `neat-config`; override the saved-sample budget via `guided_debug_dump_limit` (defaults to 5). Dumps capture the raw Torch tensors that drove each rebuild so you can replay them locally. Separately, the Mermaid `.mmd` visualizations stay controlled by `guided_invalid_viz_enabled`, `guided_invalid_viz_dir`, `guided_invalid_viz_limit`, and `guided_invalid_viz_rankdir` (the format is always Mermaid). Use `guided_invalid_viz_limit` to cap how many `.mmd` diagrams are rendered per generation, while `guided_debug_dump_limit` caps how many raw tensor snapshots are serialized overall—the former keeps human-readable diagrams manageable, the latter bounds binary replay artifacts.
+Whenever a guided graph fails these validity filters you can optionally snapshot the offending graph under `debug_guided_offspring/`. Enable this by setting `[GuidedPopulation] guided_debug_dump_enabled = true` in `neat-config`; override the saved-sample budget via `guided_debug_dump_limit` (defaults to 5). Dumps capture the raw Torch tensors that drove each rebuild so you can replay them locally. Separately, the Mermaid `.mmd` visualizations stay controlled by `guided_invalid_viz_enabled`, `guided_invalid_viz_dir`, `guided_invalid_viz_limit`, and `guided_invalid_viz_rankdir` $\element {"LR","RL","TB","BT"}$ (the format is always Mermaid). Use `guided_invalid_viz_limit` to cap how many `.mmd` diagrams are rendered per generation, while `guided_debug_dump_limit` caps how many raw tensor snapshots are serialized overall—the former keeps human-readable diagrams manageable, the latter bounds binary replay artifacts.
 
 Inspired by the targeted feasibility restorations used in CTFGNAS [57], the post-decoding phase is treated as a constrained graph-repair problem: every decoded adjacency is first passed through an analytical repair operator (`GuidedPopulation._repair_graph_dict`).
 The operator only executes when every required input and output node is present in the decoded graph; otherwise the sample is rejected immediately and a graph containing all required input and output nodes such that each input has a path to at least one output and each output has a path from some input.
 It reconstructs role labels for nodes using decoded attributes plus the configured IO slot set, runs forward/backward reachability to detect outputs lacking an ancestral input, and injects the minimal set of additional edges required so that **each input has a path to at least one output and each output has a path from some input**, all while leaving previously enabled connections intact.
 Otherwise, the repaired graph replaces the original latent sample for evaluation.
+
+#### Tracking inactive repair salvage
+
+`GuidedPopulation` no longer TorchScripts every repaired child twice. Set `[GuidedPopulation] inactive_repair_probe_limit` (default `4`) to bound the number of inline pre-repair probes each generation.
+Additional repaired graphs are cloned into `debug_guided_offspring/pre_repair_samples` (or the directory supplied via `inactive_repair_dump_dir`) until `inactive_repair_dump_max` is reached; disable the buffering entirely with `inactive_repair_dump_enabled = false`.
+Guided-offspring stats now expose `inactive_repair_buffered` and `inactive_repair_probe_used` so you can tell how many children still need offline inspection. Use `python3 scripts/analyze_inactive_repair_samples.py --config-file neat-config` to replay the backlog on demand. The analyzer rebuilds each stored graph, re-runs the `_optimizer_updates_parameters` dry run, and prints the number of children that would have remained inactive without the repair hook. Supply `--limit N` to inspect a subsample, `--verbose` for per-file results, and `--delete` to drop samples after they have been analyzed.
+
+For deeper diagnostics, the analyzer now records each sample’s latent vector and basic WL-subtree fingerprints, enabling richer post-hoc stats:
+
+- Pass `--latent-components k` (with an optional `--latent-csv path/to/coords.csv`) to compute a PCA projection of the buffered latents so you can spot whether the “almost inactive” offspring cluster in a specific region of the latent manifold.
+- Structural drift is summarized through WL entropy/unique-color counts (`--wl-iterations` controls the histogram depth) so you can see if repair-salvaged children share a narrow motif family.
+- Use `--counterfactual-repair N` to rerun the repair hook `N` times per inactive sample and estimate how often alternative random seeds would have yielded an optimizer that updates parameters.
 
 ### Stabilizing Graph Decoding
 

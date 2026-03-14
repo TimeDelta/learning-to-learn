@@ -2682,7 +2682,7 @@ class OnlineTrainer:
             avg_adj = epoch_adj / max(1, batches)
             avg_feat = epoch_feat / max(1, batches)
             if verbose:
-                print(f"Decoder epoch {epoch}/{epochs}: adj_loss={avg_adj:.4f} attr_loss={avg_feat:.4f}")
+                print(f"Teacher force epoch {epoch}/{epochs}: adj_loss={avg_adj:.4f} attr_loss={avg_feat:.4f}")
             if self.progress_callback is not None:
                 self.progress_callback(
                     generation=generation,

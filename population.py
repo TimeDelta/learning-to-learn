@@ -371,6 +371,17 @@ class GuidedPopulation(Population):
             inactive_limit = 32
         self.guided_inactive_detail_limit = max(0, inactive_limit)
         self.track_inactive_repair_salvage = bool(getattr(config, "track_inactive_repair_salvage", True))
+        raw_inactive_dump_dir = getattr(config, "inactive_repair_dump_dir", None)
+        if raw_inactive_dump_dir:
+            self.inactive_repair_dump_dir = Path(raw_inactive_dump_dir)
+        else:
+            self.inactive_repair_dump_dir = Path("debug_guided_offspring") / "pre_repair_samples"
+        self.inactive_repair_dump_enabled = bool(getattr(config, "inactive_repair_dump_enabled", True))
+        self.inactive_repair_dump_max = max(0, int(getattr(config, "inactive_repair_dump_max", 512)))
+        self.inactive_repair_probe_limit = max(0, int(getattr(config, "inactive_repair_probe_limit", 4)))
+        self._inactive_repair_dump_paths: deque[Path] = deque()
+        self._inactive_repair_dump_initialized = False
+        self._inactive_repair_dump_errors_logged = False
         self.guided_debug_dump_enabled = bool(getattr(config, "guided_debug_dump_enabled", False))
         self.guided_debug_dump_limit = max(0, int(getattr(config, "guided_debug_dump_limit", 5)))
 
@@ -394,6 +405,9 @@ class GuidedPopulation(Population):
             "inactive_details": [],
             "inactive_repair_salvaged": 0,
             "inactive_repair_salvaged_total": self._total_inactive_repair_salvaged,
+            "inactive_repair_buffered": 0,
+            "inactive_repair_probe_limit": self.inactive_repair_probe_limit,
+            "inactive_repair_probe_used": 0,
             "validator_failures": 0,
         }
 
@@ -406,6 +420,9 @@ class GuidedPopulation(Population):
         inactive_details = stats.get("inactive_details") or []
         inactive_repair_salvaged = int(stats.get("inactive_repair_salvaged", 0) or 0)
         inactive_repair_total = int(stats.get("inactive_repair_salvaged_total", 0) or 0)
+        inactive_repair_buffered = int(stats.get("inactive_repair_buffered", 0) or 0)
+        inactive_repair_probe_limit = int(stats.get("inactive_repair_probe_limit", 0) or 0)
+        inactive_repair_probe_used = int(stats.get("inactive_repair_probe_used", 0) or 0)
         if not inactive_invalid and not inactive_details_total and not inactive_repair_salvaged:
             return None
         record = {
@@ -417,7 +434,12 @@ class GuidedPopulation(Population):
             "inactive_details_total": inactive_details_total,
             "inactive_repair_salvaged": inactive_repair_salvaged,
             "inactive_repair_salvaged_total": inactive_repair_total,
+            "inactive_repair_buffered": inactive_repair_buffered,
+            "inactive_repair_probe_limit": inactive_repair_probe_limit,
+            "inactive_repair_probe_used": inactive_repair_probe_used,
             "decoder_max_nodes_hits": int(stats.get("decoder_max_nodes_hits", 0) or 0),
+            "decoder_max_nodes_invalid": int(stats.get("decoder_max_nodes_invalid", 0) or 0),
+            "validator_failures": int(stats.get("validator_failures", 0) or 0),
         }
         if inactive_details:
             record["inactive_details"] = copy.deepcopy(inactive_details)
@@ -470,6 +492,8 @@ class GuidedPopulation(Population):
         decoder_max_nodes_invalid: int = 0,
         inactive_details: Sequence[dict] | None = None,
         inactive_repair_salvaged: int = 0,
+        inactive_repair_buffered: int = 0,
+        inactive_repair_probe_used: int = 0,
         validator_failures: int = 0,
     ):
         stats = self._guided_offspring_stats
@@ -504,6 +528,10 @@ class GuidedPopulation(Population):
         if inactive_repair_salvaged:
             stats["inactive_repair_salvaged"] += int(inactive_repair_salvaged)
         stats["inactive_repair_salvaged_total"] = self._total_inactive_repair_salvaged
+        if inactive_repair_buffered:
+            stats["inactive_repair_buffered"] += int(inactive_repair_buffered)
+        if inactive_repair_probe_used:
+            stats["inactive_repair_probe_used"] += int(inactive_repair_probe_used)
         if validator_failures:
             stats["validator_failures"] += int(validator_failures)
 
@@ -657,6 +685,142 @@ class GuidedPopulation(Population):
             self._seeded_replay_entries.append(entry)
             if signature:
                 self._seeded_replay_signatures.add(signature)
+
+    def _ensure_inactive_repair_dump_dir(self) -> bool:
+        if not self.track_inactive_repair_salvage:
+            return False
+        if not self.inactive_repair_dump_enabled or self.inactive_repair_dump_max <= 0:
+            return False
+        if self._inactive_repair_dump_initialized:
+            return True
+        try:
+            self.inactive_repair_dump_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            if not self._inactive_repair_dump_errors_logged:
+                warn(f"Failed to create inactive repair dump dir '{self.inactive_repair_dump_dir}': {exc}")
+                self._inactive_repair_dump_errors_logged = True
+            return False
+        existing = []
+        try:
+            existing = sorted(
+                self.inactive_repair_dump_dir.glob("*.pt"),
+                key=lambda path: path.stat().st_mtime,
+            )
+        except OSError:
+            existing = []
+        if existing and len(existing) > self.inactive_repair_dump_max:
+            stale = existing[: -self.inactive_repair_dump_max]
+            for path in stale:
+                try:
+                    path.unlink()
+                except OSError:
+                    continue
+            existing = existing[-self.inactive_repair_dump_max :]
+        self._inactive_repair_dump_paths = deque(existing)
+        self._inactive_repair_dump_initialized = True
+        return True
+
+    def _enforce_inactive_repair_dump_limit(self) -> None:
+        if self.inactive_repair_dump_max <= 0:
+            return
+        while len(self._inactive_repair_dump_paths) > self.inactive_repair_dump_max:
+            oldest = self._inactive_repair_dump_paths.popleft()
+            try:
+                oldest.unlink()
+            except OSError:
+                continue
+
+    @staticmethod
+    def _latent_snapshot(latent: torch.Tensor | None) -> Tuple[float | None, float | None]:
+        if latent is None:
+            return None, None
+        try:
+            flat = latent.detach().view(-1)
+        except Exception:
+            return None, None
+        if flat.numel() == 0:
+            return 0.0, 0.0
+        try:
+            norm = float(flat.norm().detach().cpu().item())
+            mean = float(flat.mean().detach().cpu().item())
+        except Exception:
+            return None, None
+        return norm, mean
+
+    @staticmethod
+    def _latent_vector_tensor(latent: torch.Tensor | None) -> torch.Tensor | None:
+        if latent is None:
+            return None
+        try:
+            flat = latent.detach().view(-1).to(torch.float32).cpu()
+        except Exception:
+            return None
+        return flat.clone()
+
+    def _buffer_inactive_pre_repair_sample(
+        self,
+        graph_dict: dict | None,
+        *,
+        generation_idx: int,
+        child_index: int,
+        latent: torch.Tensor | None,
+        repaired_signature: str | None,
+        pre_repair_signature: str | None,
+        hit_max_nodes: bool,
+    ) -> bool:
+        if graph_dict is None:
+            return False
+        if not self._ensure_inactive_repair_dump_dir():
+            return False
+        cloned = self._clone_graph_dict(graph_dict, include_history=False)
+        if cloned is None:
+            return False
+        timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+        random_token = random.randint(0, 99999)
+        filename = f"gen{generation_idx}_child{child_index}_pre_{timestamp}_{random_token:05d}.pt"
+        path = self.inactive_repair_dump_dir / filename
+        latent_norm, latent_mean = self._latent_snapshot(latent)
+        metadata = {
+            "generation": int(generation_idx),
+            "child_index": int(child_index),
+            "timestamp": timestamp,
+            "repaired_signature": repaired_signature,
+            "pre_repair_signature": pre_repair_signature,
+            "hit_max_nodes": bool(hit_max_nodes),
+        }
+        if latent_norm is not None:
+            metadata["latent_norm"] = latent_norm
+        if latent_mean is not None:
+            metadata["latent_mean"] = latent_mean
+        node_types = cloned.get("node_types")
+        edge_index = cloned.get("edge_index")
+        node_count = int(node_types.numel()) if isinstance(node_types, torch.Tensor) else len(node_types or [])
+        edge_count = 0
+        if isinstance(edge_index, torch.Tensor):
+            edge_count = int(edge_index.size(1) if edge_index.dim() >= 2 else edge_index.numel() // 2)
+        elif edge_index:
+            edge_count = len(edge_index[0]) if isinstance(edge_index, (list, tuple)) and edge_index else 0
+        metadata["node_count"] = node_count
+        metadata["edge_count"] = edge_count
+        latent_vector = self._latent_vector_tensor(latent)
+        if latent_vector is not None:
+            metadata["latent_dim"] = int(latent_vector.numel())
+        payload = {
+            "graph_dict": cloned,
+            "metadata": metadata,
+        }
+        if latent_vector is not None:
+            payload["latent_vector"] = latent_vector
+        try:
+            torch.save(payload, path)
+        except Exception as exc:
+            if not self._inactive_repair_dump_errors_logged:
+                warn(f"Unable to persist pre-repair sample to '{path}': {exc}")
+                self._inactive_repair_dump_errors_logged = True
+            return False
+        self._inactive_repair_dump_paths.append(path)
+        self._enforce_inactive_repair_dump_limit()
+        return True
 
     @staticmethod
     def _graph_dict_has_topology(graph_dict: dict | None) -> bool:
@@ -1654,6 +1818,8 @@ class GuidedPopulation(Population):
         decoder_max_nodes_invalid = 0
         inactive_detail_samples: List[dict] = []
         inactive_repair_salvaged = 0
+        inactive_repair_samples_buffered = 0
+        inactive_repair_probes_used = 0
         debug_dir: Path | None = None
         debug_save_limit = 0
         debug_saved = 0
@@ -1762,19 +1928,32 @@ class GuidedPopulation(Population):
                 new_genomes.append(genome)
                 continue
             self._prepare_decoded_graph_dict(graph_dict)
-            pre_repair_graph_dict = (
-                self._clone_graph_dict(graph_dict, include_history=False)
-                if self.track_inactive_repair_salvage
-                else None
-            )
+            pre_repair_graph_dict = None
+            pending_pre_repair_sample: dict | None = None
+            if self.track_inactive_repair_salvage:
+                pre_repair_graph_dict = self._clone_graph_dict(graph_dict, include_history=False)
             self._repair_graph_dict(graph_dict)
             repair_applied_flag = bool(graph_dict.get("_repair_applied"))
             pre_repair_inactive = False
             if self.track_inactive_repair_salvage and repair_applied_flag and pre_repair_graph_dict is not None:
-                pre_repair_inactive = self._graph_dict_would_be_inactive(
-                    pre_repair_graph_dict,
-                    key=i,
-                )
+                if (
+                    self.inactive_repair_probe_limit > 0
+                    and inactive_repair_probes_used < self.inactive_repair_probe_limit
+                ):
+                    pre_repair_inactive = self._graph_dict_would_be_inactive(
+                        pre_repair_graph_dict,
+                        key=i,
+                    )
+                    inactive_repair_probes_used += 1
+                else:
+                    pending_pre_repair_sample = {
+                        "graph_dict": pre_repair_graph_dict,
+                        "generation": generation_idx,
+                        "child_index": i,
+                        "latent": latent,
+                        "pre_repair_signature": graph_signature_from_dict(pre_repair_graph_dict),
+                        "hit_max_nodes": hit_max_nodes_cap,
+                    }
             repair_reason = graph_dict.get("_repair_failure_reason")
             repair_details = graph_dict.get("_repair_failure_details")
             if repair_reason:
@@ -1783,6 +1962,19 @@ class GuidedPopulation(Population):
             num_edges = len(genome.connections)
             num_params = len(genome.connections)
             graph_signature = graph_signature_from_dict(graph_dict)
+            if pending_pre_repair_sample is not None:
+                buffered = self._buffer_inactive_pre_repair_sample(
+                    pending_pre_repair_sample.get("graph_dict"),
+                    generation_idx=int(pending_pre_repair_sample.get("generation", generation_idx)),
+                    child_index=int(pending_pre_repair_sample.get("child_index", i)),
+                    latent=pending_pre_repair_sample.get("latent"),
+                    repaired_signature=graph_signature,
+                    pre_repair_signature=pending_pre_repair_sample.get("pre_repair_signature"),
+                    hit_max_nodes=bool(pending_pre_repair_sample.get("hit_max_nodes", False)),
+                )
+                if buffered:
+                    inactive_repair_samples_buffered += 1
+                pending_pre_repair_sample = None
 
             if repair_reason:
                 self._maybe_visualize_guided_invalid_graph(
@@ -2038,6 +2230,8 @@ class GuidedPopulation(Population):
             decoder_max_nodes_invalid=decoder_max_nodes_invalid,
             inactive_details=inactive_detail_samples,
             inactive_repair_salvaged=inactive_repair_salvaged,
+            inactive_repair_buffered=inactive_repair_samples_buffered,
+            inactive_repair_probe_used=inactive_repair_probes_used,
             validator_failures=inactive_optimizer_count,
         )
         return deduped_genomes
