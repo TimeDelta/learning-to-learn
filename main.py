@@ -1143,40 +1143,41 @@ if __name__ == "__main__":
                 if snapshot_path and snapshot_path.exists():
                     mlflow_run.log_artifact(str(snapshot_path))
         finally:
-            log_artifact_fn = getattr(population, "log_inactive_detail_artifact", None)
-            if mlflow_run and callable(log_artifact_fn):
-                try:
-                    log_artifact_fn(mlflow_run)
-                except Exception as exc:  # pragma: no cover - logging safety net
-                    logger.exception("Failed to log inactive optimizer artifact: %s", exc)
-            mlflow_run.log_params(
-                {
-                    "config_file": args.config_file,
-                    "population_size": config.pop_size,
-                    "num_generations": args.num_generations,
-                    "fitness_threshold": getattr(config, "fitness_threshold", None),
-                }
-            )
-            kl_slice_params = {}
-            trainer = getattr(population, "trainer", None)
-            if trainer is not None:
-                ratio = getattr(trainer, "kl_partial_slice_ratio", None)
-                dims = getattr(trainer, "kl_partial_slice_dims", None)
-                start = getattr(trainer, "kl_partial_slice_start", None)
-                if ratio is not None:
-                    kl_slice_params["kl_partial_slice_ratio"] = ratio
-                if dims is not None:
-                    kl_slice_params["kl_partial_slice_dims"] = dims
-                if (ratio is not None or dims is not None) and start is not None:
-                    kl_slice_params["kl_partial_slice_start"] = start
-            if kl_slice_params:
-                mlflow_run.log_params(kl_slice_params)
-            mlflow_run.log_artifact(args.config_file)
-            mlflow_reporter = MLflowLoggingReporter(mlflow_run)
-            population.add_reporter(mlflow_reporter)
-            trainer_step_counter = itertools.count(start=1)
-            trainer_last_step = {"value": 0}
-            trainer_metrics_history: list[dict[str, object]] = []
+            if mlflow_run:
+                log_artifact_fn = getattr(population, "log_inactive_detail_artifact", None)
+                if callable(log_artifact_fn):
+                    try:
+                        log_artifact_fn(mlflow_run)
+                    except Exception as exc:  # pragma: no cover - logging safety net
+                        logger.exception("Failed to log inactive optimizer artifact: %s", exc)
+                mlflow_run.log_params(
+                    {
+                        "config_file": args.config_file,
+                        "population_size": config.pop_size,
+                        "num_generations": args.num_generations,
+                        "fitness_threshold": getattr(config, "fitness_threshold", None),
+                    }
+                )
+                kl_slice_params = {}
+                trainer = getattr(population, "trainer", None)
+                if trainer is not None:
+                    ratio = getattr(trainer, "kl_partial_slice_ratio", None)
+                    dims = getattr(trainer, "kl_partial_slice_dims", None)
+                    start = getattr(trainer, "kl_partial_slice_start", None)
+                    if ratio is not None:
+                        kl_slice_params["kl_partial_slice_ratio"] = ratio
+                    if dims is not None:
+                        kl_slice_params["kl_partial_slice_dims"] = dims
+                    if (ratio is not None or dims is not None) and start is not None:
+                        kl_slice_params["kl_partial_slice_start"] = start
+                if kl_slice_params:
+                    mlflow_run.log_params(kl_slice_params)
+                mlflow_run.log_artifact(args.config_file)
+                mlflow_reporter = MLflowLoggingReporter(mlflow_run)
+                population.add_reporter(mlflow_reporter)
+                trainer_step_counter = itertools.count(start=1)
+                trainer_last_step = {"value": 0}
+                trainer_metrics_history: list[dict[str, object]] = []
 
             def _log_trainer_progress(**kwargs):
                 generation = kwargs.get("generation", 0) or 0
