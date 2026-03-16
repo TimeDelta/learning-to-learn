@@ -1063,7 +1063,7 @@ class GraphDecoder(nn.Module):
                             node_loop_iters += 1
                             if t > self.max_nodes:
                                 hit_max_nodes_cap = True
-                                warn("max nodes reached")
+                                print("max nodes reached")
                                 if DEBUG_DECODER and decode_stats is not None:
                                     decode_stats["node_loop_exit"] = decode_stats["node_loop_exit"] or "max_nodes_pre"
                                 break
@@ -1102,7 +1102,7 @@ class GraphDecoder(nn.Module):
                                         break
                             if t > self.max_nodes:
                                 hit_max_nodes_cap = True
-                                warn("max nodes reached")
+                                print("max nodes reached")
                                 if DEBUG_DECODER and decode_stats is not None:
                                     decode_stats["node_loop_exit"] = decode_stats["node_loop_exit"] or "max_nodes_post"
                                 break

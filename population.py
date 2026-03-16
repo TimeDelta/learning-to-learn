@@ -1835,6 +1835,8 @@ class GuidedPopulation(Population):
         track_latents = self.guided_structure_buffer > 0
         latent_valid_flags = [False] * total_requested if track_latents else None
 
+        abort_due_to_decoder_cap = False
+        species_key = starting_genomes[0].species_key if starting_genomes else None
         for i in range(total_requested):
             latent = z_g[i].unsqueeze(0).clone()
             with torch.no_grad():
@@ -1892,8 +1894,11 @@ class GuidedPopulation(Population):
                 graph_signature = graph_signature_from_dict(graph_dict)
                 if graph_signature:
                     seen_graph_signatures.add(graph_signature)
-                new_genomes.append(genome)
-                continue
+                # Treat decoder-capacity violations as failed offspring so NEAT
+                # reproduction can backfill with fresh children instead of
+                # keeping hopeless penalty genomes around.
+                abort_due_to_decoder_cap = True
+                break
             if original_node_count < min_nodes_required:
                 reason = "insufficient_node_count"
                 genome = genome_from_graph_dict(graph_dict, self.config.genome_config, key=i)
@@ -2162,6 +2167,15 @@ class GuidedPopulation(Population):
             self._buffer_decoder_replay_dict(graph_dict)
             if last_valid_graph_dict is not None:
                 self._buffer_decoder_replay_dict(last_valid_graph_dict)
+
+        if abort_due_to_decoder_cap and decoder_max_nodes_invalid:
+            if species_key is not None:
+                detail = f"species={species_key}"
+            else:
+                detail = "species=unknown"
+            self.reporters.info(
+                f"Aborted guided offspring decoding early after hitting decoder max-nodes cap ({detail}, children_skipped={total_requested - len(new_genomes)})"
+            )
 
         if track_latents and latent_valid_flags is not None:
             for idx in range(total_requested):
@@ -2839,41 +2853,97 @@ class GuidedPopulation(Population):
         self._reset_optimizer_state(optimizer, None)
         self._reset_optimizer_step_counters(optimizer)
 
-        prev_metrics = None
-        named_params = list(model.named_parameters())
-        baseline = {name: param.detach().clone() for name, param in named_params}
-        max_delta_seen = 0.0
+        def _capture_baseline(named_params: Sequence[tuple[str, torch.Tensor]]) -> dict:
+            return {name: param.detach().clone() for name, param in named_params}
 
-        for _ in range(max(1, check_steps)):
-            metrics = self.task.evaluate_metrics(model, self.task.train_data)
-            if not torch.isfinite(metrics).all():
-                break
-            prev = torch.zeros_like(metrics) if prev_metrics is None else prev_metrics
-            self._ensure_optimizer_state_shapes(optimizer, named_params)
-            try:
-                updated_state = optimizer(metrics, prev, named_params)
-            except Exception:
-                updated_state = None
-            if updated_state is None:
-                break
-            state_dict = self._normalize_state_dict(updated_state, named_params)
-            total_delta = 0.0
-            for name, before in baseline.items():
+        def _state_delta(state_dict, baseline_dict):
+            delta = 0.0
+            for name, before in baseline_dict.items():
                 after = state_dict.get(name)
                 if after is None:
                     continue
-                total_delta += torch.norm(after - before, p=1).item()
-            if total_delta > max_delta_seen:
-                max_delta_seen = total_delta
-            model.load_state_dict(state_dict)
-            if total_delta > delta_eps:
-                self._reset_optimizer_state(optimizer, None)
-                self._reset_optimizer_step_counters(optimizer)
-                self._last_optimizer_delta = total_delta
-                return True
-            prev_metrics = metrics.detach()
+                delta += torch.norm(after - before, p=1).item()
+            return delta
+
+        def _run_optimizer_once(named_params, metrics, prev_metrics):
+            self._ensure_optimizer_state_shapes(optimizer, named_params)
+            try:
+                return optimizer(metrics, prev_metrics, named_params)
+            except Exception:
+                return None
+
+        probe_delta = 0.0
+        with log_timing(logger, "Optimizer validation (synthetic probe)", log_on_start=True) as timing:
+            probe_model = torch.nn.Linear(2, 2, bias=False)
+            probe_params = list(probe_model.named_parameters())
+            probe_baseline = _capture_baseline(probe_params)
+            probe_metrics = torch.ones(2, dtype=torch.float32)
+            updated_probe = _run_optimizer_once(probe_params, probe_metrics, torch.zeros_like(probe_metrics))
+            if updated_probe is not None:
+                probe_state = self._normalize_state_dict(updated_probe, probe_params)
+                probe_delta = _state_delta(probe_state, probe_baseline)
+            timing.set_details(f"delta={probe_delta:.3e}")
+        if probe_delta > delta_eps:
+            self._reset_optimizer_state(optimizer, None)
+            self._reset_optimizer_step_counters(optimizer)
+            self._last_optimizer_delta = probe_delta
+            return True
+
+        self._reset_optimizer_state(optimizer, None)
+        self._reset_optimizer_step_counters(optimizer)
+
+        fast_delta = 0.0
+        with log_timing(logger, "Optimizer validation (fast diff)", log_on_start=True) as timing:
             named_params = list(model.named_parameters())
-            baseline = {name: param.detach().clone() for name, param in named_params}
+            baseline = _capture_baseline(named_params)
+            metrics = self.task.evaluate_metrics(model, self.task.train_data)
+            if torch.isfinite(metrics).all():
+                prev = torch.zeros_like(metrics)
+                updated_state = _run_optimizer_once(named_params, metrics, prev)
+                if updated_state is not None:
+                    state_dict = self._normalize_state_dict(updated_state, named_params)
+                    fast_delta = _state_delta(state_dict, baseline)
+            timing.set_details(f"delta={fast_delta:.3e}")
+        if fast_delta > delta_eps:
+            self._reset_optimizer_state(optimizer, None)
+            self._reset_optimizer_step_counters(optimizer)
+            self._last_optimizer_delta = fast_delta
+            return True
+
+        self._reset_optimizer_state(optimizer, None)
+        self._reset_optimizer_step_counters(optimizer)
+
+        prev_metrics = None
+        max_delta_seen = 0.0
+        slow_steps = 0
+        with log_timing(logger, "Optimizer validation (slow fallback)", log_on_start=True) as timing:
+            named_params = list(model.named_parameters())
+            baseline = _capture_baseline(named_params)
+            for _ in range(max(1, check_steps)):
+                metrics = self.task.evaluate_metrics(model, self.task.train_data)
+                if not torch.isfinite(metrics).all():
+                    break
+                prev = torch.zeros_like(metrics) if prev_metrics is None else prev_metrics
+                updated_state = _run_optimizer_once(named_params, metrics, prev)
+                if updated_state is None:
+                    break
+                state_dict = self._normalize_state_dict(updated_state, named_params)
+                total_delta = _state_delta(state_dict, baseline)
+                slow_steps += 1
+                if total_delta > max_delta_seen:
+                    max_delta_seen = total_delta
+                model.load_state_dict(state_dict)
+                if total_delta > delta_eps:
+                    break
+                prev_metrics = metrics.detach()
+                named_params = list(model.named_parameters())
+                baseline = _capture_baseline(named_params)
+            timing.set_details(f"delta={max_delta_seen:.3e} steps={slow_steps}")
+        if max_delta_seen > delta_eps:
+            self._reset_optimizer_state(optimizer, None)
+            self._reset_optimizer_step_counters(optimizer)
+            self._last_optimizer_delta = max_delta_seen
+            return True
 
         self._reset_optimizer_state(optimizer, None)
         self._reset_optimizer_step_counters(optimizer)

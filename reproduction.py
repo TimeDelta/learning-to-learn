@@ -85,6 +85,16 @@ class GuidedReproduction(DefaultReproduction):
                 timing.set_details("remaining_species=0")
             return {}
 
+        # Drop species whose entire membership is invalid so they don't request
+        # guided offspring or consume reproduction cycles unnecessarily.
+        valid_species = []
+        for s in remaining_species:
+            if not self._species_has_guided_candidates(list(s.members.values())):
+                self.reporters.info(f"Removing species {s.key} because all members have invalid fitness")
+                continue
+            valid_species.append(s)
+        remaining_species = valid_species
+
         # Find minimum/maximum fitness across the entire population, for use in
         # species adjusted fitness computation.
         min_fitness = min(all_fitnesses)
@@ -131,9 +141,13 @@ class GuidedReproduction(DefaultReproduction):
                 guided_quota = 1
             guided_quota = min(guided_quota, remaining_spawn)
             guided_children = []
+            members_list = list(s.members.values())
             if guided_quota > 0 and self.guide_fn is not None and generation >= self.guided_start_generation:
-                guided_children = self.guide_fn(list(s.members.values()), self.reproduction_config, guided_quota)
-                guided_children_total += len(guided_children)
+                if not self._species_has_guided_candidates(members_list):
+                    self.reporters.info(f"Skipping guided offspring for species {s.key} — no valid members available")
+                else:
+                    guided_children = self.guide_fn(members_list, self.reproduction_config, guided_quota)
+                    guided_children_total += len(guided_children)
 
             for kid in guided_children:
                 existing_key = getattr(kid, "key", None)
@@ -342,6 +356,16 @@ class GuidedReproduction(DefaultReproduction):
         setattr(genome, "_minimum_graph_fallback", True)
         setattr(genome, "hidden_node_ids", list(hidden_ids))
         return genome
+
+    def _species_has_guided_candidates(self, members):
+        for member in members:
+            if getattr(member, "fitness", None) is None:
+                continue
+            if getattr(member, "invalid_graph", False):
+                continue
+            if math.isfinite(member.fitness):
+                return True
+        return False
 
     def _log_species_metrics(self, species_list):
         for species in species_list:
