@@ -1836,7 +1836,7 @@ class GuidedPopulation(Population):
         latent_valid_flags = [False] * total_requested if track_latents else None
 
         abort_due_to_decoder_cap = False
-        species_key = starting_genomes[0].species_key if starting_genomes else None
+        species_key = getattr(starting_genomes[0], "species_key", None) if starting_genomes else None
         for i in range(total_requested):
             latent = z_g[i].unsqueeze(0).clone()
             with torch.no_grad():
