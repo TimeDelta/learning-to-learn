@@ -18,6 +18,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.utils import clip_grad_norm_
 from torch.nn.utils.rnn import pad_sequence
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
@@ -491,6 +492,19 @@ def group_node_attributes(node_attrs: Sequence[Any], batch_vec: Optional[torch.T
     return node_attrs
 
 
+def _sorted_attribute_items(attr_dict: dict | None) -> List[tuple[str, Any]]:
+    if not attr_dict:
+        return []
+    items: List[tuple[str, Any]] = []
+    for key, value in attr_dict.items():
+        name = attribute_key_to_name(key)
+        if name in {"pin_role", "pin_slot_index"}:
+            continue
+        items.append((name, value))
+    items.sort(key=lambda item: item[0])
+    return items
+
+
 def build_teacher_attr_targets(
     node_attrs: Sequence[Any], batch_vec: Optional[torch.Tensor], shared_vocab: SharedAttributeVocab
 ) -> List[List[List[int]]]:
@@ -499,12 +513,52 @@ def build_teacher_attr_targets(
     for graph_attrs in per_graph_attrs:
         node_sequences: List[List[int]] = []
         for attrs in graph_attrs:
-            attr_dict = attrs or {}
-            attr_names = sorted(attribute_key_to_name(name) for name in attr_dict.keys())
-            attr_names = [name for name in attr_names if name not in {"pin_role", "pin_slot_index"}]
+            attr_names = [name for name, _value in _sorted_attribute_items(attrs or {})]
             tokens = [shared_vocab.ensure_index(name) for name in attr_names]
             tokens.append(shared_vocab.eos_index)
             node_sequences.append(tokens)
+        sequences.append(node_sequences)
+    return sequences
+
+
+def build_teacher_attr_value_targets(
+    node_attrs: Sequence[Any],
+    batch_vec: Optional[torch.Tensor],
+    shared_vocab: SharedAttributeVocab,
+    max_value_dim: int,
+) -> List[List[List[torch.Tensor]]]:
+    per_graph_attrs = group_node_attributes(node_attrs, batch_vec)
+    sequences: List[List[List[torch.Tensor]]] = []
+
+    def tensorize_value(value: Any) -> torch.Tensor:
+        if value is None:
+            tensor = torch.zeros(1, dtype=torch.float32)
+        elif torch.is_tensor(value):
+            tensor = value.detach().view(-1).float().cpu()
+        elif isinstance(value, np.ndarray):
+            tensor = torch.from_numpy(value).view(-1).float()
+        elif isinstance(value, (list, tuple)):
+            tensor = torch.as_tensor(value, dtype=torch.float32).view(-1)
+        elif isinstance(value, (int, float, bool)):
+            tensor = torch.tensor([float(value)], dtype=torch.float32)
+        elif isinstance(value, str):
+            index = shared_vocab.ensure_index(value)
+            tensor = shared_vocab.embedding.weight.detach().cpu()[index].view(-1).float()
+        else:
+            tensor = torch.zeros(1, dtype=torch.float32)
+        if tensor.numel() == 0:
+            tensor = torch.zeros(1, dtype=torch.float32)
+        if max_value_dim > 0 and tensor.numel() > max_value_dim:
+            tensor = tensor[:max_value_dim]
+        return tensor
+
+    for graph_attrs in per_graph_attrs:
+        node_sequences: List[List[torch.Tensor]] = []
+        for attrs in graph_attrs:
+            attr_values: List[torch.Tensor] = []
+            for _name, value in _sorted_attribute_items(attrs or {}):
+                attr_values.append(tensorize_value(value))
+            node_sequences.append(attr_values)
         sequences.append(node_sequences)
     return sequences
 
@@ -963,6 +1017,7 @@ class GraphDecoder(nn.Module):
         latent,
         teacher_attr_targets: Optional[List[List[List[int]]]] = None,
         teacher_adj_targets: Optional[List[Optional[torch.Tensor]]] = None,
+        teacher_attr_value_targets: Optional[List[List[List[torch.Tensor]]]] = None,
     ):
         """
         (num_graphs, latent_dim)
@@ -977,6 +1032,10 @@ class GraphDecoder(nn.Module):
             all_graphs = []
             attr_teacher_loss = latent.new_tensor(0.0)
             attr_teacher_tokens = 0
+            attr_value_teacher_loss = latent.new_tensor(0.0)
+            attr_value_teacher_tokens = 0
+            attr_dim_teacher_loss = latent.new_tensor(0.0)
+            attr_dim_teacher_tokens = 0
             node_teacher_loss = latent.new_tensor(0.0)
             node_teacher_tokens = 0
             edge_teacher_loss = latent.new_tensor(0.0)
@@ -1014,6 +1073,9 @@ class GraphDecoder(nn.Module):
                         graph_teacher_targets = teacher_attr_targets[l]
                         if graph_teacher_targets is not None:
                             target_node_count = len(graph_teacher_targets)
+                    graph_value_targets = None
+                    if teacher_attr_value_targets is not None and l < len(teacher_attr_value_targets):
+                        graph_value_targets = teacher_attr_value_targets[l]
                     graph_adj_target = None
                     if teacher_adj_targets is not None and l < len(teacher_adj_targets):
                         graph_adj_target = teacher_adj_targets[l]
@@ -1299,32 +1361,56 @@ class GraphDecoder(nn.Module):
                 attr_loop_iters = 0
                 used_name_indices: Set[int] = set()
                 node_teacher_targets: Optional[List[int]] = None
+                node_value_targets: Optional[List[torch.Tensor]] = None
                 attr_exit_reason = "eos"
                 last_attr_logits: Optional[Tuple[float, float, int]] = None
                 if graph_teacher_targets is not None and node_idx < len(graph_teacher_targets):
                     node_teacher_targets = graph_teacher_targets[node_idx] or None
+                if graph_value_targets is not None and node_idx < len(graph_value_targets):
+                    node_value_targets = graph_value_targets[node_idx] or None
 
                 def project_name_logits(name_out: torch.Tensor) -> torch.Tensor:
                     return self.attr_name_head(name_out).reshape(-1)
 
-                def add_attribute(name_index: int, name: str):
-                    nonlocal t
+                def add_attribute(name_index: int, name: str, target_value: Optional[torch.Tensor] = None):
+                    nonlocal t, attr_value_teacher_loss, attr_value_teacher_tokens, attr_dim_teacher_loss, attr_dim_teacher_tokens
                     if name in ("pin_role", "pin_slot_index"):
                         return False
                     raw_dim = self.attr_dims_head(embedding).squeeze()
                     raw_dim = torch.nan_to_num(raw_dim, nan=0.0, posinf=20.0, neginf=-20.0)
                     dim_val = F.softplus(raw_dim)
                     dim_val = torch.nan_to_num(dim_val, nan=1.0, posinf=float(self.max_attr_value_dim), neginf=1.0)
+                    attr_dims_target = None
+                    if target_value is not None:
+                        target_vector = target_value.to(device).view(-1)
+                        if target_vector.numel() == 0:
+                            target_vector = torch.zeros(1, device=device)
+                        target_vector = target_vector[: self.max_attr_value_dim]
+                        attr_dims_target = int(target_vector.numel())
+                    else:
+                        target_vector = None
                     attr_dims = int(torch.clamp(dim_val, min=1.0, max=float(self.max_attr_value_dim)).item())
                     attr_dims = max(1, min(attr_dims, self.max_attr_value_dim))
+                    if attr_dims_target is not None:
+                        attr_dims = max(1, min(attr_dims_target, self.max_attr_value_dim))
+                        target_tensor = torch.tensor([float(attr_dims_target)], device=device)
+                        attr_dim_teacher_loss = attr_dim_teacher_loss + F.mse_loss(dim_val.reshape(1), target_tensor)
+                        attr_dim_teacher_tokens += 1
                     values = []
                     value_hidden = embedding.unsqueeze(0).unsqueeze(1)
                     value_input = torch.zeros(1, 1, 1, device=device)
-                    for _ in range(attr_dims):
+                    for dim_idx in range(attr_dims):
                         value_out, value_hidden = self.attr_val_rnn(value_input, value_hidden)
                         v = self.attr_val_head(value_out).view(-1)
+                        if target_vector is not None and dim_idx < target_vector.numel():
+                            target_scalar = target_vector[dim_idx].view(-1)
+                            attr_value_teacher_loss = attr_value_teacher_loss + F.mse_loss(v, target_scalar.to(device))
+                            attr_value_teacher_tokens += 1
+                            next_input = target_scalar.view(1, 1, 1).to(device)
+                        else:
+                            next_input = v.unsqueeze(0).unsqueeze(-1)
                         values.append(v)
-                        value_input = v.unsqueeze(0).unsqueeze(-1)
+                        value_input = next_input
                     if DEBUG_DECODER:
                         decode_stats["attr_value_cells"] += attr_dims
                         if attr_dims >= self.max_attr_value_dim:
@@ -1353,6 +1439,7 @@ class GraphDecoder(nn.Module):
                 with torch.autograd.profiler.record_function("GraphDecoder.attr_loop"):
                     if node_teacher_targets:
                         prev_token_idx = self.attr_sos_index
+                        value_target_idx = 0
                         for target_idx in node_teacher_targets:
                             attr_loop_iters += 1
                             if DEBUG_DECODER and attr_loop_iters % 50 == 0:
@@ -1412,7 +1499,12 @@ class GraphDecoder(nn.Module):
                             if name is None:
                                 name = generate_random_string(8)
                                 target_idx = self.shared_attr_vocab.ensure_index(name)
-                            add_attribute(target_idx, name)
+                            target_tensor = None
+                            if node_value_targets and value_target_idx < len(node_value_targets):
+                                target_tensor = node_value_targets[value_target_idx]
+                            added = add_attribute(target_idx, name, target_tensor)
+                            if added:
+                                value_target_idx += 1
                     else:
                         prev_token_idx = self.attr_sos_index
                         while True:
@@ -1557,15 +1649,24 @@ class GraphDecoder(nn.Module):
                         teacher_cap_hits,
                         attr_cap_hits - teacher_cap_hits,
                     )
-            if attr_teacher_tokens or node_teacher_tokens or edge_teacher_tokens:
-                return all_graphs, {
-                    "loss": attr_teacher_loss,
-                    "attribute_tokens": attr_teacher_tokens,
-                    "node_loss": node_teacher_loss,
-                    "node_tokens": node_teacher_tokens,
-                    "edge_loss": edge_teacher_loss,
-                    "edge_tokens": edge_teacher_tokens,
-                }
+            decoder_aux = {}
+            if attr_teacher_tokens:
+                decoder_aux["loss"] = attr_teacher_loss
+                decoder_aux["attribute_tokens"] = attr_teacher_tokens
+            if attr_value_teacher_tokens:
+                decoder_aux["attr_value_loss"] = attr_value_teacher_loss
+                decoder_aux["attr_value_tokens"] = attr_value_teacher_tokens
+            if attr_dim_teacher_tokens:
+                decoder_aux["attr_dim_loss"] = attr_dim_teacher_loss
+                decoder_aux["attr_dim_tokens"] = attr_dim_teacher_tokens
+            if node_teacher_tokens:
+                decoder_aux["node_loss"] = node_teacher_loss
+                decoder_aux["node_tokens"] = node_teacher_tokens
+            if edge_teacher_tokens:
+                decoder_aux["edge_loss"] = edge_teacher_loss
+                decoder_aux["edge_tokens"] = edge_teacher_tokens
+            if decoder_aux:
+                return all_graphs, decoder_aux
             return all_graphs
         finally:
             _forward_prof.__exit__(None, None, None)
@@ -1752,11 +1853,13 @@ class SelfCompressingFitnessRegularizedDAGVAE(nn.Module):
         z,
         teacher_attr_targets: Optional[List[List[List[int]]]] = None,
         teacher_adj_targets: Optional[List[Optional[torch.Tensor]]] = None,
+        teacher_attr_value_targets: Optional[List[List[List[torch.Tensor]]]] = None,
     ):
         return self.decoder(
             z,
             teacher_attr_targets=teacher_attr_targets,
             teacher_adj_targets=teacher_adj_targets,
+            teacher_attr_value_targets=teacher_attr_value_targets,
         )
 
     def forward(
@@ -1767,6 +1870,7 @@ class SelfCompressingFitnessRegularizedDAGVAE(nn.Module):
         batch,
         teacher_attr_targets: Optional[List[List[List[int]]]] = None,
         teacher_adj_targets: Optional[List[Optional[torch.Tensor]]] = None,
+        teacher_attr_value_targets: Optional[List[List[List[torch.Tensor]]]] = None,
         num_graphs: Optional[int] = None,
     ):
         mu_g, lv_g = self.encode(
@@ -1781,6 +1885,7 @@ class SelfCompressingFitnessRegularizedDAGVAE(nn.Module):
             graph_latent,
             teacher_attr_targets=teacher_attr_targets,
             teacher_adj_targets=teacher_adj_targets,
+            teacher_attr_value_targets=teacher_attr_value_targets,
         )
         if isinstance(decoded, tuple):
             decoded_graphs, decoder_aux = decoded
@@ -1914,6 +2019,7 @@ class OnlineTrainer:
         decoder_missing_node_penalty: float = 0.0,
         decoder_excess_node_penalty: float = 0.0,
         decoder_stop_loss_weight: float = 1.0,
+        grad_clip_norm: float = 5.0,
     ):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = model.to(self.device)
@@ -1939,6 +2045,8 @@ class OnlineTrainer:
         self.decoder_missing_node_penalty = float(decoder_missing_node_penalty or 0.0)
         self.decoder_excess_node_penalty = float(decoder_excess_node_penalty or 0.0)
         self.decoder_stop_loss_weight = float(decoder_stop_loss_weight or 1.0)
+        clip_value = float(grad_clip_norm or 0.0)
+        self.grad_clip_norm = max(0.0, clip_value)
         self.wl_kernel_iterations = 2
         self.wl_loss_weight = 0.0
         self.kl_partial_slice_ratio: Optional[float] = None
@@ -2034,6 +2142,14 @@ class OnlineTrainer:
                 print(f"Trainer module freeze phase -> {label} (reason={reason or 'epoch'})")
         self._last_freeze_reason = reason
 
+    def _clip_gradients(self):
+        clip_value = float(getattr(self, "grad_clip_norm", 0.0) or 0.0)
+        if clip_value <= 0:
+            return
+        params = [param for param in self.model.parameters() if param.grad is not None]
+        if params:
+            clip_grad_norm_(params, clip_value)
+
     def _update_metric_metadata(self, metric_keys: Sequence):
         self.sorted_metrics = sort_metrics_by_name(metric_keys)
         self.num_metrics = len(self.sorted_metrics)
@@ -2096,6 +2212,7 @@ class OnlineTrainer:
 
         loss_adj = torch.tensor(0.0, device=self.device)
         loss_feat = torch.tensor(0.0, device=self.device)
+        attribute_value_cells = 0
         empty_penalty = float(getattr(self, "decoder_empty_penalty", 0.0) or 0.0)
         missing_node_penalty = float(getattr(self, "decoder_missing_node_penalty", 0.0) or 0.0)
         excess_node_penalty = float(getattr(self, "decoder_excess_node_penalty", 0.0) or 0.0)
@@ -2158,18 +2275,19 @@ class OnlineTrainer:
 
             def attribute_value_loss(value):
                 tensor = to_tensor(value)
-                return tensor.abs().sum()
+                return tensor.abs().sum(), tensor.numel()
 
             def mse_aligned(pred_tensor, target_tensor):
                 if pred_tensor.numel() == target_tensor.numel():
-                    return F.mse_loss(pred_tensor, target_tensor)
+                    return F.mse_loss(pred_tensor, target_tensor), pred_tensor.numel()
                 size = min(pred_tensor.numel(), target_tensor.numel())
                 loss = F.mse_loss(pred_tensor[:size], target_tensor[:size])
                 if pred_tensor.numel() > size:
                     loss = loss + pred_tensor[size:].abs().sum()
                 if target_tensor.numel() > size:
                     loss = loss + target_tensor[size:].abs().sum()
-                return loss
+                cells = max(pred_tensor.numel(), target_tensor.numel())
+                return loss, cells
 
             for node_idx in range(num_nodes):
                 all_attr_names = set(pred_attrs[node_idx].keys()) | set(target_attrs[node_idx].keys())
@@ -2177,32 +2295,52 @@ class OnlineTrainer:
                     pred_value = pred_attrs[node_idx].get(attr_name)
                     target_value = target_attrs[node_idx].get(attr_name)
                     if (pred_value is not None) and (target_value is not None):
-                        loss_feat += mse_aligned(to_tensor(pred_value), to_tensor(target_value))
+                        loss_delta, cell_count = mse_aligned(to_tensor(pred_value), to_tensor(target_value))
+                        loss_feat += loss_delta
+                        attribute_value_cells += cell_count
                     elif target_value is not None:
-                        loss_feat += attribute_value_loss(target_value)
+                        loss_delta, cell_count = attribute_value_loss(target_value)
+                        loss_feat += loss_delta
+                        attribute_value_cells += cell_count
                     else:
-                        loss_feat += attribute_value_loss(pred_value)
+                        loss_delta, cell_count = attribute_value_loss(pred_value)
+                        loss_feat += loss_delta
+                        attribute_value_cells += cell_count
 
+        extra_attr_loss = torch.tensor(0.0, device=self.device)
+        extra_adj_loss = torch.tensor(0.0, device=self.device)
         if decoder_aux is not None:
             token_count = float(decoder_aux.get("attribute_tokens", 0) or 0)
             if token_count > 0:
                 ce_loss = decoder_aux["loss"] / token_count
-                loss_feat = loss_feat + float(teacher_force_weight) * ce_loss.to(loss_feat.device)
+                extra_attr_loss = extra_attr_loss + float(teacher_force_weight) * ce_loss.to(self.device)
+            value_tokens = float(decoder_aux.get("attr_value_tokens", 0) or 0)
+            if value_tokens > 0:
+                value_loss = decoder_aux["attr_value_loss"] / value_tokens
+                extra_attr_loss = extra_attr_loss + float(teacher_force_weight) * value_loss.to(self.device)
+            dim_tokens = float(decoder_aux.get("attr_dim_tokens", 0) or 0)
+            if dim_tokens > 0:
+                dim_loss = decoder_aux["attr_dim_loss"] / dim_tokens
+                extra_attr_loss = extra_attr_loss + float(teacher_force_weight) * dim_loss.to(self.device)
             node_tokens = float(decoder_aux.get("node_tokens", 0) or 0)
             if node_tokens > 0:
                 node_loss = decoder_aux["node_loss"] / node_tokens
                 weight = float(getattr(self, "decoder_stop_loss_weight", 1.0) or 1.0)
-                loss_adj = loss_adj + weight * node_loss.to(loss_adj.device)
+                extra_adj_loss = extra_adj_loss + weight * node_loss.to(self.device)
             edge_tokens = float(decoder_aux.get("edge_tokens", 0) or 0)
             if edge_tokens > 0:
                 edge_loss = decoder_aux["edge_loss"] / edge_tokens
-                loss_adj = loss_adj + edge_loss.to(loss_adj.device)
+                extra_adj_loss = extra_adj_loss + edge_loss.to(self.device)
 
         denom = max(1, int(batch.num_graphs))
         if empty_penalty > 0 and empty_hits:
             loss_adj = loss_adj + empty_penalty * empty_hits
-        loss_adj = loss_adj / denom
-        loss_feat = loss_feat / denom
+        loss_adj = (loss_adj + extra_adj_loss) / denom
+        if attribute_value_cells > 0:
+            loss_feat = loss_feat / float(attribute_value_cells)
+        else:
+            loss_feat = loss_feat / denom
+        loss_feat = loss_feat + extra_attr_loss
         if graphs_to_compare == 0 and empty_penalty > 0:
             loss_adj = loss_adj + empty_penalty
         return _finite_loss(loss_adj), _finite_loss(loss_feat)
@@ -2376,6 +2514,12 @@ class OnlineTrainer:
                 teacher_attr_targets = build_teacher_attr_targets(
                     target_graph_attrs, None, self.model.shared_attr_vocab
                 )
+                teacher_attr_value_targets = build_teacher_attr_value_targets(
+                    target_graph_attrs,
+                    None,
+                    self.model.shared_attr_vocab,
+                    max_value_dim=self.model.max_value_dim,
+                )
                 teacher_adj_targets = build_teacher_adj_targets(batch.edge_index, batch.batch, per_graph_node_counts)
                 # --- 1) forward pass ---
                 if DEBUG_TRAINER:
@@ -2401,6 +2545,7 @@ class OnlineTrainer:
                     batch.node_attributes,
                     batch.batch,
                     teacher_attr_targets=teacher_attr_targets,
+                    teacher_attr_value_targets=teacher_attr_value_targets,
                     teacher_adj_targets=teacher_adj_targets,
                     num_graphs=batch.num_graphs,
                 )
@@ -2476,6 +2621,7 @@ class OnlineTrainer:
                     self.wl_loss_weight * wl_loss,
                 ]
                 sum(loss_terms).backward()
+                self._clip_gradients()
                 self.optimizer.step()
                 total_loss_terms += torch.tensor(loss_terms)
                 if DEBUG_TRAINER and batch_timer is not None:
@@ -2648,6 +2794,12 @@ class OnlineTrainer:
                 teacher_attr_targets = build_teacher_attr_targets(
                     target_graph_attrs, None, self.model.shared_attr_vocab
                 )
+                teacher_attr_value_targets = build_teacher_attr_value_targets(
+                    target_graph_attrs,
+                    None,
+                    self.model.shared_attr_vocab,
+                    max_value_dim=self.model.max_value_dim,
+                )
                 (
                     decoded_graphs,
                     _fitness_pred,
@@ -2663,6 +2815,7 @@ class OnlineTrainer:
                     batch.node_attributes,
                     batch.batch,
                     teacher_attr_targets=teacher_attr_targets,
+                    teacher_attr_value_targets=teacher_attr_value_targets,
                     num_graphs=batch.num_graphs,
                 )
                 loss_adj, loss_feat = self._compute_reconstruction_losses(
@@ -2674,6 +2827,7 @@ class OnlineTrainer:
                 )
                 loss = loss_adj + loss_feat
                 loss.backward()
+                self._clip_gradients()
                 self.optimizer.step()
                 epoch_adj += float(loss_adj.detach().item())
                 epoch_feat += float(loss_feat.detach().item())
