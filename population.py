@@ -1,5 +1,6 @@
 import atexit
 import copy
+import csv
 import json
 import logging
 import math
@@ -8,10 +9,11 @@ import re
 import signal
 import tempfile
 import time
-import tracemalloc
 import weakref
 from collections import Counter, deque
+from dataclasses import dataclass, field
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Set, Tuple
 from warnings import warn
@@ -66,12 +68,188 @@ _PIN_ROLE_FALLBACKS = {
 logger = logging.getLogger(__name__)
 
 
+class ValidatorOutcome(str, Enum):
+    ACTIVE = "active"
+    NO_STATE_RETURNED = "no_state_returned"
+    NO_STATE_CHANGE = "no_state_change"
+    IDENTICAL_STATE_DICT = "state_dict_identical"
+    AUX_STATE_ONLY = "aux_state_only"
+    NAME_MISMATCH = "parameter_name_mismatch"
+    DELTA_BELOW_THRESHOLD = "delta_below_threshold"
+    LATE_ACTIVATION = "late_activation"
+    VALIDATOR_ONLY = "validator_task_only"
+    RESET_DEPENDENCY = "state_reset_dependency"
+    SLOT_PROJECTION_MISS = "slot_projection_miss"
+    EXCEPTION = "exception"
+
+
+@dataclass
+class OptimizerValidationResult:
+    outcome: ValidatorOutcome
+    stage_deltas: Dict[str, float] = field(default_factory=dict)
+    max_delta: float = 0.0
+    steps_run: int = 0
+    details: Dict[str, Any] = field(default_factory=dict)
+    late_activation_step: int | None = None
+
+    def __bool__(self) -> bool:  # pragma: no cover - convenience
+        return self.outcome == ValidatorOutcome.ACTIVE
+
+
+def _coerce_validation_result(value: Any) -> OptimizerValidationResult:
+    """Normalize legacy validator outputs into OptimizerValidationResult."""
+
+    if isinstance(value, OptimizerValidationResult):
+        return value
+
+    if value is None:
+        return OptimizerValidationResult(outcome=ValidatorOutcome.NO_STATE_RETURNED)
+
+    if isinstance(value, bool):
+        outcome = ValidatorOutcome.ACTIVE if value else ValidatorOutcome.NO_STATE_CHANGE
+        return OptimizerValidationResult(outcome=outcome, max_delta=1.0 if value else 0.0)
+
+    outcome_attr = getattr(value, "outcome", None)
+    if isinstance(outcome_attr, ValidatorOutcome):
+        outcome = outcome_attr
+    elif isinstance(outcome_attr, str):
+        try:
+            outcome = ValidatorOutcome(outcome_attr)
+        except ValueError:
+            outcome = ValidatorOutcome.ACTIVE if bool(value) else ValidatorOutcome.NO_STATE_CHANGE
+    else:
+        outcome = ValidatorOutcome.ACTIVE if bool(value) else ValidatorOutcome.NO_STATE_CHANGE
+
+    stage_deltas_attr = getattr(value, "stage_deltas", None)
+    if isinstance(stage_deltas_attr, dict):
+        stage_deltas = dict(stage_deltas_attr)
+    elif isinstance(stage_deltas_attr, Sequence):
+        stage_deltas = dict(stage_deltas_attr)
+    else:
+        stage_deltas = {}
+
+    details_attr = getattr(value, "details", None)
+    if isinstance(details_attr, dict):
+        details = dict(details_attr)
+    elif details_attr is None:
+        details = {}
+    else:
+        details = {"legacy_details": details_attr}
+
+    late_activation_step = getattr(value, "late_activation_step", None)
+    if isinstance(late_activation_step, int):
+        late_activation = late_activation_step
+    else:
+        late_activation = None
+
+    max_delta_attr = getattr(value, "max_delta", None)
+    try:
+        max_delta = float(max_delta_attr) if max_delta_attr is not None else 0.0
+    except (TypeError, ValueError):
+        max_delta = 0.0
+
+    steps_run_attr = getattr(value, "steps_run", None)
+    try:
+        steps_run = int(steps_run_attr) if steps_run_attr is not None else 0
+    except (TypeError, ValueError):
+        steps_run = 0
+
+    return OptimizerValidationResult(
+        outcome=outcome,
+        stage_deltas=stage_deltas,
+        max_delta=max_delta,
+        steps_run=steps_run,
+        details=details,
+        late_activation_step=late_activation,
+    )
+
+
+@dataclass
+class GuidedChildRecord:
+    generation: int
+    child_index: int
+    species_key: int | None
+    latent_norm: float | None = None
+    latent_mean: float | None = None
+    raw_node_count: int | None = None
+    raw_edge_count: int | None = None
+    prepared_node_count: int | None = None
+    prepared_edge_count: int | None = None
+    hit_decoder_cap: bool = False
+    repair_applied: bool = False
+    repair_added_edges: int | None = None
+    repair_added_nodes: int | None = None
+    repair_reason: str | None = None
+    slot_coverage_passed: bool | None = None
+    slot_missing: int | None = None
+    graph_signature: str | None = None
+    validator_outcome: ValidatorOutcome | None = None
+    validator_max_delta: float | None = None
+    validator_stage_deltas: Dict[str, float] = field(default_factory=dict)
+    failure_reason: str | None = None
+    pre_repair_outcome: ValidatorOutcome | None = None
+    post_repair_outcome: ValidatorOutcome | None = None
+
+    def as_row(self) -> Dict[str, Any]:
+        row = {
+            "generation": self.generation,
+            "child_index": self.child_index,
+            "species_key": self.species_key,
+            "latent_norm": self.latent_norm,
+            "latent_mean": self.latent_mean,
+            "raw_node_count": self.raw_node_count,
+            "raw_edge_count": self.raw_edge_count,
+            "prepared_node_count": self.prepared_node_count,
+            "prepared_edge_count": self.prepared_edge_count,
+            "hit_decoder_cap": self.hit_decoder_cap,
+            "repair_applied": self.repair_applied,
+            "repair_added_edges": self.repair_added_edges,
+            "repair_added_nodes": self.repair_added_nodes,
+            "repair_reason": self.repair_reason,
+            "slot_coverage_passed": self.slot_coverage_passed,
+            "slot_missing": self.slot_missing,
+            "graph_signature": self.graph_signature,
+            "validator_outcome": self.validator_outcome.value if self.validator_outcome else None,
+            "validator_max_delta": self.validator_max_delta,
+            "validator_stage_deltas": json.dumps(self.validator_stage_deltas, sort_keys=True)
+            if self.validator_stage_deltas
+            else None,
+            "failure_reason": self.failure_reason,
+            "pre_repair_outcome": self.pre_repair_outcome.value if self.pre_repair_outcome else None,
+            "post_repair_outcome": self.post_repair_outcome.value if self.post_repair_outcome else None,
+        }
+        return row
+
+
+GUIDED_CHILD_FIELDNAMES = list(GuidedChildRecord(0, 0, None).as_row().keys())
+
+
 def _normalize_pin_role(value: Any) -> str | None:
     if isinstance(value, str):
         role = value.strip().lower()
         if role in _PIN_ROLE_FALLBACKS:
             return _PIN_ROLE_FALLBACKS[role]
     return None
+
+
+def _graph_node_edge_counts(graph_dict: dict | None) -> Tuple[int, int]:
+    if not graph_dict:
+        return 0, 0
+    node_types = graph_dict.get("node_types")
+    if isinstance(node_types, torch.Tensor):
+        node_count = int(node_types.numel())
+    else:
+        node_count = len(node_types or [])
+    edge_index = graph_dict.get("edge_index")
+    edge_count = 0
+    if isinstance(edge_index, torch.Tensor):
+        if edge_index.dim() == 1:
+            edge_count = int(edge_index.numel() // 2)
+        elif edge_index.dim() >= 2:
+            edge_count = int(edge_index.size(1))
+    elif isinstance(edge_index, (list, tuple)) and edge_index:
+        edge_count = len(edge_index[0]) if isinstance(edge_index[0], (list, tuple)) else len(edge_index)
+    return max(0, node_count), max(0, edge_count)
 
 
 def _dump_invalid_reason_summary():
@@ -269,6 +447,7 @@ class GuidedPopulation(Population):
             self.test_epoch_scale = max(0.01, min(1.0, scale))
         else:
             self.test_epoch_scale = None
+        self.teacher_force_enabled = bool(getattr(config, "teacher_force_enabled", True))
         self.teacher_force_epochs_base = int(getattr(config, "teacher_force_epochs", 5))
         self.teacher_force_epochs_max = int(
             getattr(config, "teacher_force_epochs_max", max(5, self.teacher_force_epochs_base * 3))
@@ -278,7 +457,15 @@ class GuidedPopulation(Population):
             getattr(config, "teacher_force_weight_max", max(2.0, self.teacher_force_weight_base * 2))
         )
         self.teacher_force_verbose = bool(getattr(config, "teacher_force_verbose", True))
+        if not self.teacher_force_enabled:
+            self.teacher_force_epochs_base = 0
+            self.teacher_force_epochs_max = 0
+            self.teacher_force_weight_base = 0.0
+            self.teacher_force_weight_max = 0.0
+        self.decoder_replay_enabled = bool(getattr(config, "decoder_replay_enabled", True))
         self.decoder_replay_max = int(getattr(config, "decoder_replay_max", 256))
+        if not self.decoder_replay_enabled:
+            self.decoder_replay_max = 0
         # graph_signature_from_dict can legitimately return None (e.g., tensors with unsupported dtypes) even for validated graphs
         self._decoder_replay_cache: deque[tuple[str | None, dict]] = deque()
         self._decoder_replay_signatures: Set[str] = set()
@@ -296,9 +483,13 @@ class GuidedPopulation(Population):
         if raw_seed_fail_threshold is None:
             raw_seed_fail_threshold = getattr(config, "guided_seed_inactive_threshold", 0.3)
         self.guided_seed_fail_threshold = min(1.0, max(0.0, float(raw_seed_fail_threshold)))
+        self.seeded_replay_enabled = bool(getattr(config, "seeded_replay_enabled", True))
         self._seeded_replay_entries: List[dict] = []
         self._seeded_replay_signatures: Set[str | None] = set()
+        self.latent_structure_enabled = bool(getattr(config, "latent_structure_enabled", True))
         self.guided_structure_buffer = max(0, int(getattr(config, "guided_structure_buffer", 512)))
+        if not self.latent_structure_enabled:
+            self.guided_structure_buffer = 0
         self.guided_structure_margin = float(getattr(config, "guided_structure_margin", 0.15))
         self.guided_structure_weight = max(0.0, float(getattr(config, "guided_structure_weight", 0.6)))
         self._latent_valid_samples: deque[torch.Tensor] = deque(maxlen=self.guided_structure_buffer)
@@ -333,8 +524,8 @@ class GuidedPopulation(Population):
         stagnation = config.stagnation_type(config.stagnation_config, self.reporters)
         self.reproduction = GuidedReproduction(config.reproduction_config, self.reporters, stagnation)
         self.reproduction.guide_fn = self.generate_guided_offspring
-        self.reproduction.optimizer_validator = lambda optimizer: self._optimizer_updates_parameters(
-            optimizer, check_steps=1
+        self.reproduction.optimizer_validator = lambda optimizer: bool(
+            self._optimizer_updates_parameters(optimizer, check_steps=1)
         )
         self._initial_compression_done = False
         self._enable_initial_compression = getattr(config, "enable_initial_compression", False)
@@ -384,21 +575,26 @@ class GuidedPopulation(Population):
         except (TypeError, ValueError):
             inactive_limit = 32
         self.guided_inactive_detail_limit = max(0, inactive_limit)
-        self.track_inactive_repair_salvage = bool(getattr(config, "track_inactive_repair_salvage", True))
-        raw_inactive_dump_dir = getattr(config, "inactive_repair_dump_dir", None)
-        if raw_inactive_dump_dir:
-            self.inactive_repair_dump_dir = Path(raw_inactive_dump_dir)
+        self.guided_child_log_enabled = bool(getattr(config, "guided_child_log_enabled", True))
+        raw_child_log_dir = getattr(config, "guided_child_log_dir", None)
+        if raw_child_log_dir:
+            self.guided_child_log_dir = Path(raw_child_log_dir)
         else:
-            self.inactive_repair_dump_dir = Path("debug_guided_offspring") / "pre_repair_samples"
-        self.inactive_repair_dump_enabled = bool(getattr(config, "inactive_repair_dump_enabled", True))
-        self.inactive_repair_dump_max = max(0, int(getattr(config, "inactive_repair_dump_max", 512)))
-        self.inactive_repair_probe_limit = max(0, int(getattr(config, "inactive_repair_probe_limit", 4)))
-        self._inactive_repair_dump_paths: deque[Path] = deque()
-        self._inactive_repair_dump_initialized = False
-        self._inactive_repair_dump_errors_logged = False
-        self._inactive_repair_probes_used = 0
+            self.guided_child_log_dir = Path("debug_guided_offspring") / "lifecycles"
+        self._guided_child_records: List[GuidedChildRecord] = []
         self.guided_debug_dump_enabled = bool(getattr(config, "guided_debug_dump_enabled", False))
         self.guided_debug_dump_limit = max(0, int(getattr(config, "guided_debug_dump_limit", 5)))
+        self.validator_compare_main_task = bool(getattr(config, "validator_compare_main_task", True))
+        self.validator_mode = str(getattr(config, "validator_mode", "synthetic_fast")).strip().lower()
+        self.validator_reset_state = bool(getattr(config, "validator_reset_state", True))
+        self.validator_relative_delta = bool(getattr(config, "validator_relative_delta", False))
+        self.validator_delta_eps = float(getattr(config, "validator_delta_eps", 1e-12))
+        self.validator_check_steps = max(1, int(getattr(config, "validator_check_steps", 2)))
+        self._validator_confusion: Counter = Counter()
+        self.structure_penalty_enabled = bool(getattr(config, "structure_penalty_enabled", True))
+        self.repair_activity_probe_fraction = float(getattr(config, "repair_activity_probe_fraction", 0.0))
+        self.repair_activity_probe_max = max(0, int(getattr(config, "repair_activity_probe_max", 8)))
+        self._repair_activity_probes_used = 0
 
     def _reset_guided_offspring_stats(self):
         if self._guided_offspring_stats is not None:
@@ -420,11 +616,71 @@ class GuidedPopulation(Population):
             "inactive_details": [],
             "inactive_repair_salvaged": 0,
             "inactive_repair_salvaged_total": self._total_inactive_repair_salvaged,
-            "inactive_repair_buffered": 0,
-            "inactive_repair_probe_limit": self.inactive_repair_probe_limit,
-            "inactive_repair_probe_used": 0,
             "validator_failures": 0,
         }
+        self._repair_activity_probes_used = 0
+
+    def _begin_guided_child_record(
+        self,
+        *,
+        generation: int,
+        child_index: int,
+        species_key: int | None,
+        latent: torch.Tensor | None,
+    ) -> GuidedChildRecord | None:
+        if not self.guided_child_log_enabled:
+            return None
+        latent_norm, latent_mean = self._latent_snapshot(latent)
+        record = GuidedChildRecord(
+            generation=generation,
+            child_index=child_index,
+            species_key=species_key,
+            latent_norm=latent_norm,
+            latent_mean=latent_mean,
+        )
+        self._guided_child_records.append(record)
+        return record
+
+    def _flush_guided_child_records(self, generation: int) -> None:
+        if not self.guided_child_log_enabled or not self._guided_child_records:
+            return
+        self.guided_child_log_dir.mkdir(parents=True, exist_ok=True)
+        path = self.guided_child_log_dir / f"gen_{generation:05d}.csv"
+        with path.open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=GUIDED_CHILD_FIELDNAMES)
+            writer.writeheader()
+            for record in self._guided_child_records:
+                writer.writerow(record.as_row())
+
+    def _should_probe_repair_activity(self) -> bool:
+        if self.repair_activity_probe_fraction <= 0 or self.repair_activity_probe_max <= 0:
+            return False
+        if random.random() >= self.repair_activity_probe_fraction:
+            return False
+        return self._reserve_repair_activity_probe()
+
+    def _reserve_repair_activity_probe(self) -> bool:
+        used = getattr(self, "_repair_activity_probes_used", 0)
+        if used >= self.repair_activity_probe_max:
+            return False
+        self._repair_activity_probes_used = used + 1
+        return True
+
+    def _probe_graph_activity(self, graph_dict: dict | None, *, child_index: int) -> OptimizerValidationResult | None:
+        genome_config = getattr(self.config, "genome_config", None)
+        if not graph_dict or genome_config is None:
+            return None
+        clone = self._clone_graph_dict(graph_dict, include_history=False)
+        if clone is None:
+            return None
+        try:
+            genome = genome_from_graph_dict(clone, genome_config, key=child_index)
+        except Exception:
+            return None
+        optimizer = rebuild_and_script(clone, genome_config, key=child_index, genome=genome)
+        if optimizer is None:
+            return None
+        return self._optimizer_updates_parameters(optimizer, check_steps=1, task=self.validator_task)
 
     def _summarize_inactive_details(self, stats: dict | None) -> dict | None:
         if not stats:
@@ -435,9 +691,6 @@ class GuidedPopulation(Population):
         inactive_details = stats.get("inactive_details") or []
         inactive_repair_salvaged = int(stats.get("inactive_repair_salvaged", 0) or 0)
         inactive_repair_total = int(stats.get("inactive_repair_salvaged_total", 0) or 0)
-        inactive_repair_buffered = int(stats.get("inactive_repair_buffered", 0) or 0)
-        inactive_repair_probe_limit = int(stats.get("inactive_repair_probe_limit", 0) or 0)
-        inactive_repair_probe_used = int(stats.get("inactive_repair_probe_used", 0) or 0)
         if not inactive_invalid and not inactive_details_total and not inactive_repair_salvaged:
             return None
         record = {
@@ -449,9 +702,6 @@ class GuidedPopulation(Population):
             "inactive_details_total": inactive_details_total,
             "inactive_repair_salvaged": inactive_repair_salvaged,
             "inactive_repair_salvaged_total": inactive_repair_total,
-            "inactive_repair_buffered": inactive_repair_buffered,
-            "inactive_repair_probe_limit": inactive_repair_probe_limit,
-            "inactive_repair_probe_used": inactive_repair_probe_used,
             "decoder_max_nodes_hits": int(stats.get("decoder_max_nodes_hits", 0) or 0),
             "decoder_max_nodes_invalid": int(stats.get("decoder_max_nodes_invalid", 0) or 0),
             "validator_failures": int(stats.get("validator_failures", 0) or 0),
@@ -507,8 +757,6 @@ class GuidedPopulation(Population):
         decoder_max_nodes_invalid: int = 0,
         inactive_details: Sequence[dict] | None = None,
         inactive_repair_salvaged: int = 0,
-        inactive_repair_buffered: int = 0,
-        inactive_repair_probe_used: int = 0,
         validator_failures: int = 0,
     ):
         stats = self._guided_offspring_stats
@@ -543,10 +791,6 @@ class GuidedPopulation(Population):
         if inactive_repair_salvaged:
             stats["inactive_repair_salvaged"] += int(inactive_repair_salvaged)
         stats["inactive_repair_salvaged_total"] = self._total_inactive_repair_salvaged
-        if inactive_repair_buffered:
-            stats["inactive_repair_buffered"] += int(inactive_repair_buffered)
-        if inactive_repair_probe_used:
-            stats["inactive_repair_probe_used"] += int(inactive_repair_probe_used)
         if validator_failures:
             stats["validator_failures"] += int(validator_failures)
 
@@ -572,6 +816,10 @@ class GuidedPopulation(Population):
             "inactive_repair_salvaged_total": stats.get("inactive_repair_salvaged_total", 0),
             "validator_failures": stats.get("validator_failures", 0),
         }
+        confusion = self._validator_confusion_summary()
+        if confusion:
+            summary["validator_confusion"] = confusion
+        self._validator_confusion.clear()
         if stats.get("inactive_details"):
             summary["inactive_details"] = list(stats["inactive_details"])
         summary["spawn_generation"] = summary.get("generation", self.generation) + 1
@@ -616,6 +864,8 @@ class GuidedPopulation(Population):
         return max(0.0, min(1.0, empties / requested))
 
     def _teacher_force_schedule(self) -> tuple[int, float]:
+        if not self.teacher_force_enabled:
+            return 0, 0.0
         ratio = self._guided_empty_ratio()
         epochs_span = max(0, self.teacher_force_epochs_max - self.teacher_force_epochs_base)
         weight_span = max(0.0, self.teacher_force_weight_max - self.teacher_force_weight_base)
@@ -690,7 +940,7 @@ class GuidedPopulation(Population):
             if len(self._decoder_replay_reservoir) >= self.decoder_replay_max:
                 self._decoder_replay_reservoir.popleft()
             self._decoder_replay_reservoir.append((signature, cloned))
-        if seeded:
+        if seeded and self.seeded_replay_enabled:
             if signature in self._seeded_replay_signatures:
                 return
             entry = {
@@ -700,50 +950,6 @@ class GuidedPopulation(Population):
             self._seeded_replay_entries.append(entry)
             if signature:
                 self._seeded_replay_signatures.add(signature)
-
-    def _ensure_inactive_repair_dump_dir(self) -> bool:
-        if not self.track_inactive_repair_salvage:
-            return False
-        if not self.inactive_repair_dump_enabled or self.inactive_repair_dump_max <= 0:
-            return False
-        if self._inactive_repair_dump_initialized:
-            return True
-        try:
-            self.inactive_repair_dump_dir.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            if not self._inactive_repair_dump_errors_logged:
-                warn(f"Failed to create inactive repair dump dir '{self.inactive_repair_dump_dir}': {exc}")
-                self._inactive_repair_dump_errors_logged = True
-            return False
-        existing = []
-        try:
-            existing = sorted(
-                self.inactive_repair_dump_dir.glob("*.pt"),
-                key=lambda path: path.stat().st_mtime,
-            )
-        except OSError:
-            existing = []
-        if existing and len(existing) > self.inactive_repair_dump_max:
-            stale = existing[: -self.inactive_repair_dump_max]
-            for path in stale:
-                try:
-                    path.unlink()
-                except OSError:
-                    continue
-            existing = existing[-self.inactive_repair_dump_max :]
-        self._inactive_repair_dump_paths = deque(existing)
-        self._inactive_repair_dump_initialized = True
-        return True
-
-    def _enforce_inactive_repair_dump_limit(self) -> None:
-        if self.inactive_repair_dump_max <= 0:
-            return
-        while len(self._inactive_repair_dump_paths) > self.inactive_repair_dump_max:
-            oldest = self._inactive_repair_dump_paths.popleft()
-            try:
-                oldest.unlink()
-            except OSError:
-                continue
 
     @staticmethod
     def _latent_snapshot(latent: torch.Tensor | None) -> Tuple[float | None, float | None]:
@@ -771,71 +977,6 @@ class GuidedPopulation(Population):
         except Exception:
             return None
         return flat.clone()
-
-    def _buffer_inactive_pre_repair_sample(
-        self,
-        graph_dict: dict | None,
-        *,
-        generation_idx: int,
-        child_index: int,
-        latent: torch.Tensor | None,
-        repaired_signature: str | None,
-        pre_repair_signature: str | None,
-        hit_max_nodes: bool,
-    ) -> bool:
-        if graph_dict is None:
-            return False
-        if not self._ensure_inactive_repair_dump_dir():
-            return False
-        cloned = self._clone_graph_dict(graph_dict, include_history=False)
-        if cloned is None:
-            return False
-        timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
-        random_token = random.randint(0, 99999)
-        filename = f"gen{generation_idx}_child{child_index}_pre_{timestamp}_{random_token:05d}.pt"
-        path = self.inactive_repair_dump_dir / filename
-        latent_norm, latent_mean = self._latent_snapshot(latent)
-        metadata = {
-            "generation": int(generation_idx),
-            "child_index": int(child_index),
-            "timestamp": timestamp,
-            "repaired_signature": repaired_signature,
-            "pre_repair_signature": pre_repair_signature,
-            "hit_max_nodes": bool(hit_max_nodes),
-        }
-        if latent_norm is not None:
-            metadata["latent_norm"] = latent_norm
-        if latent_mean is not None:
-            metadata["latent_mean"] = latent_mean
-        node_types = cloned.get("node_types")
-        edge_index = cloned.get("edge_index")
-        node_count = int(node_types.numel()) if isinstance(node_types, torch.Tensor) else len(node_types or [])
-        edge_count = 0
-        if isinstance(edge_index, torch.Tensor):
-            edge_count = int(edge_index.size(1) if edge_index.dim() >= 2 else edge_index.numel() // 2)
-        elif edge_index:
-            edge_count = len(edge_index[0]) if isinstance(edge_index, (list, tuple)) and edge_index else 0
-        metadata["node_count"] = node_count
-        metadata["edge_count"] = edge_count
-        latent_vector = self._latent_vector_tensor(latent)
-        if latent_vector is not None:
-            metadata["latent_dim"] = int(latent_vector.numel())
-        payload = {
-            "graph_dict": cloned,
-            "metadata": metadata,
-        }
-        if latent_vector is not None:
-            payload["latent_vector"] = latent_vector
-        try:
-            torch.save(payload, path)
-        except Exception as exc:
-            if not self._inactive_repair_dump_errors_logged:
-                warn(f"Unable to persist pre-repair sample to '{path}': {exc}")
-                self._inactive_repair_dump_errors_logged = True
-            return False
-        self._inactive_repair_dump_paths.append(path)
-        self._enforce_inactive_repair_dump_limit()
-        return True
 
     @staticmethod
     def _graph_dict_has_topology(graph_dict: dict | None) -> bool:
@@ -1062,7 +1203,7 @@ class GuidedPopulation(Population):
         return graphs
 
     def _sample_seeded_replay_graphs(self, count: int) -> List[dict]:
-        if count <= 0 or not self._seeded_replay_entries:
+        if not self.seeded_replay_enabled or count <= 0 or not self._seeded_replay_entries:
             return []
         picks = self._random_draw_entries(self._seeded_replay_entries, count)
         graphs: List[dict] = []
@@ -1178,13 +1319,16 @@ class GuidedPopulation(Population):
             node_attributes.append(attr_dict)
         node_types = torch.tensor(node_types, dtype=torch.long)
 
+        id_to_local = {node_id: idx for idx, node_id in enumerate(node_ids)}
         edges = []
         for (src, dst), conn in genome.connections.items():
-            if conn.enabled:
-                if src in node_ids and dst in node_ids:
-                    local_src = node_ids.index(src)
-                    local_dst = node_ids.index(dst)
-                    edges.append([local_src, local_dst])
+            if not conn.enabled:
+                continue
+            local_src = id_to_local.get(src)
+            local_dst = id_to_local.get(dst)
+            if local_src is None or local_dst is None:
+                continue
+            edges.append([local_src, local_dst])
         if len(edges) > 0:
             edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
         else:
@@ -1316,7 +1460,8 @@ class GuidedPopulation(Population):
         optimizer = rebuild_and_script(graph_dict, genome_config, key=key, genome=genome)
         if optimizer is None:
             return False
-        return not self._optimizer_updates_parameters(optimizer, check_steps=2, task=self.validator_task)
+        result = self._optimizer_updates_parameters(optimizer, check_steps=2, task=self.validator_task)
+        return not bool(result)
 
     def _minimum_required_node_count(self) -> int:
         config = getattr(self.config, "genome_config", None)
@@ -1413,7 +1558,7 @@ class GuidedPopulation(Population):
         return total.mean()
 
     def _latent_structure_penalty(self, latents: torch.Tensor) -> torch.Tensor:
-        if self.guided_structure_weight <= 0 or self.guided_structure_buffer <= 0:
+        if not self.structure_penalty_enabled or self.guided_structure_weight <= 0 or self.guided_structure_buffer <= 0:
             return torch.zeros((), dtype=latents.dtype, device=latents.device)
         valid_center = self._latent_center(self._latent_valid_samples, latents.device, latents.dtype)
         invalid_center = self._latent_center(self._latent_invalid_samples, latents.device, latents.dtype)
@@ -1674,8 +1819,6 @@ class GuidedPopulation(Population):
         n_offspring: int = 10,
         latent_steps: int = 50,
         latent_lr: float = 1e-2,
-        max_decode_attempts: int = 5,
-        decode_jitter_std: float = 0.05,
         latent_tether_weight: float | None = None,
         latent_tether_init: float = 1e-3,
         latent_tether_prior: float = 1e-4,
@@ -1689,7 +1832,6 @@ class GuidedPopulation(Population):
         latent_steps = max(5, int(latent_steps * (1.0 - 0.5 * empty_feedback)))
         latent_lr = float(latent_lr) * (0.5 + 0.5 * (1.0 - empty_feedback))
         latent_tether_init = float(latent_tether_init) * (1.0 + empty_feedback)
-        _ = decode_jitter_std  # legacy arg retained; repair hook replaces jitter retries
 
         metric_keys = self.metric_keys
         metric_best_values = self.metric_best_values
@@ -1847,6 +1989,8 @@ class GuidedPopulation(Population):
             )
 
         stats = []
+        if self.guided_child_log_enabled:
+            self._guided_child_records = []
         new_genomes = []
         empty_graph_count = 0
         duplicate_count = 0
@@ -1859,7 +2003,6 @@ class GuidedPopulation(Population):
         decoder_max_nodes_invalid = 0
         inactive_detail_samples: List[dict] = []
         inactive_repair_salvaged = 0
-        inactive_repair_samples_buffered = 0
         debug_dir: Path | None = None
         debug_save_limit = 0
         debug_saved = 0
@@ -1874,8 +2017,6 @@ class GuidedPopulation(Population):
         last_valid_graph_dict = None
         track_latents = self.guided_structure_buffer > 0
         latent_valid_flags = [False] * total_requested if track_latents else None
-        inactive_probe_start = self._inactive_repair_probes_used
-
         abort_due_to_decoder_cap = False
         species_key = getattr(starting_genomes[0], "species_key", None) if starting_genomes else None
         for i in range(total_requested):
@@ -1889,11 +2030,24 @@ class GuidedPopulation(Population):
             graph_dict = decoded_graphs[0]
             hit_max_nodes_cap = bool(graph_dict.pop("_max_nodes_hit", False))
             decoder_max_nodes = graph_dict.pop("_decoder_max_nodes", None)
+            child_record = self._begin_guided_child_record(
+                generation=generation_idx,
+                child_index=i,
+                species_key=species_key,
+                latent=latent,
+            )
+            if child_record:
+                nodes, edges = _graph_node_edge_counts(graph_dict)
+                child_record.raw_node_count = nodes
+                child_record.raw_edge_count = edges
+                child_record.hit_decoder_cap = hit_max_nodes_cap
             min_nodes_required = self._minimum_required_node_count()
             original_node_count = len(graph_dict.get("node_attributes") or [])
             self._ensure_graph_node_capacity(graph_dict, min_nodes_required)
             if hit_max_nodes_cap:
                 decoder_max_nodes_hits += 1
+                if child_record:
+                    child_record.failure_reason = "decoder_max_nodes"
                 max_nodes_value = None
                 if decoder_max_nodes is not None:
                     try:
@@ -1943,6 +2097,8 @@ class GuidedPopulation(Population):
                 break
             if original_node_count < min_nodes_required:
                 reason = "insufficient_node_count"
+                if child_record:
+                    child_record.failure_reason = reason
                 genome = genome_from_graph_dict(graph_dict, self.config.genome_config, key=i)
                 num_edges = len(genome.connections)
                 self._maybe_visualize_guided_invalid_graph(
@@ -1974,55 +2130,46 @@ class GuidedPopulation(Population):
                     seen_graph_signatures.add(graph_signature)
                 new_genomes.append(genome)
                 continue
-            self._prepare_decoded_graph_dict(graph_dict)
+            prepared_node_count, prepared_edges = self._prepare_decoded_graph_dict(graph_dict)
+            if child_record:
+                child_record.prepared_node_count = prepared_node_count
+                child_record.prepared_edge_count = len(prepared_edges)
             pre_repair_graph_dict = None
             pending_pre_repair_sample: dict | None = None
-            if self.track_inactive_repair_salvage:
-                pre_repair_graph_dict = self._clone_graph_dict(graph_dict, include_history=False)
+            probe_pre = child_record is not None and self._should_probe_repair_activity()
+            pre_probe_result = None
+            if probe_pre:
+                pre_probe_result = self._probe_graph_activity(graph_dict, child_index=i)
+                if child_record and pre_probe_result is not None:
+                    child_record.pre_repair_outcome = pre_probe_result.outcome
+            pre_repair_nodes, pre_repair_edges = _graph_node_edge_counts(graph_dict)
             self._repair_graph_dict(graph_dict)
             repair_applied_flag = bool(graph_dict.get("_repair_applied"))
-            pre_repair_inactive = False
-            if self.track_inactive_repair_salvage and repair_applied_flag and pre_repair_graph_dict is not None:
-                if (
-                    self.inactive_repair_probe_limit > 0
-                    and self._inactive_repair_probes_used < self.inactive_repair_probe_limit
-                ):
-                    pre_repair_inactive = self._graph_dict_would_be_inactive(
-                        pre_repair_graph_dict,
-                        key=i,
-                    )
-                    self._inactive_repair_probes_used += 1
-                else:
-                    pending_pre_repair_sample = {
-                        "graph_dict": pre_repair_graph_dict,
-                        "generation": generation_idx,
-                        "child_index": i,
-                        "latent": latent,
-                        "pre_repair_signature": graph_signature_from_dict(pre_repair_graph_dict),
-                        "hit_max_nodes": hit_max_nodes_cap,
-                    }
+            if child_record and repair_applied_flag:
+                post_repair_nodes, post_repair_edges = _graph_node_edge_counts(graph_dict)
+                child_record.repair_applied = True
+                child_record.repair_added_nodes = post_repair_nodes - pre_repair_nodes
+                child_record.repair_added_edges = post_repair_edges - pre_repair_edges
+            post_probe_result = None
+            probe_post = child_record is not None and self._should_probe_repair_activity()
+            if probe_post:
+                post_probe_result = self._probe_graph_activity(graph_dict, child_index=i)
+                if child_record and post_probe_result is not None:
+                    child_record.post_repair_outcome = post_probe_result.outcome
+            pre_repair_inactive = pre_probe_result is not None and not bool(pre_probe_result)
             repair_reason = graph_dict.get("_repair_failure_reason")
             repair_details = graph_dict.get("_repair_failure_details")
             if repair_reason:
                 repair_failures += 1
+                if child_record:
+                    child_record.repair_reason = repair_reason
+                    child_record.failure_reason = repair_reason
             genome = genome_from_graph_dict(graph_dict, self.config.genome_config, key=i)
             num_edges = len(genome.connections)
             num_params = len(genome.connections)
             graph_signature = graph_signature_from_dict(graph_dict)
-            if pending_pre_repair_sample is not None:
-                buffered = self._buffer_inactive_pre_repair_sample(
-                    pending_pre_repair_sample.get("graph_dict"),
-                    generation_idx=int(pending_pre_repair_sample.get("generation", generation_idx)),
-                    child_index=int(pending_pre_repair_sample.get("child_index", i)),
-                    latent=pending_pre_repair_sample.get("latent"),
-                    repaired_signature=graph_signature,
-                    pre_repair_signature=pending_pre_repair_sample.get("pre_repair_signature"),
-                    hit_max_nodes=bool(pending_pre_repair_sample.get("hit_max_nodes", False)),
-                )
-                if buffered:
-                    inactive_repair_samples_buffered += 1
-                pending_pre_repair_sample = None
-
+            if child_record and graph_signature:
+                child_record.graph_signature = graph_signature
             if repair_reason:
                 self._maybe_visualize_guided_invalid_graph(
                     genome,
@@ -2058,6 +2205,8 @@ class GuidedPopulation(Population):
 
             if num_edges == 0:
                 empty_graph_count += 1
+                if child_record:
+                    child_record.failure_reason = "empty_graph"
                 warn("Guided offspring decoder produced an empty graph (no edges); assigning penalty fitness.")
                 self._maybe_visualize_guided_invalid_graph(
                     genome,
@@ -2085,6 +2234,8 @@ class GuidedPopulation(Population):
 
             if graph_signature in seen_graph_signatures:
                 duplicate_count += 1
+                if child_record:
+                    child_record.failure_reason = "duplicate_graph"
                 warn("Guided offspring decoder produced a duplicate graph; skipping to preserve diversity.")
                 self._buffer_decoder_replay_dict(graph_dict)
                 if last_valid_graph_dict is not None:
@@ -2092,8 +2243,15 @@ class GuidedPopulation(Population):
                 continue
 
             slot_ok, slot_details = self._graph_output_slot_coverage(graph_dict)
+            if child_record and slot_ok:
+                child_record.slot_coverage_passed = True
+                child_record.slot_missing = 0
             if not slot_ok:
                 missing_slot_rejections += 1
+                if child_record:
+                    child_record.slot_coverage_passed = False
+                    child_record.slot_missing = len(slot_details.get("missing_slots", []))
+                    child_record.failure_reason = "missing_output_slots"
                 detail_parts = []
                 missing_slots = slot_details.get("missing_slots", [])
                 slot_attrs = slot_details.get("attributes", {})
@@ -2140,7 +2298,13 @@ class GuidedPopulation(Population):
 
             optimizer = rebuild_and_script(graph_dict, self.config.genome_config, key=i, genome=genome)
             if optimizer:
-                if not self._optimizer_updates_parameters(optimizer, check_steps=2, task=self.validator_task):
+                raw_validation = self._optimizer_updates_parameters(optimizer, check_steps=2, task=self.validator_task)
+                validation = _coerce_validation_result(raw_validation)
+                if child_record:
+                    child_record.validator_outcome = validation.outcome
+                    child_record.validator_max_delta = validation.max_delta
+                    child_record.validator_stage_deltas = dict(validation.stage_deltas)
+                if not validation:
                     inactive_optimizer_count += 1
                     warn("Guided offspring optimizer failed to modify model parameters; assigning penalty fitness.")
                     self._maybe_visualize_guided_invalid_graph(
@@ -2151,7 +2315,12 @@ class GuidedPopulation(Population):
                         num_edges=num_edges,
                     )
                     genome.graph_dict = graph_dict
-                    penalty_details = {"parameter_delta": getattr(self, "_last_optimizer_delta", 0.0)}
+                    if child_record:
+                        child_record.failure_reason = "inactive_optimizer"
+                    penalty_details = {
+                        "parameter_delta": getattr(self, "_last_optimizer_delta", 0.0),
+                        "validation_outcome": validation.outcome.value,
+                    }
                     self._assign_penalty(
                         genome,
                         reason="inactive_optimizer",
@@ -2205,6 +2374,8 @@ class GuidedPopulation(Population):
                 continue
 
             rebuild_failures += 1
+            if child_record:
+                child_record.failure_reason = "rebuild_failed"
             warn("Guided offspring decoder failed to rebuild a valid optimizer; skipping child.")
             self._buffer_decoder_replay_dict(graph_dict)
             if last_valid_graph_dict is not None:
@@ -2274,8 +2445,6 @@ class GuidedPopulation(Population):
                 final_invalid_counts[reason] += 1
         effective_invalid_counts = final_invalid_counts or invalid_reason_counts
 
-        inactive_probe_used = max(0, self._inactive_repair_probes_used - inactive_probe_start)
-
         self._accumulate_guided_offspring_stats(
             total_requested,
             len(deduped_genomes),
@@ -2288,10 +2457,9 @@ class GuidedPopulation(Population):
             decoder_max_nodes_invalid=decoder_max_nodes_invalid,
             inactive_details=inactive_detail_samples,
             inactive_repair_salvaged=inactive_repair_salvaged,
-            inactive_repair_buffered=inactive_repair_samples_buffered,
-            inactive_repair_probe_used=inactive_probe_used,
             validator_failures=inactive_optimizer_count,
         )
+        self._flush_guided_child_records(generation_idx)
         return deduped_genomes
 
     def _dedupe_genomes_by_signature(self, genomes: Sequence[OptimizerGenome]) -> Tuple[List[OptimizerGenome], int]:
@@ -2891,113 +3059,216 @@ class GuidedPopulation(Population):
         """Run a short dry-run to ensure the optimizer changes model weights."""
 
         task = task or self.validator_task or self.task
+        threshold = float(delta_eps if delta_eps is not None else self.validator_delta_eps)
+        stage_order = self._validator_stage_order()
+        check_steps = max(1, check_steps or self.validator_check_steps)
+        result = self._optimizer_activity_pass(
+            optimizer,
+            task=task,
+            stage_order=stage_order,
+            check_steps=check_steps,
+            delta_threshold=threshold,
+        )
 
+        if (
+            self.validator_compare_main_task
+            and task is self.validator_task
+            and self.validator_task is not None
+            and self.task is not None
+            and self.task is not self.validator_task
+        ):
+            task_result = self._optimizer_activity_pass(
+                optimizer,
+                task=self.task,
+                stage_order=["fast"],
+                check_steps=1,
+                delta_threshold=threshold,
+            )
+            key = (bool(result), bool(task_result))
+            self._validator_confusion[key] += 1
+            details = result.details.setdefault("validator_confusion", {})
+            details["validator_active"] = bool(result)
+            details["task_active"] = bool(task_result)
+        return result
+
+    def _validator_stage_order(self) -> List[str]:
+        mode = (self.validator_mode or "synthetic_fast").lower()
+        mapping = {
+            "synthetic_only": ["synthetic"],
+            "fast_only": ["fast"],
+            "synthetic_fast": ["synthetic", "fast"],
+            "full": ["synthetic", "fast", "slow"],
+        }
+        return mapping.get(mode, mapping["synthetic_fast"])
+
+    def _validator_confusion_summary(self) -> Dict[str, int]:
+        if not self._validator_confusion:
+            return {}
+        mapping = {
+            (True, True): "validator_active_task_active",
+            (True, False): "validator_active_task_inactive",
+            (False, True): "validator_inactive_task_active",
+            (False, False): "validator_inactive_task_inactive",
+        }
+        summary = {}
+        for key, name in mapping.items():
+            count = int(self._validator_confusion.get(key, 0))
+            if count:
+                summary[name] = count
+        return summary
+
+    def _optimizer_activity_pass(
+        self,
+        optimizer,
+        *,
+        task,
+        stage_order: Sequence[str],
+        check_steps: int,
+        delta_threshold: float,
+    ) -> OptimizerValidationResult:
         try:
             model = ManyLossMinimaModel(task.train_data.num_input_features)
-        except Exception:
-            return True
-
-        self._reset_optimizer_state(optimizer, None)
-        self._reset_optimizer_step_counters(optimizer)
+        except Exception as exc:  # pragma: no cover - defensive
+            warn(f"Validator model construction failed: {exc}")
+            return OptimizerValidationResult(
+                outcome=ValidatorOutcome.EXCEPTION,
+                details={"error": str(exc), "task": getattr(task, "name", str(task))},
+            )
 
         def _capture_baseline(named_params: Sequence[tuple[str, torch.Tensor]]) -> dict:
             return {name: param.detach().clone() for name, param in named_params}
 
         def _state_delta(state_dict, baseline_dict):
             delta = 0.0
+            missing = []
             for name, before in baseline_dict.items():
                 after = state_dict.get(name)
                 if after is None:
+                    missing.append(name)
                     continue
                 delta += torch.norm(after - before, p=1).item()
-            return delta
+            return delta, missing
 
         def _run_optimizer_once(named_params, metrics, prev_metrics):
             self._ensure_optimizer_state_shapes(optimizer, named_params)
             try:
                 return optimizer(metrics, prev_metrics, named_params)
-            except Exception:
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("Optimizer validation exception: %s", exc)
                 return None
 
-        probe_delta = 0.0
-        with log_timing(logger, "Optimizer validation (synthetic probe)", log_on_start=True) as timing:
-            probe_model = torch.nn.Linear(2, 2, bias=False)
-            probe_params = list(probe_model.named_parameters())
-            probe_baseline = _capture_baseline(probe_params)
-            probe_metrics = torch.ones(2, dtype=torch.float32)
-            updated_probe = _run_optimizer_once(probe_params, probe_metrics, torch.zeros_like(probe_metrics))
-            if updated_probe is not None:
-                probe_state = self._normalize_state_dict(updated_probe, probe_params)
-                probe_delta = _state_delta(probe_state, probe_baseline)
-            timing.set_details(f"delta={probe_delta:.3e}")
-        if probe_delta > delta_eps:
+        def _reset_optimizer_state_buffers():
+            if not self.validator_reset_state:
+                return
             self._reset_optimizer_state(optimizer, None)
             self._reset_optimizer_step_counters(optimizer)
-            self._last_optimizer_delta = probe_delta
-            return True
 
-        self._reset_optimizer_state(optimizer, None)
-        self._reset_optimizer_step_counters(optimizer)
-
-        fast_delta = 0.0
-        with log_timing(logger, "Optimizer validation (fast diff)", log_on_start=True) as timing:
-            named_params = list(model.named_parameters())
-            baseline = _capture_baseline(named_params)
-            metrics = task.evaluate_metrics(model, task.train_data)
-            if torch.isfinite(metrics).all():
-                prev = torch.zeros_like(metrics)
-                updated_state = _run_optimizer_once(named_params, metrics, prev)
-                if updated_state is not None:
-                    state_dict = self._normalize_state_dict(updated_state, named_params)
-                    fast_delta = _state_delta(state_dict, baseline)
-            timing.set_details(f"delta={fast_delta:.3e}")
-        if fast_delta > delta_eps:
-            self._reset_optimizer_state(optimizer, None)
-            self._reset_optimizer_step_counters(optimizer)
-            self._last_optimizer_delta = fast_delta
-            return True
-
-        self._reset_optimizer_state(optimizer, None)
-        self._reset_optimizer_step_counters(optimizer)
-
-        prev_metrics = None
-        max_delta_seen = 0.0
+        stage_deltas: Dict[str, float] = {}
+        peak_delta = 0.0
+        missing_names: Set[str] = set()
+        saw_state = False
         slow_steps = 0
-        with log_timing(logger, "Optimizer validation (slow fallback)", log_on_start=True) as timing:
-            named_params = list(model.named_parameters())
-            baseline = _capture_baseline(named_params)
-            for _ in range(max(1, check_steps)):
-                metrics = task.evaluate_metrics(model, task.train_data)
-                if not torch.isfinite(metrics).all():
-                    # Bail out before incrementing slow_steps so the log shows steps=0; caller can inspect metrics.
-                    break
-                prev = torch.zeros_like(metrics) if prev_metrics is None else prev_metrics
-                updated_state = _run_optimizer_once(named_params, metrics, prev)
-                if updated_state is None:
-                    # Optimizer threw or returned None, so we never register a slow_step and the log reports steps=0.
-                    break
-                state_dict = self._normalize_state_dict(updated_state, named_params)
-                total_delta = _state_delta(state_dict, baseline)
-                slow_steps += 1
-                if total_delta > max_delta_seen:
-                    max_delta_seen = total_delta
-                model.load_state_dict(state_dict)
-                if total_delta > delta_eps:
-                    break
-                prev_metrics = metrics.detach()
-                named_params = list(model.named_parameters())
-                baseline = _capture_baseline(named_params)
-            timing.set_details(f"delta={max_delta_seen:.3e} steps={slow_steps}")
-        if max_delta_seen > delta_eps:
-            self._reset_optimizer_state(optimizer, None)
-            self._reset_optimizer_step_counters(optimizer)
-            self._last_optimizer_delta = max_delta_seen
-            return True
 
-        self._reset_optimizer_state(optimizer, None)
-        self._reset_optimizer_step_counters(optimizer)
-        self._last_optimizer_delta = max_delta_seen
-        return False
+        for stage in stage_order:
+            stage_delta = 0.0
+            if stage not in {"synthetic", "fast", "slow"}:
+                continue
+            _reset_optimizer_state_buffers()
+            if stage == "synthetic":
+                with log_timing(logger, "Optimizer validation (synthetic probe)", log_on_start=True) as timing:
+                    probe_model = torch.nn.Linear(2, 2, bias=False)
+                    probe_params = list(probe_model.named_parameters())
+                    probe_baseline = _capture_baseline(probe_params)
+                    probe_metrics = torch.ones(2, dtype=torch.float32)
+                    updated_probe = _run_optimizer_once(probe_params, probe_metrics, torch.zeros_like(probe_metrics))
+                    if updated_probe is not None:
+                        saw_state = True
+                        probe_state = self._normalize_state_dict(updated_probe, probe_params)
+                        stage_delta, missing = _state_delta(probe_state, probe_baseline)
+                        missing_names.update(missing)
+                        peak_delta = max(peak_delta, stage_delta)
+                    timing.set_details(f"delta={stage_delta:.3e}")
+            elif stage == "fast":
+                with log_timing(logger, "Optimizer validation (fast diff)", log_on_start=True) as timing:
+                    named_params = list(model.named_parameters())
+                    baseline = _capture_baseline(named_params)
+                    metrics = task.evaluate_metrics(model, task.train_data)
+                    if torch.isfinite(metrics).all():
+                        prev = torch.zeros_like(metrics)
+                        updated_state = _run_optimizer_once(named_params, metrics, prev)
+                        if updated_state is not None:
+                            saw_state = True
+                            state_dict = self._normalize_state_dict(updated_state, named_params)
+                            stage_delta, missing = _state_delta(state_dict, baseline)
+                            missing_names.update(missing)
+                            peak_delta = max(peak_delta, stage_delta)
+                    timing.set_details(f"delta={stage_delta:.3e}")
+            elif stage == "slow":
+                with log_timing(logger, "Optimizer validation (slow fallback)", log_on_start=True) as timing:
+                    named_params = list(model.named_parameters())
+                    baseline = _capture_baseline(named_params)
+                    prev_metrics = None
+                    for _ in range(max(1, check_steps)):
+                        metrics = task.evaluate_metrics(model, task.train_data)
+                        if not torch.isfinite(metrics).all():
+                            break
+                        prev = torch.zeros_like(metrics) if prev_metrics is None else prev_metrics
+                        updated_state = _run_optimizer_once(named_params, metrics, prev)
+                        if updated_state is None:
+                            break
+                        saw_state = True
+                        state_dict = self._normalize_state_dict(updated_state, named_params)
+                        stage_delta, missing = _state_delta(state_dict, baseline)
+                        missing_names.update(missing)
+                        peak_delta = max(peak_delta, stage_delta)
+                        slow_steps += 1
+                        model.load_state_dict(state_dict)
+                        if stage_delta > delta_threshold:
+                            timing.set_details(f"delta={stage_delta:.3e} steps={slow_steps}")
+                            result = OptimizerValidationResult(
+                                outcome=ValidatorOutcome.ACTIVE,
+                                stage_deltas={**stage_deltas, stage: stage_delta},
+                                max_delta=peak_delta,
+                                steps_run=slow_steps,
+                                late_activation_step=slow_steps if slow_steps > 1 else None,
+                            )
+                            self._last_optimizer_delta = peak_delta
+                            return result
+                        prev_metrics = metrics.detach()
+                        named_params = list(model.named_parameters())
+                        baseline = _capture_baseline(named_params)
+                    timing.set_details(f"delta={stage_delta:.3e} steps={slow_steps}")
+            stage_deltas[stage] = stage_delta
+            if stage_delta > delta_threshold:
+                self._last_optimizer_delta = peak_delta
+                return OptimizerValidationResult(
+                    outcome=ValidatorOutcome.ACTIVE,
+                    stage_deltas=stage_deltas,
+                    max_delta=peak_delta,
+                    steps_run=slow_steps,
+                )
+
+        self._last_optimizer_delta = peak_delta
+        if not saw_state:
+            outcome = ValidatorOutcome.NO_STATE_RETURNED
+        elif missing_names:
+            outcome = ValidatorOutcome.NAME_MISMATCH
+        elif peak_delta <= delta_threshold:
+            outcome = ValidatorOutcome.DELTA_BELOW_THRESHOLD
+        else:
+            outcome = ValidatorOutcome.NO_STATE_CHANGE
+        details = {
+            "missing_state_names": sorted(missing_names) if missing_names else None,
+            "stage_order": list(stage_order),
+            "slow_steps": slow_steps,
+        }
+        return OptimizerValidationResult(
+            outcome=outcome,
+            stage_deltas=stage_deltas,
+            max_delta=peak_delta,
+            steps_run=slow_steps,
+            details=details,
+        )
 
     def run(self, n=None, offspring_per_species=None):
         """
@@ -3398,10 +3669,10 @@ class GuidedPopulation(Population):
         self._reset_optimizer_step_counters(optimizer)
         # TODO: clear all levels of RAM caches in between every run to create fair starting point
         # for comparison
-        tracemalloc.start()
         start = time.perf_counter()
         prev_metrics_values = None
         area_under_metrics = 0.0
+        peak_memory = 0.0
 
         invalid_graph = False
         for step in range(steps):
@@ -3461,11 +3732,8 @@ class GuidedPopulation(Population):
             prev_metrics_values = torch.nan_to_num(prev_metrics_values)
             area_under_metrics += float(metrics_values.detach().sum())
         if invalid_graph:
-            tracemalloc.stop()
             return None
         stop = time.perf_counter()
-        _, peak_memory = tracemalloc.get_traced_memory()
-        tracemalloc.stop()
         time_cost = stop - start
         validation_metrics = self.task.evaluate_metrics(model, self.task.valid_data).detach()
         validation_metrics = torch.nan_to_num(validation_metrics)

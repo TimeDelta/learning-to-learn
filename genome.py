@@ -456,12 +456,16 @@ class OptimizerGenome(object):
                 node_attributes.append(node.dynamic_attributes)
             node_types = torch.tensor(node_types, dtype=torch.long)
 
+            id_to_local = {node_id: idx for idx, node_id in enumerate(node_ids)}
             edges = []
             for (src, dst), conn in self.connections.items():
-                if conn.enabled and src in node_ids and dst in node_ids:
-                    local_src = node_ids.index(src)
-                    local_dst = node_ids.index(dst)
-                    edges.append([local_src, local_dst])
+                if not conn.enabled:
+                    continue
+                local_src = id_to_local.get(src)
+                local_dst = id_to_local.get(dst)
+                if local_src is None or local_dst is None:
+                    continue
+                edges.append([local_src, local_dst])
             if edges:
                 edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
             else:

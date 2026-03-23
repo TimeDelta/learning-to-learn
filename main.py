@@ -1030,6 +1030,9 @@ if __name__ == "__main__":
                         "guided_inactive_repair_salvaged": stats.get("inactive_repair_salvaged"),
                         "guided_inactive_repair_salvaged_total": stats.get("inactive_repair_salvaged_total"),
                     }
+                    confusion = stats.get("validator_confusion") or {}
+                    for label, count in confusion.items():
+                        metrics[f"guided_{label}"] = count
                     invalid_by_reason = stats.get("invalid_by_reason", {}) or {}
                     for reason, count in invalid_by_reason.items():
                         metrics[f"guided_children_invalid_{reason}"] = count
@@ -1055,6 +1058,9 @@ if __name__ == "__main__":
                             f" (last={stats.get('structure_penalty_last', 0):.6f},"
                             f" samples={stats.get('structure_penalty_samples', 0)})"
                         )
+                    if confusion:
+                        conf_parts = ", ".join(f"{k}={v}" for k, v in sorted(confusion.items()))
+                        summary += f", validator_confusion={{ {conf_parts} }}"
                     if parts:
                         summary += f" :: {parts}"
                     mlflow_run.append_log_line(summary)
@@ -1258,6 +1264,9 @@ if __name__ == "__main__":
                     "guided_inactive_repair_salvaged": stats.get("inactive_repair_salvaged"),
                     "guided_inactive_repair_salvaged_total": stats.get("inactive_repair_salvaged_total"),
                 }
+                confusion = stats.get("validator_confusion") or {}
+                for label, count in confusion.items():
+                    metrics[f"guided_{label}"] = count
                 invalid_by_reason = stats.get("invalid_by_reason", {}) or {}
                 for reason, count in invalid_by_reason.items():
                     metrics[f"guided_children_invalid_{reason}"] = count
@@ -1283,6 +1292,9 @@ if __name__ == "__main__":
                         f" (last={stats.get('structure_penalty_last', 0):.6f},"
                         f" samples={stats.get('structure_penalty_samples', 0)})"
                     )
+                if confusion:
+                    conf_parts = ", ".join(f"{k}={v}" for k, v in sorted(confusion.items()))
+                    summary += f", validator_confusion={{ {conf_parts} }}"
                 if parts:
                     summary += f" :: {parts}"
                 mlflow_run.append_log_line(summary)

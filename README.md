@@ -104,9 +104,8 @@ Otherwise, the repaired graph replaces the original latent sample for evaluation
 
 #### Tracking inactive repair salvage
 
-`GuidedPopulation` no longer TorchScripts every repaired child twice. Set `[GuidedPopulation] inactive_repair_probe_limit` (default `4`) to bound the number of inline pre-repair probes each generation.
-Additional repaired graphs are cloned into `debug_guided_offspring/pre_repair_samples` (or the directory supplied via `inactive_repair_dump_dir`) until `inactive_repair_dump_max` is reached; disable the buffering entirely with `inactive_repair_dump_enabled = false`.
-Guided-offspring stats now expose `inactive_repair_buffered` and `inactive_repair_probe_used` so you can tell how many children still need offline inspection. Use `python3 scripts/analyze_inactive_repair_samples.py --config-file neat-config` to replay the backlog on demand. The analyzer rebuilds each stored graph, re-runs the `_optimizer_updates_parameters` dry run, and prints the number of children that would have remained inactive without the repair hook. Supply `--limit N` to inspect a subsample, `--verbose` for per-file results, and `--delete` to drop samples after they have been analyzed.
+`GuidedPopulation` captures per-child repair activity via the lifecycle CSV emitted to `debug_guided_offspring/lifecycles/`. Set `[GuidedPopulation] repair_activity_probe_fraction`/`repair_activity_probe_max` to bound the number of inline pre/post repair probes each generation.
+The old pre-repair sample buffering path has been removed to cut down on object cloning and filesystem churn—the single lifecycle table now carries latent stats, graph size deltas, repair outcome, and validator classifications for every child.
 
 For deeper diagnostics, the analyzer now records each sample’s latent vector and basic WL-subtree fingerprints, enabling richer post-hoc stats:
 
@@ -182,8 +181,6 @@ In practice, this means there are two crossover pathways: (1) standard crossover
 This balance ensures both **exploitation and exploration**: the population can refine known good solutions while still injecting radically new variations.
 
 ### Other explanations to incoporate (!!TODO)
-*Guided latent retries.* To keep promising latents alive, the decoder retains a non-empty graph seen during each child’s decode attempts if available and jitters subsequent retries around that anchor rather than restarting from the original latent.
-Empirically this turns “almost valid” intermediate graphs into stepping stones, increasing the likelihood that at least one decode per latent survives the structural filters (implementation: [`population.py:260-340`](population.py)).
 
 Immediately after the seed generation is evaluated, the self-compressing autoencoder (SCAE) undergoes a dedicated 100-epoch warm-up.
 
