@@ -117,6 +117,20 @@ class GuidedPopulation(Population):
         graph_latent_dim = 32
         num_node_types = 10
         self.task = RegressionTask.random_init()
+        self.validator_task = self._build_validator_task(config)
+        if self.validator_task is not None:
+            logger.info(
+                "Validator task configured: samples=%d inputs=%d outputs=%d",
+                getattr(self.validator_task, "num_samples", -1),
+                getattr(self.validator_task.train_data, "num_input_features", -1)
+                if hasattr(self.validator_task, "train_data")
+                else -1,
+                getattr(self.validator_task.train_data, "num_output_features", -1)
+                if hasattr(self.validator_task, "train_data")
+                else -1,
+            )
+        else:
+            logger.info("Validator task disabled; falling back to main task for optimizer checks")
         self.metric_keys = self._evaluation_metric_keys(self.task)
         self.metric_best_values = self._metric_best_values(self.metric_keys)
         self.metric_guidance_weights = self._metric_guidance_weights(self.metric_keys)
@@ -1263,6 +1277,32 @@ class GuidedPopulation(Population):
         data = Data(node_types=node_types, edge_index=edge_index, node_attributes=node_attributes)
         return data
 
+    def _build_validator_task(self, config):
+        enabled = getattr(config, "validator_task_enabled", True)
+        if not enabled:
+            return None
+        task_type = str(getattr(config, "validator_task_type", "regression")).lower()
+        if task_type not in {"regression", "regress"}:
+            return None
+        num_samples = max(8, int(getattr(config, "validator_task_num_samples", 64)))
+        true_dims = max(1, int(getattr(config, "validator_task_true_dims", 2)))
+        observed_dims = max(1, int(getattr(config, "validator_task_observed_dims", 2)))
+        train_ratio = float(getattr(config, "validator_task_train_ratio", 0.8))
+        train_ratio = min(max(train_ratio, 0.1), 0.9)
+        try:
+            task = RegressionTask(
+                true_dims=true_dims,
+                observed_dims=observed_dims,
+                metrics=[MSELoss()],
+                num_samples=num_samples,
+                train_ratio=train_ratio,
+                silent=True,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            warn(f"Failed to initialize validator task: {exc}; falling back to main task")
+            return None
+        return task
+
     def _graph_dict_would_be_inactive(self, graph_dict: dict | None, *, key: int) -> bool:
         if not graph_dict:
             return False
@@ -1276,7 +1316,7 @@ class GuidedPopulation(Population):
         optimizer = rebuild_and_script(graph_dict, genome_config, key=key, genome=genome)
         if optimizer is None:
             return False
-        return not self._optimizer_updates_parameters(optimizer, check_steps=2)
+        return not self._optimizer_updates_parameters(optimizer, check_steps=2, task=self.validator_task)
 
     def _minimum_required_node_count(self) -> int:
         config = getattr(self.config, "genome_config", None)
@@ -1834,6 +1874,7 @@ class GuidedPopulation(Population):
         last_valid_graph_dict = None
         track_latents = self.guided_structure_buffer > 0
         latent_valid_flags = [False] * total_requested if track_latents else None
+        inactive_probe_start = self._inactive_repair_probes_used
 
         abort_due_to_decoder_cap = False
         species_key = getattr(starting_genomes[0], "species_key", None) if starting_genomes else None
@@ -1894,6 +1935,7 @@ class GuidedPopulation(Population):
                 graph_signature = graph_signature_from_dict(graph_dict)
                 if graph_signature:
                     seen_graph_signatures.add(graph_signature)
+                new_genomes.append(genome)
                 # Treat decoder-capacity violations as failed offspring so NEAT
                 # reproduction can backfill with fresh children instead of
                 # keeping hopeless penalty genomes around.
@@ -2098,7 +2140,7 @@ class GuidedPopulation(Population):
 
             optimizer = rebuild_and_script(graph_dict, self.config.genome_config, key=i, genome=genome)
             if optimizer:
-                if not self._optimizer_updates_parameters(optimizer, check_steps=2):
+                if not self._optimizer_updates_parameters(optimizer, check_steps=2, task=self.validator_task):
                     inactive_optimizer_count += 1
                     warn("Guided offspring optimizer failed to modify model parameters; assigning penalty fitness.")
                     self._maybe_visualize_guided_invalid_graph(
@@ -2232,6 +2274,8 @@ class GuidedPopulation(Population):
                 final_invalid_counts[reason] += 1
         effective_invalid_counts = final_invalid_counts or invalid_reason_counts
 
+        inactive_probe_used = max(0, self._inactive_repair_probes_used - inactive_probe_start)
+
         self._accumulate_guided_offspring_stats(
             total_requested,
             len(deduped_genomes),
@@ -2245,6 +2289,7 @@ class GuidedPopulation(Population):
             inactive_details=inactive_detail_samples,
             inactive_repair_salvaged=inactive_repair_salvaged,
             inactive_repair_buffered=inactive_repair_samples_buffered,
+            inactive_repair_probe_used=inactive_probe_used,
             validator_failures=inactive_optimizer_count,
         )
         return deduped_genomes
@@ -2842,11 +2887,13 @@ class GuidedPopulation(Population):
             graph_dict.pop("_repair_applied", None)
         return repaired
 
-    def _optimizer_updates_parameters(self, optimizer, check_steps=2, delta_eps=1e-12):
+    def _optimizer_updates_parameters(self, optimizer, check_steps=2, delta_eps=1e-12, task=None):
         """Run a short dry-run to ensure the optimizer changes model weights."""
 
+        task = task or self.validator_task or self.task
+
         try:
-            model = ManyLossMinimaModel(self.task.train_data.num_input_features)
+            model = ManyLossMinimaModel(task.train_data.num_input_features)
         except Exception:
             return True
 
@@ -2896,7 +2943,7 @@ class GuidedPopulation(Population):
         with log_timing(logger, "Optimizer validation (fast diff)", log_on_start=True) as timing:
             named_params = list(model.named_parameters())
             baseline = _capture_baseline(named_params)
-            metrics = self.task.evaluate_metrics(model, self.task.train_data)
+            metrics = task.evaluate_metrics(model, task.train_data)
             if torch.isfinite(metrics).all():
                 prev = torch.zeros_like(metrics)
                 updated_state = _run_optimizer_once(named_params, metrics, prev)
@@ -2920,12 +2967,14 @@ class GuidedPopulation(Population):
             named_params = list(model.named_parameters())
             baseline = _capture_baseline(named_params)
             for _ in range(max(1, check_steps)):
-                metrics = self.task.evaluate_metrics(model, self.task.train_data)
+                metrics = task.evaluate_metrics(model, task.train_data)
                 if not torch.isfinite(metrics).all():
+                    # Bail out before incrementing slow_steps so the log shows steps=0; caller can inspect metrics.
                     break
                 prev = torch.zeros_like(metrics) if prev_metrics is None else prev_metrics
                 updated_state = _run_optimizer_once(named_params, metrics, prev)
                 if updated_state is None:
+                    # Optimizer threw or returned None, so we never register a slow_step and the log reports steps=0.
                     break
                 state_dict = self._normalize_state_dict(updated_state, named_params)
                 total_delta = _state_delta(state_dict, baseline)
