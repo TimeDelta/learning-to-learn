@@ -701,12 +701,15 @@ def _log_trainer_history_artifacts(run_manager, history):
     history = sorted(history, key=lambda item: item.get("step", 0))
     loss_names = sorted({name for entry in history for name in entry.get("loss_terms", {}).keys()})
     metric_loss_names = sorted({name for entry in history for name in entry.get("per_metric_losses", {}).keys()})
+    include_attr_mismatch = any(entry.get("attr_type_mismatch_skips") is not None for entry in history)
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_path = Path(tmpdir)
         csv_path = tmp_path / "trainer_losses.csv"
         header = ["step", "generation", "epoch", "total_loss"]
         header.extend([f"loss_{name}" for name in loss_names])
         header.extend([f"metric_loss_{name}" for name in metric_loss_names])
+        if include_attr_mismatch:
+            header.append("attr_type_mismatch_skips")
         with open(csv_path, "w", newline="", encoding="utf-8") as csv_file:
             writer = csv.writer(csv_file)
             writer.writerow(header)
@@ -721,6 +724,8 @@ def _log_trainer_history_artifacts(run_manager, history):
                     row.append(entry.get("loss_terms", {}).get(name))
                 for name in metric_loss_names:
                     row.append(entry.get("per_metric_losses", {}).get(name))
+                if include_attr_mismatch:
+                    row.append(entry.get("attr_type_mismatch_skips"))
                 writer.writerow(row)
         run_manager.log_artifact(str(csv_path))
 
@@ -977,6 +982,7 @@ if __name__ == "__main__":
                     )
                     step = next(trainer_step_counter)
                     trainer_last_step["value"] = step
+                    attr_mismatch = kwargs.get("attr_type_mismatch_skips")
                     metrics = {
                         "trainer_generation": generation,
                         "trainer_epoch": epoch,
@@ -988,6 +994,8 @@ if __name__ == "__main__":
                     metrics.update({f"trainer_loss_{name}": value for name, value in loss_terms.items()})
                     for idx, name in enumerate(available_modules):
                         metrics[f"trainer_module_active_{name}"] = 1 if name in active_modules else 0
+                    if attr_mismatch is not None:
+                        metrics["trainer_attr_type_mismatch_skips"] = attr_mismatch
                     clean_metrics = {k: v for k, v in metrics.items() if v is not None}
                     if clean_metrics:
                         mlflow_run.log_metrics(clean_metrics, step=step)
@@ -1006,6 +1014,8 @@ if __name__ == "__main__":
                     log_line = f"{epoch_header}, Loss terms per batch: [{loss_str}] (total={total_loss:.4f})"
                     if active_modules:
                         log_line += f" | active_modules={','.join(active_modules)}"
+                    if attr_mismatch is not None:
+                        log_line += f" | attr_type_mismatch_skips={attr_mismatch}"
                     mlflow_run.append_log_line(log_line)
                     mlflow_run.flush_log()
 
@@ -1201,6 +1211,7 @@ if __name__ == "__main__":
                 active_label = kwargs.get("active_modules_label")
                 step = next(trainer_step_counter)
                 trainer_last_step["value"] = step
+                attr_mismatch = kwargs.get("attr_type_mismatch_skips")
                 metrics = {
                     "trainer_total_loss": total_loss,
                     "trainer_epoch": epoch,
@@ -1212,6 +1223,8 @@ if __name__ == "__main__":
                     for module_name in available_modules:
                         metrics[f"trainer_module_active_{module_name}"] = 1 if module_name in active_modules else 0
                 metrics.update({f"trainer_{name}": value for name, value in loss_terms.items()})
+                if attr_mismatch is not None:
+                    metrics["trainer_attr_type_mismatch_skips"] = attr_mismatch
                 filtered_metrics = {k: v for k, v in metrics.items() if v is not None}
                 if filtered_metrics:
                     mlflow_run.log_metrics(filtered_metrics, step=step)
@@ -1230,6 +1243,8 @@ if __name__ == "__main__":
                 log_line = f"{epoch_header}, Loss terms per batch: [{loss_str}] (total={total_loss:.4f})"
                 if active_label:
                     log_line += f" | active_modules={active_label}"
+                if attr_mismatch is not None:
+                    log_line += f" | attr_type_mismatch_skips={attr_mismatch}"
                 mlflow_run.append_log_line(log_line)
                 mlflow_run.flush_log()
                 trainer_metrics_history.append(
@@ -1240,6 +1255,7 @@ if __name__ == "__main__":
                         "total_loss": total_loss,
                         "loss_terms": loss_terms,
                         "per_metric_losses": per_metric_losses,
+                        "attr_type_mismatch_skips": attr_mismatch,
                     }
                 )
 

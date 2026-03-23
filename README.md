@@ -135,6 +135,7 @@ Each phase is a `+`-delimited set of module aliases drawn from `{encoder, decode
 Example: `trainer_freeze_cycle = decoder,encoder+fitness,icnn,all` spends one epoch on decoder-only updates, the next on encoder+predictor, the third on the convex ICNN head, and the fourth on a full joint update before repeating.
 - `trainer_freeze_verbose = true` prints the active phase whenever it changes so you can correlate empty-graph spikes with a specific training slice.
 These phases are also logged to MLflow via the `trainer_module_active_*` metrics and the `active_modules=...` suffix in trainer log lines.
+- `trainer_attr_type_mismatch_skips` tracks how many nodes in that epoch skipped teacher-forced attribute/name/value supervision because the decoder predicted the wrong node type compared to the teacher graph’s `node_types`. When this value spikes, the attr-name RNN is being asked to learn for nodes whose op kind is already incorrect, so the trainer withholds the loss to avoid corrupting the schema-specific vocab; lowering it indicates the decoder is matching operator kinds before emitting attributes.
 
 Leaving the cycle unset defaults to a balanced round-robin across whatever modules exist in the current guide.
 The teacher-forcing refresh temporarily unfreezes all heads so the auxiliary rehearsal can update the entire stack regardless of the main-cycle state.
@@ -225,6 +226,7 @@ When MLflow is enabled, the run logs population best/mean/worst fitnesses, speci
 - OnlineTrainer epoch summaries (adjacency/attribute reconstruction, KL terms, fitness loss, and totals) so the `Epoch … Loss terms per batch` lines end up in the MLflow run as metrics + `logs/progress.log` text.
 - Per-metric fitness predictor losses (`trainer_metric_<metric_name>` metrics plus the CSV/HTML artifacts) so you can see which task objectives dominate each epoch.
 - Guided offspring production stats (`guided_children_*` metrics for requested/created totals and invalid counts per reason) logged once per generation alongside your trainer curves.
+- Attribute supervision health via `trainer_attr_type_mismatch_skips`: this MLflow metric (and the column in `trainer_losses.csv`) counts nodes whose teacher-forced attr loss was skipped because their predicted node type didn’t match the teacher graph. Sustained high values mean the decoder is generating the wrong operator kinds, so attribute CE/value losses are being withheld; once the count drops to near-zero, you know attr supervision is reaching almost every node again.
 - Genetic-distance statistics, compatibility-threshold changes, and a per-generation species table (same columns as the NEAT stdout reporter) under `species/generation_*.json`.
 
 This mirrors what shows up in stdout while giving you a permanent experiment record.

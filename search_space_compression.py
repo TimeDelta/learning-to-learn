@@ -2770,6 +2770,7 @@ class OnlineTrainer:
             active_label = "+".join(active_modules)
             self._apply_module_freeze(active_modules, reason=f"epoch_{self._kl_global_epoch}")
             current_kl_weight = self._resolve_kl_weight(kl_weight)
+            epoch_attr_type_mismatch = 0
             for batch_idx, batch in enumerate(loader, start=1):
                 batch_timer = time.perf_counter() if DEBUG_TRAINER else None
                 batch = batch.to(self.device)
@@ -2816,6 +2817,8 @@ class OnlineTrainer:
                     teacher_node_types=teacher_node_types,
                     num_graphs=batch.num_graphs,
                 )
+                if decoder_aux is not None:
+                    epoch_attr_type_mismatch += int(decoder_aux.get("attr_type_mismatch_skips", 0) or 0)
                 target_y = batch.y
 
                 # --- 2) reconstruction losses ---
@@ -2953,6 +2956,7 @@ class OnlineTrainer:
                     active_modules=tuple(active_modules),
                     active_modules_label=active_label,
                     available_modules=self._module_order,
+                    attr_type_mismatch_skips=int(epoch_attr_type_mismatch),
                 )
 
             if verbose:
@@ -2960,6 +2964,7 @@ class OnlineTrainer:
                     f"{name}={value:.4g}" for name, value in zip(loss_term_labels, avg_loss_terms.tolist())
                 )
                 label_str = f"{label_str}, kl_beta={current_kl_weight:.4g}, active={active_label}"
+                label_str += f", attr_type_mismatch_skips={epoch_attr_type_mismatch}"
                 if not epochs:
                     print(f"Epoch {epoch}, Loss terms per batch: [{label_str}] (total={total_loss:.4f})")
                 else:
@@ -3054,6 +3059,7 @@ class OnlineTrainer:
             epoch_adj = 0.0
             epoch_feat = 0.0
             batches = 0
+            epoch_attr_type_mismatch = 0
             for batch in loader:
                 batch = batch.to(self.device)
                 self.optimizer.zero_grad()
@@ -3087,6 +3093,8 @@ class OnlineTrainer:
                     teacher_node_types=teacher_node_types,
                     num_graphs=batch.num_graphs,
                 )
+                if decoder_aux is not None:
+                    epoch_attr_type_mismatch += int(decoder_aux.get("attr_type_mismatch_skips", 0) or 0)
                 loss_adj, loss_feat = self._compute_reconstruction_losses(
                     batch,
                     decoded_graphs,
@@ -3105,7 +3113,15 @@ class OnlineTrainer:
             avg_adj = epoch_adj / max(1, batches)
             avg_feat = epoch_feat / max(1, batches)
             if verbose:
-                print(f"Teacher force epoch {epoch}/{epochs}: adj_loss={avg_adj:.4f} attr_loss={avg_feat:.4f}")
+                print(
+                    "Teacher force epoch {}/{}: adj_loss={:.4f} attr_loss={:.4f} attr_type_mismatch_skips={}".format(
+                        epoch,
+                        epochs,
+                        avg_adj,
+                        avg_feat,
+                        epoch_attr_type_mismatch,
+                    )
+                )
             if self.progress_callback is not None:
                 self.progress_callback(
                     generation=generation,
@@ -3115,6 +3131,7 @@ class OnlineTrainer:
                     loss_terms={"decoder_adj": avg_adj, "decoder_attr": avg_feat},
                     per_metric_losses={},
                     kl_beta=0.0,
+                    attr_type_mismatch_skips=int(epoch_attr_type_mismatch),
                 )
 
     def resize_bottleneck(self):
