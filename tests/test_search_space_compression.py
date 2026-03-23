@@ -255,6 +255,22 @@ def test_graph_decoder_marks_max_nodes_hit():
     assert graph.get("_decoder_max_nodes") == 0
 
 
+def test_graph_decoder_soft_stop_reduces_continue_probability():
+    vocab = SharedAttributeVocab([], embedding_dim=4)
+    decoder = GraphDecoder(num_node_types=3, latent_dim=8, shared_attr_vocab=vocab, hidden_dim=4)
+    decoder.max_nodes = 10
+    decoder.node_stop_decay_start_ratio = 0.6
+    decoder.node_stop_decay_margin = 0
+    decoder.node_stop_decay_min = 0.1
+
+    baseline = torch.full((1, 1), 0.8)
+    early = decoder._apply_node_continue_decay(baseline.clone(), emitted_nodes=2, minimum_required_nodes=1)
+    assert torch.allclose(early, baseline)
+
+    near_cap = decoder._apply_node_continue_decay(baseline.clone(), emitted_nodes=9, minimum_required_nodes=1)
+    assert decoder.node_stop_decay_min <= near_cap.item() < baseline.item()
+
+
 def test_graph_decoder_enforces_min_pin_nodes():
     vocab = SharedAttributeVocab([], embedding_dim=4)
     decoder = GraphDecoder(

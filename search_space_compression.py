@@ -928,6 +928,10 @@ class GraphDecoder(nn.Module):
         self.attr_eos_bias_base = 0.0
         self.attr_eos_bias_slope = 0.1
         self._min_required_nodes = self._base_required_node_count
+        # Soft-stop controls to avoid hammering the hard max_nodes cap.
+        self.node_stop_decay_start_ratio = 0.85  # begin decaying continue prob after ~85% of the budget
+        self.node_stop_decay_margin = 16  # ensure a small grace window even for tiny budgets
+        self.node_stop_decay_min = 0.02  # never drive continue prob fully to zero so the sampler can explore
 
     def _resolved_required_input_slots(self) -> int:
         configured = 1
@@ -941,6 +945,33 @@ class GraphDecoder(nn.Module):
         except (TypeError, ValueError):
             fallback = 1
         return max(configured, fallback)
+
+    def _apply_node_continue_decay(
+        self,
+        continue_prob: torch.Tensor,
+        emitted_nodes: int,
+        minimum_required_nodes: int,
+    ) -> torch.Tensor:
+        """Gently reduce sampling probability as the node budget is consumed."""
+        if self.max_nodes <= 0:
+            return continue_prob
+        # Start decaying once we have emitted most of the allowed nodes but always obey the minimum.
+        decay_start = int(self.max_nodes * self.node_stop_decay_start_ratio)
+        decay_start = max(minimum_required_nodes, decay_start - self.node_stop_decay_margin)
+        decay_start = min(decay_start, self.max_nodes)
+        if emitted_nodes < decay_start:
+            return continue_prob
+        span = max(1, self.max_nodes - decay_start)
+        distance = max(0, emitted_nodes - decay_start + 1)
+        scale = 1.0 - (distance / span)
+        scale = float(max(self.node_stop_decay_min, min(1.0, scale)))
+        decay = continue_prob.new_full(continue_prob.shape, scale)
+        adjusted = continue_prob * decay
+        if self.node_stop_decay_min > 0:
+            adjusted = adjusted.clamp_(self.node_stop_decay_min, 1.0)
+        else:
+            adjusted = adjusted.clamp_(0.0, 1.0)
+        return adjusted
 
     def _emit_pin_debug_snapshot(self, node_attributes: List[Dict[str, Any]]) -> None:
         try:
@@ -1155,6 +1186,12 @@ class GraphDecoder(nn.Module):
                             else:
                                 if force_minimum_nodes:
                                     continue_prob = torch.ones_like(continue_prob)
+                                else:
+                                    continue_prob = self._apply_node_continue_decay(
+                                        continue_prob,
+                                        emitted_nodes=t,
+                                        minimum_required_nodes=minimum_required_nodes,
+                                    )
                                 if DEBUG_DECODER and decode_stats is not None:
                                     decode_stats["node_stop_samples"].append(float(continue_prob.item()))
                                 if torch.bernoulli(continue_prob).item() == 0:
