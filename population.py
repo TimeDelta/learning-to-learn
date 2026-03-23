@@ -189,6 +189,9 @@ class GuidedChildRecord:
     failure_reason: str | None = None
     pre_repair_outcome: ValidatorOutcome | None = None
     post_repair_outcome: ValidatorOutcome | None = None
+    attr_summary_decoded: Dict[str, Any] = field(default_factory=dict)
+    attr_summary_prepared: Dict[str, Any] = field(default_factory=dict)
+    attr_drift_summary: Dict[str, Any] = field(default_factory=dict)
 
     def as_row(self) -> Dict[str, Any]:
         row = {
@@ -217,6 +220,15 @@ class GuidedChildRecord:
             "failure_reason": self.failure_reason,
             "pre_repair_outcome": self.pre_repair_outcome.value if self.pre_repair_outcome else None,
             "post_repair_outcome": self.post_repair_outcome.value if self.post_repair_outcome else None,
+            "attr_summary_decoded": json.dumps(self.attr_summary_decoded, sort_keys=True)
+            if self.attr_summary_decoded
+            else None,
+            "attr_summary_prepared": json.dumps(self.attr_summary_prepared, sort_keys=True)
+            if self.attr_summary_prepared
+            else None,
+            "attr_drift_summary": json.dumps(self.attr_drift_summary, sort_keys=True)
+            if self.attr_drift_summary
+            else None,
         }
         return row
 
@@ -250,6 +262,140 @@ def _graph_node_edge_counts(graph_dict: dict | None) -> Tuple[int, int]:
     elif isinstance(edge_index, (list, tuple)) and edge_index:
         edge_count = len(edge_index[0]) if isinstance(edge_index[0], (list, tuple)) else len(edge_index)
     return max(0, node_count), max(0, edge_count)
+
+
+def _attr_value_to_int(value: Any) -> int | None:
+    if torch.is_tensor(value):
+        if value.numel() == 0:
+            return None
+        try:
+            return int(round(float(value.detach().cpu().view(-1)[0].item())))
+        except Exception:
+            return None
+    try:
+        return int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _attr_value_equal(a: Any, b: Any) -> bool:
+    if torch.is_tensor(a) and torch.is_tensor(b):
+        if a.shape != b.shape:
+            return False
+        return bool(torch.allclose(a, b, atol=1e-6, rtol=1e-5))
+    if torch.is_tensor(a) or torch.is_tensor(b):
+        return False
+    if isinstance(a, float) or isinstance(b, float):
+        try:
+            return abs(float(a) - float(b)) <= 1e-9
+        except (TypeError, ValueError):
+            return False
+    return a == b
+
+
+def _normalize_attr_dict(attrs: Any) -> Dict[str, Any]:
+    if not isinstance(attrs, dict):
+        return {}
+    normalized: Dict[str, Any] = {}
+    for key, value in attrs.items():
+        normalized[attribute_key_to_name(key)] = value
+    return normalized
+
+
+def _summarize_node_attributes(graph_dict: dict | None, top_k: int = 6) -> Dict[str, Any]:
+    if not graph_dict:
+        return {}
+    node_attrs = graph_dict.get("node_attributes") or []
+    if not isinstance(node_attrs, list):
+        node_attrs = list(node_attrs)
+    pin_roles: Counter = Counter()
+    attr_name_counts: Counter = Counter()
+    missing_roles = 0
+    slotless_roles = 0
+    block_refs: Set[int] = set()
+    total_nodes = len(node_attrs)
+    for attrs in node_attrs:
+        normalized = _normalize_attr_dict(attrs)
+        for attr_name in normalized.keys():
+            attr_name_counts[attr_name] += 1
+        for name, value in normalized.items():
+            if name.startswith(BLOCK_REF_ATTR_PREFIX):
+                block_id = _attr_value_to_int(value)
+                if block_id is not None:
+                    block_refs.add(block_id)
+        role = _normalize_pin_role(normalized.get("pin_role"))
+        if role is None and isinstance(normalized.get("node_type"), str):
+            role = _normalize_pin_role(normalized.get("node_type"))
+        if role is None:
+            missing_roles += 1
+        else:
+            pin_roles[role] += 1
+            slot = _attr_value_to_int(normalized.get("pin_slot_index"))
+            if slot is None:
+                slotless_roles += 1
+    summary = {
+        "total_nodes": total_nodes,
+        "pin_role_counts": dict(pin_roles),
+        "missing_pin_roles": missing_roles,
+        "slotless_pin_roles": slotless_roles,
+        "unique_block_refs": len(block_refs),
+        "attr_name_top": attr_name_counts.most_common(top_k),
+    }
+    return summary
+
+
+def _attribute_drift_summary(graph_dict: dict | None, top_k: int = 6) -> Dict[str, Any]:
+    if not graph_dict:
+        return {}
+    decoded = graph_dict.get(DECODED_GRAPH_DICT_KEY)
+    if not decoded or "node_attributes" not in decoded:
+        return {}
+    decoded_attrs = decoded.get("node_attributes") or []
+    current_attrs = graph_dict.get("node_attributes") or []
+    if not isinstance(decoded_attrs, list):
+        decoded_attrs = list(decoded_attrs)
+    if not isinstance(current_attrs, list):
+        current_attrs = list(current_attrs)
+    changed_nodes = 0
+    attr_added = 0
+    attr_removed = 0
+    pin_role_changes = 0
+    pin_slot_changes = 0
+    attr_changed_counts: Counter = Counter()
+    total = min(len(decoded_attrs), len(current_attrs))
+    for idx in range(total):
+        before = _normalize_attr_dict(decoded_attrs[idx])
+        after = _normalize_attr_dict(current_attrs[idx])
+        if before == after:
+            continue
+        changed_nodes += 1
+        before_keys = set(before.keys())
+        after_keys = set(after.keys())
+        added = after_keys - before_keys
+        removed = before_keys - after_keys
+        attr_added += len(added)
+        attr_removed += len(removed)
+        for key in added:
+            attr_changed_counts[key] += 1
+        for key in removed:
+            attr_changed_counts[key] += 1
+        for key in before_keys & after_keys:
+            if not _attr_value_equal(before[key], after[key]):
+                attr_changed_counts[key] += 1
+                if key == "pin_role":
+                    pin_role_changes += 1
+                if key == "pin_slot_index":
+                    pin_slot_changes += 1
+    summary = {
+        "total_nodes": total,
+        "changed_nodes": changed_nodes,
+        "attr_keys_added": attr_added,
+        "attr_keys_removed": attr_removed,
+        "pin_role_changes": pin_role_changes,
+        "pin_slot_changes": pin_slot_changes,
+        "attr_changes_top": attr_changed_counts.most_common(top_k),
+    }
+    return summary
 
 
 def _dump_invalid_reason_summary():
@@ -1988,7 +2134,7 @@ class GuidedPopulation(Population):
                 % (structure_penalty_mean, structure_penalty_last or 0.0, structure_penalty_steps)
             )
 
-        stats = []
+        child_graph_stats = []
         if self.guided_child_log_enabled:
             self._guided_child_records = []
         new_genomes = []
@@ -2134,6 +2280,12 @@ class GuidedPopulation(Population):
             if child_record:
                 child_record.prepared_node_count = prepared_node_count
                 child_record.prepared_edge_count = len(prepared_edges)
+            decoded_attr_summary = _summarize_node_attributes(graph_dict.get(DECODED_GRAPH_DICT_KEY))
+            prepared_attr_summary = _summarize_node_attributes(graph_dict)
+            if child_record:
+                child_record.attr_summary_decoded = decoded_attr_summary or {}
+                child_record.attr_summary_prepared = prepared_attr_summary or {}
+                child_record.attr_drift_summary = {}
             pre_repair_graph_dict = None
             pending_pre_repair_sample: dict | None = None
             probe_pre = child_record is not None and self._should_probe_repair_activity()
@@ -2150,6 +2302,7 @@ class GuidedPopulation(Population):
                 child_record.repair_applied = True
                 child_record.repair_added_nodes = post_repair_nodes - pre_repair_nodes
                 child_record.repair_added_edges = post_repair_edges - pre_repair_edges
+            stats = self._guided_offspring_stats
             post_probe_result = None
             probe_post = child_record is not None and self._should_probe_repair_activity()
             if probe_post:
@@ -2370,7 +2523,7 @@ class GuidedPopulation(Population):
                 if graph_signature:
                     seen_graph_signatures.add(graph_signature)
                 new_genomes.append(genome)
-                stats.append((i, num_edges, num_params))
+                child_graph_stats.append((i, num_edges, num_params))
                 continue
 
             rebuild_failures += 1
@@ -2411,8 +2564,10 @@ class GuidedPopulation(Population):
         if repair_failures:
             warn(f"Guided offspring repair hook could not rescue {repair_failures} decoded graphs.")
 
-        if stats:
-            sample = ", ".join(f"child {idx}: edges={edges}, params={params}" for idx, edges, params in stats[:10])
+        if child_graph_stats:
+            sample = ", ".join(
+                f"child {idx}: edges={edges}, params={params}" for idx, edges, params in child_graph_stats[:10]
+            )
             self.reporters.info(f"Guided offspring graph stats (first 10): {sample}")
 
         if repair_salvaged:
@@ -2424,7 +2579,7 @@ class GuidedPopulation(Population):
             self.reporters.info(
                 "Guided offspring summary: %d/%d survived (duplicates=%d, empty=%d, rebuild_failures=%d, inactive=%d)"
                 % (
-                    len(stats),
+                    len(child_graph_stats),
                     total_requested,
                     duplicate_count,
                     empty_graph_count,
