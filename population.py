@@ -25,6 +25,7 @@ from torch_geometric.data import Batch, Data
 from torch_geometric.loader import DataLoader
 
 from genes import (
+    ATTRIBUTE_NAMES,
     NODE_TYPE_OPTIONS,
     NODE_TYPE_TO_INDEX,
     node_type_index_from_name,
@@ -469,6 +470,7 @@ class GuidedPopulation(Population):
         block_value_cap = max(DEFAULT_BLOCK_PAYLOAD_VALUE_DIM, block_value_cap)
         self.attr_value_max_dim = block_value_cap
         self.shared_attr_vocab = SharedAttributeVocab([], 50)
+        self.shared_attr_vocab.set_allowed_names(ATTRIBUTE_NAMES)
         # Keep attribute-name embeddings high-dimensional (50d) while compressing the
         # DeepSet attribute summaries down to 20d per node before DAG attention.
         attr_encoder = NodeAttributeDeepSetEncoder(

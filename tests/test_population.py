@@ -21,7 +21,15 @@ from factories import make_neat_config
 
 import population as population_module
 from attributes import FloatAttribute, IntAttribute
-from genes import NODE_TYPE_TO_INDEX, ConnectionGene, NodeGene
+from genes import (
+    NODE_TYPE_TO_INDEX,
+    ConnectionGene,
+    NodeGene,
+    attribute_value_kind,
+    canonical_attribute_names_for_kind,
+    register_attribute_name,
+    register_schema_argument_names,
+)
 from genome import OptimizerGenome
 from graph_builder import rebuild_and_script
 from loop_blocks import prime_registry
@@ -45,6 +53,34 @@ from search_space_compression import (
     SharedAttributeVocab,
     flatten_task_features,
 )
+
+for _name in ("a", "b", "foo"):
+    register_attribute_name(None, _name)
+
+
+class _AttrRegistryGuard:
+    def __enter__(self):
+        import genes
+
+        self._names = set(genes.ATTRIBUTE_NAMES)
+        self._map = {kind: set(names) for kind, names in genes.ATTRIBUTE_NAMES_BY_KIND.items()}
+        self._version = genes.ATTRIBUTE_NAMES_VERSION
+        genes.ATTRIBUTE_NAMES.clear()
+        genes.ATTRIBUTE_NAMES_BY_KIND.clear()
+        genes.ATTRIBUTE_NAMES_VERSION = 0
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        import genes
+
+        genes.ATTRIBUTE_NAMES.clear()
+        genes.ATTRIBUTE_NAMES.update(self._names)
+        genes.ATTRIBUTE_NAMES_BY_KIND.clear()
+        for kind, names in self._map.items():
+            genes.ATTRIBUTE_NAMES_BY_KIND[kind] = set(names)
+        genes.ATTRIBUTE_NAMES_VERSION = self._version
+
+
 from tasks import RegressionTask
 
 
@@ -155,6 +191,22 @@ def create_simple_genome(key=0):
     genome.connections = {(0, 1): cg}
     genome.next_node_id = 2
     return genome
+
+
+def test_registers_schema_argument_names_for_aten_ops():
+    add = torch.jit.trace(lambda x, y: x + y, (torch.ones(1), torch.ones(1)))
+    with _AttrRegistryGuard():
+        target = None
+        for node in add.graph.nodes():
+            if node.kind() == "aten::add":
+                target = node
+                break
+        assert target is not None
+        register_schema_argument_names(target)
+        names = canonical_attribute_names_for_kind("aten::add")
+        assert {"self", "other"}.issubset(names)
+        kind = attribute_value_kind("aten::add", "self")
+        assert kind == "tensor"
 
 
 def make_decoded_graph(bias):

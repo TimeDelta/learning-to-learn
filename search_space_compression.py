@@ -11,7 +11,7 @@ import time
 from collections import Counter, deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Collection, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from warnings import warn
 
 import numpy as np
@@ -31,6 +31,12 @@ from torch_geometric.utils import (
     to_dense_batch,
 )
 
+from genes import (
+    ATTRIBUTE_NAMES_BY_KIND,
+    ATTRIBUTE_NAMES_VERSION,
+    NODE_TYPE_OPTIONS,
+    attribute_value_kind_for_index,
+)
 from metrics import canonical_log_distance, sort_metrics_by_name
 from tasks import TASK_FEATURE_DIMS, TASK_INDEX_TO_DIM, TASK_TYPE_TO_INDEX
 from utility import generate_random_string
@@ -58,6 +64,12 @@ LOG_ALPHA_MIN = -20.0
 LOG_ALPHA_MAX = 20.0
 LATENT_SAMPLE_CLAMP = 1_000.0
 LOSS_VALUE_CLAMP = 1_000_000.0
+
+METADATA_ATTRIBUTE_NAMES: Set[str] = {"pin_role", "pin_slot_index", "node_type"}
+
+
+def _is_metadata_attribute(name: Any) -> bool:
+    return isinstance(name, str) and name in METADATA_ATTRIBUTE_NAMES
 
 
 def _normalize_pin_role(value: Any) -> str | None:
@@ -295,22 +307,37 @@ class TasksEncoder(nn.Module):
         self.latent_dim = len(kept_idx)
 
 
+def _value_token(name: str) -> str:
+    return f"__value__{name}"
+
+
 class SharedAttributeVocab(nn.Module):
     """
     Holds one name-to-index mapping plus a single Embedding that
     can grow on‐the‐fly as new names are added.
     """
 
-    def __init__(self, initial_names: List[str], embedding_dim: int):
+    _SPECIAL_TOKENS = ("<UNK>", "<EOS>", "<SOS>")
+
+    def __init__(
+        self,
+        initial_names: List[str],
+        embedding_dim: int,
+        *,
+        allowed_names: Optional[Collection[str]] = None,
+    ):
         super().__init__()
         self.name_to_index = {name: i for i, name in enumerate(initial_names)}
         self.index_to_name = {i: name for name, i in self.name_to_index.items()}
-        for token in ("<UNK>", "<EOS>", "<SOS>"):
+        for token in self._SPECIAL_TOKENS:
             if token not in self.name_to_index:
                 idx = len(self.name_to_index)
                 self.name_to_index[token] = idx
                 self.index_to_name[idx] = token
         self.embedding = nn.Embedding(len(self.name_to_index), embedding_dim)
+        self._allowed_names: Optional[Collection[str]] = None
+        if allowed_names is not None:
+            self.set_allowed_names(allowed_names)
 
     @property
     def unk_index(self) -> int:
@@ -324,8 +351,36 @@ class SharedAttributeVocab(nn.Module):
     def sos_index(self) -> int:
         return self.name_to_index["<SOS>"]
 
+    def set_allowed_names(self, allowed_names: Optional[Collection[str]]) -> None:
+        """Restrict future vocabulary growth to canonical attribute names."""
+        self._allowed_names = allowed_names
+        if allowed_names is None:
+            return
+        # Validate any previously added attributes (special tokens are always allowed).
+        for name in self.name_to_index:
+            self._ensure_allowed(name)
+
+    def _ensure_allowed(self, name: str) -> None:
+        if name in self._SPECIAL_TOKENS or self._allowed_names is None:
+            return
+        if _is_metadata_attribute(name):
+            return
+        if isinstance(name, str) and name.startswith("__"):
+            return
+        if name in self._allowed_names:
+            return
+        raise ValueError(
+            f"Attribute name '{name}' is not part of the canonical attribute set; "
+            "update ATTRIBUTE_NAMES or relax the restriction before adding it."
+        )
+
     def add_names(self, new_names: List[str]):
-        names_to_add = [name for name in new_names if name not in self.name_to_index]
+        names_to_add: List[str] = []
+        for name in new_names:
+            if name in self.name_to_index:
+                continue
+            self._ensure_allowed(name)
+            names_to_add.append(name)
 
         if not names_to_add:
             return
@@ -492,13 +547,35 @@ def group_node_attributes(node_attrs: Sequence[Any], batch_vec: Optional[torch.T
     return node_attrs
 
 
+def group_node_types(node_types: torch.Tensor, batch_vec: Optional[torch.Tensor]) -> List[torch.Tensor]:
+    if node_types is None:
+        return []
+    if batch_vec is None or batch_vec.numel() == 0:
+        return [node_types]
+    per_graph: List[torch.Tensor] = []
+    cursor = 0
+    batch_vec = batch_vec.view(-1)
+    max_graph = int(batch_vec.max().item()) + 1 if batch_vec.numel() > 0 else 0
+    for graph_index in range(max_graph):
+        mask = batch_vec == graph_index
+        count = int(mask.sum().item())
+        if count == 0:
+            per_graph.append(node_types.new_empty(0))
+            continue
+        per_graph.append(node_types[cursor : cursor + count])
+        cursor += count
+    if cursor < node_types.numel():
+        per_graph.append(node_types[cursor:])
+    return per_graph
+
+
 def _sorted_attribute_items(attr_dict: dict | None) -> List[tuple[str, Any]]:
     if not attr_dict:
         return []
     items: List[tuple[str, Any]] = []
     for key, value in attr_dict.items():
         name = attribute_key_to_name(key)
-        if name in {"pin_role", "pin_slot_index"}:
+        if _is_metadata_attribute(name):
             continue
         items.append((name, value))
     items.sort(key=lambda item: item[0])
@@ -542,7 +619,7 @@ def build_teacher_attr_value_targets(
         elif isinstance(value, (int, float, bool)):
             tensor = torch.tensor([float(value)], dtype=torch.float32)
         elif isinstance(value, str):
-            index = shared_vocab.ensure_index(value)
+            index = shared_vocab.ensure_index(_value_token(value))
             tensor = shared_vocab.embedding.weight.detach().cpu()[index].view(-1).float()
         else:
             tensor = torch.zeros(1, dtype=torch.float32)
@@ -627,7 +704,7 @@ class NodeAttributeDeepSetEncoder(nn.Module):
         if isinstance(value, (int, float)):
             value = torch.tensor([value], dtype=torch.float)
         elif isinstance(value, str):
-            index = self.shared_attr_vocab.ensure_index(value)
+            index = self.shared_attr_vocab.ensure_index(_value_token(value))
             index = torch.tensor(index, dtype=torch.long, device=self.shared_attr_vocab.embedding.weight.device)
             value = self.shared_attr_vocab.embedding(index)
         elif isinstance(value, torch.Tensor):
@@ -653,7 +730,7 @@ class NodeAttributeDeepSetEncoder(nn.Module):
             attr_dict.items(), key=lambda item: attribute_key_to_name(item[0])
         ):  # consistent ordering
             attr_name = attribute_key_to_name(attr)
-            if attr_name == "pin_role":
+            if _is_metadata_attribute(attr_name):
                 continue
             attr_name = attribute_key_to_name(attr)
             name_idx = self.shared_attr_vocab.ensure_index(attr_name)
@@ -932,6 +1009,12 @@ class GraphDecoder(nn.Module):
         self.node_stop_decay_start_ratio = 0.85  # begin decaying continue prob after ~85% of the budget
         self.node_stop_decay_margin = 16  # ensure a small grace window even for tiny budgets
         self.node_stop_decay_min = 0.02  # never drive continue prob fully to zero so the sampler can explore
+        self._attr_name_indices_cache: Dict[int, Dict[str, Any]] = {}
+        self._attr_name_cache_version = -1
+        self._metadata_index_cache: Optional[torch.Tensor] = None
+        self._metadata_index_set: Set[int] = set()
+        self._metadata_index_vocab_size = -1
+        self._eos_index_cache: Optional[torch.Tensor] = None
 
     def _resolved_required_input_slots(self) -> int:
         configured = 1
@@ -945,6 +1028,122 @@ class GraphDecoder(nn.Module):
         except (TypeError, ValueError):
             fallback = 1
         return max(configured, fallback)
+
+    def _eos_index_tensor(self, device: torch.device) -> torch.Tensor:
+        cache = self._eos_index_cache
+        if cache is None or cache.device != device:
+            cache = torch.tensor([self.attr_eos_index], dtype=torch.long, device=device)
+            self._eos_index_cache = cache
+        return cache
+
+    def _refresh_metadata_index_cache(self) -> None:
+        vocab_size = self.shared_attr_vocab.embedding.num_embeddings
+        if self._metadata_index_cache is not None and self._metadata_index_vocab_size == vocab_size:
+            return
+        indices = [
+            idx
+            for name, idx in self.shared_attr_vocab.name_to_index.items()
+            if isinstance(name, str) and name.startswith("__")
+        ]
+        if indices:
+            tensor = torch.tensor(sorted(set(indices)), dtype=torch.long)
+        else:
+            tensor = torch.empty(0, dtype=torch.long)
+        self._metadata_index_cache = tensor
+        self._metadata_index_set = set(indices)
+        self._metadata_index_vocab_size = vocab_size
+
+    def _metadata_index_tensor(self, device: torch.device) -> torch.Tensor:
+        self._refresh_metadata_index_cache()
+        return self._metadata_index_cache.to(device)
+
+    def _attr_name_cache_entry(self, node_type_idx: int) -> Dict[str, Any]:
+        if self._attr_name_cache_version != ATTRIBUTE_NAMES_VERSION:
+            self._attr_name_indices_cache.clear()
+            self._attr_name_cache_version = ATTRIBUTE_NAMES_VERSION
+        entry = self._attr_name_indices_cache.get(node_type_idx)
+        if entry is not None:
+            return entry
+        type_name: Optional[str]
+        if 0 <= node_type_idx < len(NODE_TYPE_OPTIONS):
+            type_name = NODE_TYPE_OPTIONS[node_type_idx]
+        else:
+            type_name = None
+        canonical_names = ATTRIBUTE_NAMES_BY_KIND.get(type_name, set()) if type_name else set()
+        indices: List[int] = []
+        for name in sorted(canonical_names):
+            idx = self.shared_attr_vocab.name_to_index.get(name)
+            if idx is None:
+                continue
+            indices.append(idx)
+        tensor = torch.tensor(indices, dtype=torch.long) if indices else torch.empty(0, dtype=torch.long)
+        entry = {"tensor": tensor, "set": set(indices)}
+        self._attr_name_indices_cache[node_type_idx] = entry
+        return entry
+
+    def _attribute_name_indices_for_type(self, node_type_idx: int, device: torch.device) -> torch.Tensor:
+        entry = self._attr_name_cache_entry(node_type_idx)
+        tensors: List[torch.Tensor] = [self._eos_index_tensor(device)]
+        base = entry["tensor"]
+        if base.numel():
+            tensors.append(base.to(device))
+        metadata = self._metadata_index_tensor(device)
+        if metadata.numel():
+            tensors.append(metadata)
+        if len(tensors) == 1:
+            return tensors[0]
+        return torch.unique(torch.cat(tensors, dim=0))
+
+    def _is_metadata_index(self, name_index: int) -> bool:
+        self._refresh_metadata_index_cache()
+        return name_index in self._metadata_index_set
+
+    def _is_name_allowed_for_type(self, node_type_idx: int, name_index: int) -> bool:
+        if name_index == self.attr_eos_index:
+            return True
+        entry = self._attr_name_cache_entry(node_type_idx)
+        if name_index in entry["set"]:
+            return True
+        return self._is_metadata_index(name_index)
+
+    def _mask_logits_for_type(self, node_type_idx: int, logits: torch.Tensor) -> torch.Tensor:
+        allowed = self._attribute_name_indices_for_type(node_type_idx, logits.device)
+        if allowed.numel() == logits.numel():
+            return logits
+        mask = torch.ones_like(logits, dtype=torch.bool)
+        mask[allowed] = False
+        return logits.masked_fill(mask, -1e4)
+
+    def _scalar_from_tensor(self, tensor: torch.Tensor) -> float:
+        if tensor.numel() == 0:
+            return 0.0
+        return float(tensor.reshape(-1)[0].item())
+
+    def _materialize_attribute_value(self, raw_values, expected_kind: Optional[str]):
+        if not raw_values:
+            return None
+        if not expected_kind or expected_kind.startswith("tensor"):
+            tensors = [v.detach().clone() for v in raw_values]
+            return torch.stack(tensors)
+        if expected_kind.startswith("list[") and expected_kind.endswith("]"):
+            inner = expected_kind[len("list[") : -1]
+            values = []
+            for tensor in raw_values:
+                value = self._materialize_attribute_value([tensor], inner or None)
+                if value is None:
+                    return None
+                values.append(value)
+            return values
+        scalar = self._scalar_from_tensor(raw_values[0])
+        if expected_kind == "int":
+            return int(round(scalar))
+        if expected_kind in {"float", "scalar"}:
+            return float(scalar)
+        if expected_kind == "bool":
+            return bool(scalar >= 0.5)
+        if expected_kind == "string":
+            return None  # string synthesis unsupported
+        return torch.stack([v.detach().clone() for v in raw_values])
 
     def _apply_node_continue_decay(
         self,
@@ -1049,6 +1248,7 @@ class GraphDecoder(nn.Module):
         teacher_attr_targets: Optional[List[List[List[int]]]] = None,
         teacher_adj_targets: Optional[List[Optional[torch.Tensor]]] = None,
         teacher_attr_value_targets: Optional[List[List[List[torch.Tensor]]]] = None,
+        teacher_node_types: Optional[List[torch.Tensor]] = None,
     ):
         """
         (num_graphs, latent_dim)
@@ -1067,6 +1267,7 @@ class GraphDecoder(nn.Module):
             attr_value_teacher_tokens = 0
             attr_dim_teacher_loss = latent.new_tensor(0.0)
             attr_dim_teacher_tokens = 0
+            attr_type_mismatch_skips = 0
             node_teacher_loss = latent.new_tensor(0.0)
             node_teacher_tokens = 0
             edge_teacher_loss = latent.new_tensor(0.0)
@@ -1107,6 +1308,9 @@ class GraphDecoder(nn.Module):
                     graph_value_targets = None
                     if teacher_attr_value_targets is not None and l < len(teacher_attr_value_targets):
                         graph_value_targets = teacher_attr_value_targets[l]
+                    graph_teacher_node_types = None
+                    if teacher_node_types is not None and l < len(teacher_node_types):
+                        graph_teacher_node_types = teacher_node_types[l]
                     graph_adj_target = None
                     if teacher_adj_targets is not None and l < len(teacher_adj_targets):
                         graph_adj_target = teacher_adj_targets[l]
@@ -1392,6 +1596,7 @@ class GraphDecoder(nn.Module):
                     attrs["pin_role"] = order_role
                 if order_slot is not None:
                     attrs["pin_slot_index"] = order_slot
+                node_type_idx = int(node_types[node_idx]) if node_idx < len(node_types) else -1
                 name_hidden = embedding.unsqueeze(0).unsqueeze(0)
                 val_hidden = None
                 t = 0
@@ -1405,13 +1610,27 @@ class GraphDecoder(nn.Module):
                     node_teacher_targets = graph_teacher_targets[node_idx] or None
                 if graph_value_targets is not None and node_idx < len(graph_value_targets):
                     node_value_targets = graph_value_targets[node_idx] or None
+                teacher_type_idx = None
+                type_matches_teacher = True
+                if graph_teacher_node_types is not None and len(graph_teacher_node_types) > 0:
+                    if node_idx < len(graph_teacher_node_types):
+                        teacher_entry = graph_teacher_node_types[node_idx]
+                        if isinstance(teacher_entry, torch.Tensor):
+                            teacher_type_idx = int(teacher_entry.item())
+                        else:
+                            teacher_type_idx = int(teacher_entry)
+                        type_matches_teacher = teacher_type_idx == node_type_idx
+                if not type_matches_teacher:
+                    node_teacher_targets = None
+                    node_value_targets = None
+                    attr_type_mismatch_skips += 1
 
                 def project_name_logits(name_out: torch.Tensor) -> torch.Tensor:
                     return self.attr_name_head(name_out).reshape(-1)
 
                 def add_attribute(name_index: int, name: str, target_value: Optional[torch.Tensor] = None):
                     nonlocal t, attr_value_teacher_loss, attr_value_teacher_tokens, attr_dim_teacher_loss, attr_dim_teacher_tokens
-                    if name in ("pin_role", "pin_slot_index"):
+                    if _is_metadata_attribute(name):
                         return False
                     raw_dim = self.attr_dims_head(embedding).squeeze()
                     raw_dim = torch.nan_to_num(raw_dim, nan=0.0, posinf=20.0, neginf=-20.0)
@@ -1461,7 +1680,11 @@ class GraphDecoder(nn.Module):
                     if name in attrs:
                         warn(name + " is already defined for currently decoding node")
                         return False
-                    attrs[name] = torch.stack(values)
+                    expected_kind = attribute_value_kind_for_index(node_type_idx, name)
+                    materialized = self._materialize_attribute_value(values, expected_kind)
+                    if materialized is None:
+                        return False
+                    attrs[name] = materialized
                     t += 1
                     used_name_indices.add(name_index)
                     if DEBUG_DECODER and (t % 25 == 0):
@@ -1513,6 +1736,7 @@ class GraphDecoder(nn.Module):
                                 self.shared_attr_vocab.embedding.weight,
                                 project_name_logits(name_out),
                             )
+                            similarity_logits = self._mask_logits_for_type(node_type_idx, similarity_logits)
                             if DEBUG_DECODER:
                                 top_logit, top_idx = torch.max(similarity_logits, dim=0)
                                 last_attr_logits = (
@@ -1532,16 +1756,16 @@ class GraphDecoder(nn.Module):
                             prev_token_idx = target_idx
                             if target_idx == self.attr_eos_index:
                                 break
+                            if not self._is_name_allowed_for_type(node_type_idx, target_idx):
+                                continue
                             name = self.shared_attr_vocab.index_to_name.get(target_idx)
                             if name is None:
-                                name = generate_random_string(8)
-                                target_idx = self.shared_attr_vocab.ensure_index(name)
+                                continue
                             target_tensor = None
                             if node_value_targets and value_target_idx < len(node_value_targets):
                                 target_tensor = node_value_targets[value_target_idx]
-                            added = add_attribute(target_idx, name, target_tensor)
-                            if added:
                                 value_target_idx += 1
+                            added = add_attribute(target_idx, name, target_tensor)
                     else:
                         prev_token_idx = self.attr_sos_index
                         while True:
@@ -1578,6 +1802,7 @@ class GraphDecoder(nn.Module):
                                 self.shared_attr_vocab.embedding.weight,
                                 project_name_logits(name_out),
                             )
+                            similarity_logits = self._mask_logits_for_type(node_type_idx, similarity_logits)
                             if DEBUG_DECODER:
                                 top_logit, top_idx = torch.max(similarity_logits, dim=0)
                                 last_attr_logits = (
@@ -1597,24 +1822,21 @@ class GraphDecoder(nn.Module):
                             if name_index == self.attr_eos_index:
                                 break
                             elif name_index == self.attr_unk_index:
-                                name = generate_random_string(8)
-                                while name in attrs:
-                                    name = generate_random_string(8)
-                                name_index = self.shared_attr_vocab.ensure_index(name)
+                                continue
                             else:
                                 name = self.shared_attr_vocab.index_to_name.get(name_index)
                                 if name is None:
-                                    name = generate_random_string(8)
-                                    name_index = self.shared_attr_vocab.ensure_index(name)
-                                else:
-                                    name_index = self.shared_attr_vocab.ensure_index(name)
+                                    continue
+                                name_index = self.shared_attr_vocab.ensure_index(name)
                                 if name in attrs:
                                     continue
 
-                            # pin_role has already been added to the node attributes in the graph_dict
-                            if name in ("pin_role", "pin_slot_index"):
+                            # pin metadata has already been added to the node attributes in the graph_dict
+                            if _is_metadata_attribute(name):
                                 continue
 
+                            if not self._is_name_allowed_for_type(node_type_idx, name_index):
+                                continue
                             add_attribute(name_index, name)
                 node_attributes.append(attrs)
                 if DEBUG_DECODER:
@@ -1702,6 +1924,8 @@ class GraphDecoder(nn.Module):
             if edge_teacher_tokens:
                 decoder_aux["edge_loss"] = edge_teacher_loss
                 decoder_aux["edge_tokens"] = edge_teacher_tokens
+            if attr_type_mismatch_skips:
+                decoder_aux["attr_type_mismatch_skips"] = attr_type_mismatch_skips
             if decoder_aux:
                 return all_graphs, decoder_aux
             return all_graphs
@@ -1891,12 +2115,14 @@ class SelfCompressingFitnessRegularizedDAGVAE(nn.Module):
         teacher_attr_targets: Optional[List[List[List[int]]]] = None,
         teacher_adj_targets: Optional[List[Optional[torch.Tensor]]] = None,
         teacher_attr_value_targets: Optional[List[List[List[torch.Tensor]]]] = None,
+        teacher_node_types: Optional[List[torch.Tensor]] = None,
     ):
         return self.decoder(
             z,
             teacher_attr_targets=teacher_attr_targets,
             teacher_adj_targets=teacher_adj_targets,
             teacher_attr_value_targets=teacher_attr_value_targets,
+            teacher_node_types=teacher_node_types,
         )
 
     def forward(
@@ -1908,6 +2134,7 @@ class SelfCompressingFitnessRegularizedDAGVAE(nn.Module):
         teacher_attr_targets: Optional[List[List[List[int]]]] = None,
         teacher_adj_targets: Optional[List[Optional[torch.Tensor]]] = None,
         teacher_attr_value_targets: Optional[List[List[List[torch.Tensor]]]] = None,
+        teacher_node_types: Optional[List[torch.Tensor]] = None,
         num_graphs: Optional[int] = None,
     ):
         mu_g, lv_g = self.encode(
@@ -1923,6 +2150,7 @@ class SelfCompressingFitnessRegularizedDAGVAE(nn.Module):
             teacher_attr_targets=teacher_attr_targets,
             teacher_adj_targets=teacher_adj_targets,
             teacher_attr_value_targets=teacher_attr_value_targets,
+            teacher_node_types=teacher_node_types,
         )
         if isinstance(decoded, tuple):
             decoded_graphs, decoder_aux = decoded
@@ -2547,6 +2775,7 @@ class OnlineTrainer:
                 batch = batch.to(self.device)
                 self.optimizer.zero_grad()
                 target_graph_attrs = group_node_attributes(batch.node_attributes, batch.batch)
+                teacher_node_types = group_node_types(batch.node_types, batch.batch)
                 per_graph_node_counts = [len(attrs) for attrs in target_graph_attrs]
                 teacher_attr_targets = build_teacher_attr_targets(
                     target_graph_attrs, None, self.model.shared_attr_vocab
@@ -2584,6 +2813,7 @@ class OnlineTrainer:
                     teacher_attr_targets=teacher_attr_targets,
                     teacher_attr_value_targets=teacher_attr_value_targets,
                     teacher_adj_targets=teacher_adj_targets,
+                    teacher_node_types=teacher_node_types,
                     num_graphs=batch.num_graphs,
                 )
                 target_y = batch.y
@@ -2828,6 +3058,7 @@ class OnlineTrainer:
                 batch = batch.to(self.device)
                 self.optimizer.zero_grad()
                 target_graph_attrs = group_node_attributes(batch.node_attributes, batch.batch)
+                teacher_node_types = group_node_types(batch.node_types, batch.batch)
                 teacher_attr_targets = build_teacher_attr_targets(
                     target_graph_attrs, None, self.model.shared_attr_vocab
                 )
@@ -2853,6 +3084,7 @@ class OnlineTrainer:
                     batch.batch,
                     teacher_attr_targets=teacher_attr_targets,
                     teacher_attr_value_targets=teacher_attr_value_targets,
+                    teacher_node_types=teacher_node_types,
                     num_graphs=batch.num_graphs,
                 )
                 loss_adj, loss_feat = self._compute_reconstruction_losses(

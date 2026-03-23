@@ -2,7 +2,7 @@ import copy
 import hashlib
 import logging
 import random
-from typing import Dict, Tuple
+from typing import Dict, Optional, Set, Tuple
 from warnings import warn
 
 import torch
@@ -38,7 +38,182 @@ NODE_TYPE_OPTIONS = [  # for mutation
     "tensor",
 ]
 NODE_TYPE_TO_INDEX = {nt: i for i, nt in enumerate(NODE_TYPE_OPTIONS)}
-ATTRIBUTE_NAMES = set()
+ATTRIBUTE_NAMES: Set[str] = set()
+ATTRIBUTE_NAMES_BY_KIND: Dict[str, Set[str]] = {}
+ATTRIBUTE_NAMES_VERSION = 0
+ATTRIBUTE_VALUE_KINDS_BY_KIND: Dict[Optional[str], Dict[str, Set[str]]] = {}
+_SCHEMA_ARGUMENT_NAME_CACHE: Dict[str, Dict[str, str]] = {}
+_ALL_SCHEMA_ARGUMENTS: Optional[Dict[str, Dict[str, str]]] = None
+
+
+def _value_kind_from_schema_type(type_obj) -> Optional[str]:
+    if type_obj is None:
+        return None
+    kind = None
+    try:
+        kind = type_obj.kind()
+    except AttributeError:
+        kind = None
+    if kind == "OptionalType" and hasattr(type_obj, "getElementType"):
+        return _value_kind_from_schema_type(type_obj.getElementType())
+    if kind == "ListType" and hasattr(type_obj, "getElementType"):
+        inner = _value_kind_from_schema_type(type_obj.getElementType())
+        return f"list[{inner or 'any'}]"
+    mapping = {
+        "TensorType": "tensor",
+        "NumberType": "float",
+        "FloatType": "float",
+        "IntType": "int",
+        "BoolType": "bool",
+        "StringType": "string",
+        "ScalarType": "float",
+        "DeviceObjType": "string",
+    }
+    if kind in mapping:
+        return mapping[kind]
+    type_str = str(type_obj)
+    if type_str.endswith("?"):
+        return _value_kind_from_schema_type(type_str[:-1])
+    if type_str.startswith("List[") and type_str.endswith("]"):
+        inner = _value_kind_from_schema_type(type_str[5:-1])
+        return f"list[{inner or 'any'}]"
+    if type_str in {"Tensor", "Tensor[]"}:
+        return "tensor"
+    if type_str in {"int", "int64", "Index"}:
+        return "int"
+    if type_str in {"float", "Scalar"}:
+        return "float"
+    if type_str in {"bool"}:
+        return "bool"
+    if type_str in {"str", "string"}:
+        return "string"
+    return None
+
+
+def _value_kind_from_python_value(value) -> Optional[str]:
+    if torch.is_tensor(value):
+        return "tensor"
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        return "int"
+    if isinstance(value, float):
+        return "float"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return "list"
+        inner = _value_kind_from_python_value(value[0])
+        return f"list[{inner or 'any'}]"
+    if isinstance(value, dict):
+        return "dict"
+    return None
+
+
+def register_attribute_name(
+    node_type: str | None,
+    attribute_name: str | None,
+    value_kind: str | None = None,
+) -> None:
+    """Record that a node kind exposes a particular attribute name/type."""
+    if not attribute_name:
+        return
+    ATTRIBUTE_NAMES.add(attribute_name)
+    key = node_type or None
+    if node_type:
+        names = ATTRIBUTE_NAMES_BY_KIND.setdefault(node_type, set())
+        if attribute_name not in names:
+            names.add(attribute_name)
+            global ATTRIBUTE_NAMES_VERSION
+            ATTRIBUTE_NAMES_VERSION += 1
+    if value_kind:
+        kind_map = ATTRIBUTE_VALUE_KINDS_BY_KIND.setdefault(key, {})
+        kind_set = kind_map.setdefault(attribute_name, set())
+        kind_set.add(value_kind)
+
+
+def canonical_attribute_names_for_kind(node_type: str | None) -> Set[str]:
+    if not node_type:
+        return set()
+    return ATTRIBUTE_NAMES_BY_KIND.get(node_type, set())
+
+
+def attribute_value_kinds_for_kind(node_type: str | None) -> Dict[str, Set[str]]:
+    return ATTRIBUTE_VALUE_KINDS_BY_KIND.get(node_type or None, {})
+
+
+def attribute_value_kind(node_type: str | None, attribute_name: str) -> Optional[str]:
+    kinds = attribute_value_kinds_for_kind(node_type).get(attribute_name)
+    if kinds:
+        # Prefer deterministic ordering for reproducibility.
+        for choice in ("tensor", "float", "int", "bool", "string"):
+            if choice in kinds:
+                return choice
+        return sorted(kinds)[0]
+    # fall back to globally registered names
+    global_kinds = attribute_value_kinds_for_kind(None).get(attribute_name)
+    if global_kinds:
+        return sorted(global_kinds)[0]
+    return None
+
+
+def attribute_value_kind_for_index(node_type_idx: int, attribute_name: str) -> Optional[str]:
+    node_type = None
+    if 0 <= node_type_idx < len(NODE_TYPE_OPTIONS):
+        node_type = NODE_TYPE_OPTIONS[node_type_idx]
+    return attribute_value_kind(node_type, attribute_name)
+
+
+def _ensure_schema_argument_map_loaded() -> None:
+    global _ALL_SCHEMA_ARGUMENTS
+    if _ALL_SCHEMA_ARGUMENTS is not None:
+        return
+    mapping: Dict[str, Dict[str, str]] = {}
+    try:
+        schemas = torch._C._jit_get_all_schemas()
+    except AttributeError:
+        _ALL_SCHEMA_ARGUMENTS = {}
+        return
+    for schema in schemas:
+        base = getattr(schema, "name", None)
+        if not base:
+            continue
+        entry = mapping.setdefault(base, {})
+        for argument in getattr(schema, "arguments", []):
+            name = getattr(argument, "name", None)
+            if name:
+                entry.setdefault(name, _value_kind_from_schema_type(argument.type))
+        for result in getattr(schema, "returns", []):
+            name = getattr(result, "name", None)
+            if name:
+                entry.setdefault(name, _value_kind_from_schema_type(result.type))
+    _ALL_SCHEMA_ARGUMENTS = mapping
+
+
+def _schema_argument_names_for_kind(node_kind: str) -> Dict[str, str]:
+    cached = _SCHEMA_ARGUMENT_NAME_CACHE.get(node_kind)
+    if cached is not None:
+        return cached
+    _ensure_schema_argument_map_loaded()
+    names = dict(_ALL_SCHEMA_ARGUMENTS.get(node_kind, {})) if _ALL_SCHEMA_ARGUMENTS is not None else {}
+    _SCHEMA_ARGUMENT_NAME_CACHE[node_kind] = names
+    return names
+
+
+def register_schema_argument_names(node: torch._C.Node) -> None:
+    if node is None:
+        return
+    node_kind = node.kind()
+    names = _schema_argument_names_for_kind(node_kind)
+    for name, value_kind in names.items():
+        register_attribute_name(node_kind, name, value_kind)
+
+
+register_attribute_name(None, "pin_role", "string")
+register_attribute_name(None, "pin_slot_index", "int")
+register_attribute_name(None, "is_input_pin", "bool")
+register_attribute_name(None, "is_output_pin", "bool")
 
 
 def node_type_name_from_index(index: int) -> str:
@@ -80,20 +255,25 @@ class NodeGene(BaseGene):
         self.dynamic_attributes = {}
         if node is not None:
             self.node_type = node.kind()
+            register_schema_argument_names(node)
             for attribute_name in node.attributeNames():
                 attribute_type = node.kindOf(attribute_name)
                 if attribute_type == "i":
                     attribute = IntAttribute(attribute_name)
-                    self.dynamic_attributes[attribute] = node.i(attribute_name)
+                    value = node.i(attribute_name)
+                    self.dynamic_attributes[attribute] = value
                 elif attribute_type == "f":
                     attribute = FloatAttribute(attribute_name)
-                    self.dynamic_attributes[attribute] = node.f(attribute_name)
+                    value = node.f(attribute_name)
+                    self.dynamic_attributes[attribute] = value
                 elif attribute_type == "s":
                     attribute = StringAttribute(attribute_name, options=list(ATTRIBUTE_NAMES))
-                    self.dynamic_attributes[attribute] = node.s(attribute_name)
+                    value = node.s(attribute_name)
+                    self.dynamic_attributes[attribute] = value
                 else:
                     warn(f"Unknown attribute type for node [{node}]: {attribute_type}")
-                ATTRIBUTE_NAMES.add(attribute_name)
+                    value = None
+                register_attribute_name(self.node_type, attribute_name, _value_kind_from_python_value(value))
                 if self.dynamic_attributes[attribute] is None:
                     warn(f"Missing value for " + str(attribute))
             self.num_outputs = len(list(node.outputs()))
@@ -147,7 +327,13 @@ class NodeGene(BaseGene):
                 max_attrs,
             )
             return False
-        self.dynamic_attributes[attr] = attr.init_value(config)
+        value = attr.init_value(config)
+        self.dynamic_attributes[attr] = value
+        register_attribute_name(
+            getattr(self, "node_type", None),
+            getattr(attr, "name", None),
+            _value_kind_from_python_value(value),
+        )
         return True
 
     def remove_attribute(self, attr_to_remove: BaseAttribute):

@@ -2,6 +2,7 @@ import pytest
 import torch
 from torch_geometric.data import Batch, Data
 
+import genes
 from metrics import AreaUnderTaskMetrics
 from search_space_compression import (
     GraphDecoder,
@@ -9,6 +10,8 @@ from search_space_compression import (
     SharedAttributeVocab,
     StagedBetaSchedule,
     _weisfeiler_lehman_histograms,
+    build_teacher_attr_targets,
+    build_teacher_attr_value_targets,
 )
 
 
@@ -68,6 +71,147 @@ class MinimalGuide(torch.nn.Module):
 
     def forward(self, *args, **kwargs):  # pragma: no cover - not exercised here
         raise NotImplementedError
+
+
+class _AttrRegistryGuard:
+    def __enter__(self):
+        self._names_backup = set(genes.ATTRIBUTE_NAMES)
+        self._map_backup = {k: set(v) for k, v in genes.ATTRIBUTE_NAMES_BY_KIND.items()}
+        self._version_backup = genes.ATTRIBUTE_NAMES_VERSION
+        genes.ATTRIBUTE_NAMES.clear()
+        genes.ATTRIBUTE_NAMES_BY_KIND.clear()
+        genes.ATTRIBUTE_NAMES_VERSION = 0
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        genes.ATTRIBUTE_NAMES.clear()
+        genes.ATTRIBUTE_NAMES.update(self._names_backup)
+        genes.ATTRIBUTE_NAMES_BY_KIND.clear()
+        for kind, names in self._map_backup.items():
+            genes.ATTRIBUTE_NAMES_BY_KIND[kind] = set(names)
+        genes.ATTRIBUTE_NAMES_VERSION = self._version_backup
+
+
+def test_shared_attribute_vocab_rejects_non_canonical_names():
+    vocab = SharedAttributeVocab([], embedding_dim=4)
+    vocab.set_allowed_names({"foo"})
+    vocab.add_names(["foo"])
+    with pytest.raises(ValueError):
+        vocab.add_names(["bar"])
+
+
+def test_teacher_value_targets_allow_string_literals_via_private_tokens():
+    vocab = SharedAttributeVocab([], embedding_dim=4)
+    vocab.set_allowed_names({"foo"})
+    vocab.add_names(["foo"])
+    data = [{"foo": "prim::Param"}]
+    outputs = build_teacher_attr_value_targets(data, batch_vec=None, shared_vocab=vocab, max_value_dim=4)
+    assert outputs and outputs[0][0]
+    assert "__value__prim::Param" in vocab.name_to_index
+
+
+def test_teacher_attr_targets_drop_node_type_metadata():
+    vocab = SharedAttributeVocab([], embedding_dim=4)
+    vocab.set_allowed_names({"foo"})
+    vocab.add_names(["foo"])
+    sequences = build_teacher_attr_targets([{"node_type": "aten::add", "foo": 1.0}], batch_vec=None, shared_vocab=vocab)
+    assert sequences == [[[vocab.name_to_index["foo"], vocab.eos_index]]]
+    assert "node_type" not in vocab.name_to_index
+
+
+def test_teacher_attr_targets_skip_metadata_only_entries():
+    vocab = SharedAttributeVocab([], embedding_dim=4)
+    vocab.set_allowed_names(set())
+    sequences = build_teacher_attr_targets([{"node_type": "aten::add"}], batch_vec=None, shared_vocab=vocab)
+    assert sequences == [[[vocab.eos_index]]]
+    assert "node_type" not in vocab.name_to_index
+
+
+def test_shared_attribute_vocab_tracks_allowed_set_updates():
+    allowed = set()
+    vocab = SharedAttributeVocab([], embedding_dim=4)
+    vocab.set_allowed_names(allowed)
+    allowed.add("alpha")
+    vocab.add_names(["alpha"])
+    assert vocab.ensure_index("alpha") == vocab.name_to_index["alpha"]
+
+
+def test_decoder_skips_attr_loss_on_type_mismatch():
+    vocab = SharedAttributeVocab([], embedding_dim=4)
+    with _AttrRegistryGuard():
+        node_type = genes.NODE_TYPE_OPTIONS[0]
+        genes.register_attribute_name(node_type, "foo")
+        vocab.set_allowed_names(genes.ATTRIBUTE_NAMES)
+        vocab.add_names(list(genes.ATTRIBUTE_NAMES))
+        decoder = GraphDecoder(len(genes.NODE_TYPE_OPTIONS), latent_dim=4, shared_attr_vocab=vocab, min_pin_nodes=0)
+        decoder.train()
+        with torch.no_grad():
+            decoder.type_head.weight.zero_()
+            decoder.type_head.bias.fill_(-10.0)
+            decoder.type_head.bias[0] = 10.0
+            decoder.stop_head.weight.zero_()
+            decoder.stop_head.bias.fill_(-10.0)
+        latent = torch.zeros(1, decoder.latent_dim)
+        foo_idx = vocab.name_to_index["foo"]
+        teacher_attr_targets = [[[foo_idx, vocab.eos_index]]]
+        teacher_attr_value_targets = [[[torch.tensor([1.0])]]]
+        match_types = [torch.tensor([0], dtype=torch.long)]
+        mismatch_types = [torch.tensor([1], dtype=torch.long)]
+        _, aux_match = decoder(
+            latent,
+            teacher_attr_targets=teacher_attr_targets,
+            teacher_attr_value_targets=teacher_attr_value_targets,
+            teacher_node_types=match_types,
+        )
+        assert "loss" in aux_match
+        _, aux_mismatch = decoder(
+            latent,
+            teacher_attr_targets=teacher_attr_targets,
+            teacher_attr_value_targets=teacher_attr_value_targets,
+            teacher_node_types=mismatch_types,
+        )
+        assert "loss" not in aux_mismatch
+        assert aux_mismatch.get("attr_type_mismatch_skips") == 1
+
+
+def test_graph_decoder_materializes_scalar_attribute_values():
+    vocab = SharedAttributeVocab([], embedding_dim=4)
+    decoder = GraphDecoder(num_node_types=1, latent_dim=2, shared_attr_vocab=vocab)
+    assert decoder._materialize_attribute_value([torch.tensor([0.7])], "bool") is True
+    assert decoder._materialize_attribute_value([torch.tensor([2.4])], "int") == 2
+    list_vals = decoder._materialize_attribute_value([torch.tensor([1.2]), torch.tensor([3.8])], "list[int]")
+    assert list_vals == [1, 4]
+
+
+def test_graph_decoder_masks_noncanonical_names_per_type():
+    with _AttrRegistryGuard():
+        kind_a = genes.NODE_TYPE_OPTIONS[0]
+        kind_b = genes.NODE_TYPE_OPTIONS[1]
+        genes.register_attribute_name(kind_a, "alpha")
+        genes.register_attribute_name(kind_b, "beta")
+        vocab = SharedAttributeVocab([], embedding_dim=4)
+        vocab.set_allowed_names(genes.ATTRIBUTE_NAMES)
+        vocab.add_names(list(genes.ATTRIBUTE_NAMES))
+        decoder = GraphDecoder(len(genes.NODE_TYPE_OPTIONS), latent_dim=4, shared_attr_vocab=vocab)
+        logits = torch.zeros(vocab.embedding.num_embeddings)
+        masked = decoder._mask_logits_for_type(0, logits.clone())
+        assert masked[vocab.name_to_index["alpha"]] == pytest.approx(0.0)
+        assert masked[vocab.name_to_index["beta"]] < -1e3
+
+
+def test_graph_decoder_allows_metadata_names_globally():
+    with _AttrRegistryGuard():
+        genes.register_attribute_name(genes.NODE_TYPE_OPTIONS[0], "alpha")
+        vocab = SharedAttributeVocab([], embedding_dim=4)
+        vocab.set_allowed_names(genes.ATTRIBUTE_NAMES)
+        vocab.add_names(list(genes.ATTRIBUTE_NAMES))
+        vocab.add_names(["__node_kind__"])
+        decoder = GraphDecoder(len(genes.NODE_TYPE_OPTIONS), latent_dim=4, shared_attr_vocab=vocab)
+        logits = torch.zeros(vocab.embedding.num_embeddings)
+        masked = decoder._mask_logits_for_type(0, logits.clone())
+        meta_idx = vocab.name_to_index["__node_kind__"]
+        assert masked[meta_idx] == pytest.approx(0.0)
+        assert decoder._is_name_allowed_for_type(0, meta_idx)
 
 
 def test_staged_beta_schedule_phases():
