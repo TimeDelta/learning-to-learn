@@ -39,7 +39,6 @@ class GuidedReproduction(DefaultReproduction):
         self.guided_start_generation = getattr(config, "guided_start_generation", 0)
         self.guided_max_fraction = float(getattr(config, "guided_max_fraction", 0.5))
         self.optimizer_validator = None
-        self.optimizer_validation_retries = getattr(config, "optimizer_validation_retries", 3)
 
     def _is_optimizer_valid(self, optimizer) -> bool:
         validator = getattr(self, "optimizer_validator", None)
@@ -168,66 +167,60 @@ class GuidedReproduction(DefaultReproduction):
                 repro_cutoff = max(2, int(math.ceil(self.reproduction_config.survival_threshold * len(old_members))))
                 parents = old_members[:repro_cutoff]
                 for _ in range(remaining_spawn):
-                    attempts = 0
-                    child_added = False
-                    while attempts < max(1, self.optimizer_validation_retries):
-                        attempts += 1
-                        p1_id, p1 = random.choice(parents)
-                        p2_id, p2 = random.choice(parents)
-                        cid = next(self.genome_indexer)
-                        child = config.genome_type(cid)
-                        child.configure_crossover(p1, p2, config.genome_config)
-                        child.mutate(config.genome_config)
-                        optimizer_valid = True
-                        if hasattr(child, "compile_optimizer"):
-                            child.compile_optimizer(config.genome_config)
-                            graph_dict = getattr(child, "graph_dict", None)
-                            if graph_dict:
-                                edge_index = graph_dict.get("edge_index")
-                                num_edges = 0
-                                if edge_index is not None:
-                                    if isinstance(edge_index, torch.Tensor):
-                                        edge_tensor = edge_index
-                                    else:
-                                        edge_tensor = torch.as_tensor(edge_index)
-                                    if edge_tensor.dim() == 1:
-                                        num_edges = edge_tensor.numel() // 2
-                                    elif edge_tensor.dim() == 2:
-                                        num_edges = edge_tensor.size(1)
-                                if num_edges == 0:
-                                    warn(
-                                        "NEAT offspring produced an empty graph after mutation; consider adjusting mutation rates."
-                                    )
-                            optimizer = getattr(child, "optimizer", None)
-                            if not self._is_optimizer_valid(optimizer):
-                                optimizer_valid = False
-                                warn("NEAT offspring optimizer failed parameter-update check; retrying mutation.")
-                        if not optimizer_valid:
-                            continue
+                    p1_id, p1 = random.choice(parents)
+                    p2_id, p2 = random.choice(parents)
+                    cid = next(self.genome_indexer)
+                    child = config.genome_type(cid)
+                    child.configure_crossover(p1, p2, config.genome_config)
+                    child.mutate(config.genome_config)
+                    optimizer_valid = True
+                    if hasattr(child, "compile_optimizer"):
+                        child.compile_optimizer(config.genome_config)
+                        graph_dict = getattr(child, "graph_dict", None)
+                        if graph_dict:
+                            edge_index = graph_dict.get("edge_index")
+                            num_edges = 0
+                            if edge_index is not None:
+                                if isinstance(edge_index, torch.Tensor):
+                                    edge_tensor = edge_index
+                                else:
+                                    edge_tensor = torch.as_tensor(edge_index)
+                                if edge_tensor.dim() == 1:
+                                    num_edges = edge_tensor.numel() // 2
+                                elif edge_tensor.dim() == 2:
+                                    num_edges = edge_tensor.size(1)
+                            if num_edges == 0:
+                                warn(
+                                    "NEAT offspring produced an empty graph after mutation; consider adjusting mutation rates."
+                                )
+                        optimizer = getattr(child, "optimizer", None)
+                        if not self._is_optimizer_valid(optimizer):
+                            optimizer_valid = False
+                            warn("NEAT offspring optimizer failed parameter-update check; inserting fallback child.")
+                    if optimizer_valid:
                         new_population[cid] = child
                         self.ancestors[cid] = (p1_id, p2_id)
-                        child_added = True
-                        break
-                    if not child_added:
-                        fallback_child = self._build_random_minimum_genome(config, cid)
-                        optimizer = None
-                        if hasattr(fallback_child, "compile_optimizer"):
-                            try:
-                                fallback_child.compile_optimizer(config.genome_config)
-                                optimizer = getattr(fallback_child, "optimizer", None)
-                            except Exception as exc:
-                                self.reporters.info(
-                                    f"Fallback minimum graph for species {s.key} failed to compile cleanly: {exc}"
-                                )
-                        if optimizer is not None and not self._is_optimizer_valid(optimizer):
+                        continue
+
+                    fallback_child = self._build_random_minimum_genome(config, cid)
+                    optimizer = None
+                    if hasattr(fallback_child, "compile_optimizer"):
+                        try:
+                            fallback_child.compile_optimizer(config.genome_config)
+                            optimizer = getattr(fallback_child, "optimizer", None)
+                        except Exception as exc:
                             self.reporters.info(
-                                f"Fallback optimizer for species {s.key} failed validation; proceeding to keep minimum graph child."
+                                f"Fallback minimum graph for species {s.key} failed to compile cleanly: {exc}"
                             )
-                        new_population[cid] = fallback_child
-                        self.ancestors[cid] = (p1_id, p2_id)
+                    if optimizer is not None and not self._is_optimizer_valid(optimizer):
                         self.reporters.info(
-                            f"Inserted fallback minimum graph for species {s.key} after {attempts} unsuccessful attempts."
+                            f"Fallback optimizer for species {s.key} failed validation; proceeding to keep minimum graph child."
                         )
+                    new_population[cid] = fallback_child
+                    self.ancestors[cid] = (p1_id, p2_id)
+                    self.reporters.info(
+                        f"Inserted fallback minimum graph for species {s.key} after an unsuccessful offspring attempt."
+                    )
 
         if timing is not None:
             timing.set_details(
