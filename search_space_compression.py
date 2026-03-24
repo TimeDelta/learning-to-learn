@@ -2404,7 +2404,7 @@ class OnlineTrainer:
         if self.module_freeze_verbose:
             label = "train " + "+".join(self._current_active_modules)
             if changed or reason != self._last_freeze_reason:
-                print(f"Trainer module freeze phase -> {label} (reason={reason or 'epoch'})")
+                logger.info(f"Trainer module freeze phase -> {label} (reason={reason or 'epoch'})")
         self._last_freeze_reason = reason
 
     def _clip_gradients(self):
@@ -2966,9 +2966,9 @@ class OnlineTrainer:
                 label_str = f"{label_str}, kl_beta={current_kl_weight:.4g}, active={active_label}"
                 label_str += f", attr_type_mismatch_skips={epoch_attr_type_mismatch}"
                 if not epochs:
-                    print(f"Epoch {epoch}, Loss terms per batch: [{label_str}] (total={total_loss:.4f})")
+                    logger.info(f"Epoch {epoch}, Loss terms per batch: [{label_str}] (total={total_loss:.4f})")
                 else:
-                    print(f"Epoch {epoch}/{epochs}, Loss terms per batch: [{label_str}] (total={total_loss:.4f})")
+                    logger.info(f"Epoch {epoch}/{epochs}, Loss terms per batch: [{label_str}] (total={total_loss:.4f})")
             if DEBUG_TRAINER and epoch_timer is not None:
                 logger.info(
                     "Trainer epoch %d complete | duration=%.3fs loss=%.4f",
@@ -3053,7 +3053,7 @@ class OnlineTrainer:
         loader = DataLoader(refresh_samples, batch_size=batch_size, shuffle=True)
         self._apply_module_freeze(self._module_order, reason="teacher_force")
         if verbose:
-            print(f"Teacher-forcing pass: epochs={epochs} batch_size={batch_size} weight={teacher_force_weight}")
+            logger.info(f"Teacher-forcing pass: epochs={epochs} batch_size={batch_size} weight={teacher_force_weight}")
         for epoch in range(1, epochs + 1):
             self.model.train()
             epoch_adj = 0.0
@@ -3112,16 +3112,15 @@ class OnlineTrainer:
 
             avg_adj = epoch_adj / max(1, batches)
             avg_feat = epoch_feat / max(1, batches)
-            if verbose:
-                print(
-                    "Teacher force epoch {}/{}: adj_loss={:.4f} attr_loss={:.4f} attr_type_mismatch_skips={}".format(
-                        epoch,
-                        epochs,
-                        avg_adj,
-                        avg_feat,
-                        epoch_attr_type_mismatch,
-                    )
+            logger.debug(
+                "Teacher force epoch {}/{}: adj_loss={:.4f} attr_loss={:.4f} attr_type_mismatch_skips={}".format(
+                    epoch,
+                    epochs,
+                    avg_adj,
+                    avg_feat,
+                    epoch_attr_type_mismatch,
                 )
+            )
             if self.progress_callback is not None:
                 self.progress_callback(
                     generation=generation,
@@ -3140,7 +3139,7 @@ class OnlineTrainer:
         # reinit optimizer so it only holds new params
         lr = self.optimizer.defaults.get("lr", 1e-3)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
-        print("Optimizer Reinitialized")
+        logger.info("Optimizer Reinitialized")
 
 
 if __name__ == "__main__":
