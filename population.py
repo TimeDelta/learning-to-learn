@@ -47,7 +47,7 @@ from pareto import *
 from reproduction import GuidedReproduction
 from search_space_compression import *
 from tasks import *
-from utility import log_timing
+from utility import MemoryUsageTracker, log_timing
 
 _INVALID_REASON_COUNTER: Counter = Counter()
 _INVALID_REASON_REPORT_REGISTERED = False
@@ -436,8 +436,9 @@ class GuidedPopulation(Population):
     MISSING_SLOT_PENALTY_MAX_SCALE = 0.9
     INACTIVE_OPTIMIZER_PENALTY_SCALE = 0.7
 
-    def __init__(self, config):
+    def __init__(self, config, *, memory_tracker: MemoryUsageTracker | None = None):
         super().__init__(config)
+        self.memory_tracker = memory_tracker
         _register_invalid_reason_reporter()
         graph_latent_dim = 32
         num_node_types = 10
@@ -548,6 +549,7 @@ class GuidedPopulation(Population):
             decoder_missing_node_penalty=self.decoder_missing_node_penalty,
             decoder_excess_node_penalty=self.decoder_excess_node_penalty,
             decoder_stop_loss_weight=self.decoder_stop_loss_weight,
+            memory_tracker=memory_tracker,
         )
         slice_ratio = getattr(config, "kl_partial_slice_ratio", None)
         if slice_ratio is None and hasattr(config, "reproduction_config"):
@@ -743,6 +745,38 @@ class GuidedPopulation(Population):
         self.repair_activity_probe_fraction = float(getattr(config, "repair_activity_probe_fraction", 0.0))
         self.repair_activity_probe_max = max(0, int(getattr(config, "repair_activity_probe_max", 8)))
         self._repair_activity_probes_used = 0
+        self.trainer_batch_size = self._sanitize_positive_int(getattr(config, "trainer_batch_size", None))
+        raw_max_batch = self._sanitize_positive_int(getattr(config, "trainer_max_batch_size", None))
+        if raw_max_batch is None:
+            # Keep decoder pressure low by defaulting to a small batch cap.
+            raw_max_batch = 4
+        if self.trainer_batch_size is not None:
+            raw_max_batch = max(raw_max_batch or self.trainer_batch_size, self.trainer_batch_size)
+        self.trainer_max_batch_size = raw_max_batch
+        self._log_memory("guided_population_initialized")
+
+    def _log_memory(self, label: str) -> None:
+        if self.memory_tracker is not None:
+            self.memory_tracker.snapshot(label)
+
+    @staticmethod
+    def _sanitize_positive_int(value, default: int | None = None) -> int | None:
+        try:
+            ivalue = int(value)
+        except (TypeError, ValueError):
+            return default
+        return ivalue if ivalue > 0 else default
+
+    def _resolve_trainer_batch_size(self, sample_count: int) -> int:
+        count = int(sample_count or 0)
+        if count <= 0:
+            return 1
+        resolved = count
+        if self.trainer_batch_size is not None:
+            resolved = min(resolved, self.trainer_batch_size)
+        if self.trainer_max_batch_size is not None:
+            resolved = min(resolved, self.trainer_max_batch_size)
+        return max(1, resolved)
 
     def _reset_guided_offspring_stats(self):
         if self._guided_offspring_stats is not None:
@@ -3437,6 +3471,7 @@ class GuidedPopulation(Population):
 
         self.generation = 0
         while n is None or self.generation < n:
+            self._log_memory(f"gen{self.generation:03d}_start")
             self.reporters.start_generation(self.generation)
             self._reset_guided_offspring_stats()
             if not self._decoder_replay_seeded:
@@ -3454,6 +3489,7 @@ class GuidedPopulation(Population):
             ) as timing:
                 self.eval_genomes(list(self.population.items()), self.config, steps=eval_steps)
                 timing.set_details(f"genomes={len(self.population)} steps={eval_steps}")
+            self._log_memory(f"gen{self.generation:03d}_post_eval")
 
             # Termination check
             if not self.config.no_fitness_termination:
@@ -3484,8 +3520,10 @@ class GuidedPopulation(Population):
                     invalid_fits,
                     invalid_flags=[True] * len(invalid_graphs),
                 )
+            self._log_memory(f"gen{self.generation:03d}_post_dataset")
 
-            batch = max(1, len(self.trainer.dataset))
+            dataset_len = len(self.trainer.dataset)
+            batch = self._resolve_trainer_batch_size(dataset_len)
             schedule = self._trainer_epoch_schedule()
             if self.generation == 0:
                 mode_note = " (test mode)" if self.test_mode else ""
@@ -3501,10 +3539,13 @@ class GuidedPopulation(Population):
                     baseline_window=schedule["baseline_window"],
                 )
                 timing.set_details(f"dataset={len(self.trainer.dataset)} epochs={schedule['epochs']} batch={batch}")
+            self._log_memory(f"gen{self.generation:03d}_post_surrogate_train")
             teacher_force_epochs, teacher_force_weight = self._teacher_force_schedule()
             replay_payload = self._consume_decoder_replay_graphs()
             if teacher_force_epochs > 0 and (self.trainer.dataset or replay_payload):
-                teacher_force_batch = min(batch, max(1, len(self.trainer.dataset)))
+                replay_len = len(replay_payload)
+                tf_samples = dataset_len + replay_len if dataset_len or replay_len else 1
+                teacher_force_batch = self._resolve_trainer_batch_size(tf_samples)
                 empty_ratio = self._guided_empty_ratio()
                 self.reporters.info(
                     f"Teacher-forcing refresh: epochs={teacher_force_epochs} weight={teacher_force_weight:.3f} "
@@ -3522,6 +3563,7 @@ class GuidedPopulation(Population):
                     timing.set_details(
                         f"epochs={teacher_force_epochs} batch={teacher_force_batch} replay={len(replay_payload)}"
                     )
+                self._log_memory(f"gen{self.generation:03d}_post_teacher_force")
             valid_size = len(self.trainer.dataset)
             invalid_size = len(self.trainer.invalid_dataset)
             total_size = valid_size + invalid_size
@@ -3538,6 +3580,7 @@ class GuidedPopulation(Population):
                 )
                 timing.set_details(f"offspring={len(new_population)}")
             self.population = new_population
+            self._log_memory(f"gen{self.generation:03d}_post_reproduction")
 
             # Handle possible extinction
             if not self.species.species:
@@ -3555,6 +3598,7 @@ class GuidedPopulation(Population):
             with log_timing(logger, f"Generation {self.generation} speciation") as timing:
                 self.species.speciate(self.config, self.population, self.generation)
                 timing.set_details(f"species={len(self.species.species)}")
+            self._log_memory(f"gen{self.generation:03d}_post_speciation")
             self._adjust_compatibility_threshold(len(self.species.species))
             self._emit_guided_offspring_stats()
             self.reporters.end_generation(self.config, self.population, self.species)

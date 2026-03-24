@@ -38,7 +38,7 @@ from population import _INVALID_REASON_COUNTER
 from relative_rank_stagnation import RelativeRankStagnation
 from reproduction import *
 from torchscript_utils import serialize_script_module
-from utility import log_timing
+from utility import MemoryUsageTracker, log_timing
 
 GUIDED_POPULATION_SECTION = "GuidedPopulation"
 
@@ -395,6 +395,10 @@ def override_initial_population(population, config):
     with log_timing(logger, "Initial speciation pass") as timing:
         population.species.speciate(config, population.population, population.generation)
         timing.set_details(f"species={len(population.species.species)}")
+
+    tracker = getattr(population, "memory_tracker", None)
+    if tracker is not None:
+        tracker.snapshot("post_seed_population")
 
 
 class MLflowRunManager:
@@ -869,6 +873,23 @@ if __name__ == "__main__":
                 "(default: artifacts/final_population)."
             ),
         )
+        parser.add_argument(
+            "--trainer-batch-size",
+            type=int,
+            default=None,
+            help="Optional hard cap on OnlineTrainer batch size (overrides config value).",
+        )
+        parser.add_argument(
+            "--trainer-max-batch-size",
+            type=int,
+            default=None,
+            help="Upper bound for OnlineTrainer batch size; defaults to 4 when not specified.",
+        )
+        parser.add_argument(
+            "--memory-debug",
+            action="store_true",
+            help="Log RSS + tracemalloc summaries at key phases to diagnose memory spikes.",
+        )
         return parser
 
     def _parse_args():
@@ -911,10 +932,18 @@ if __name__ == "__main__":
             details.append("test_mode=1")
         if max_eval_epochs is not None:
             details.append(f"max_eval_steps={max_eval_epochs}")
+        if args.trainer_batch_size is not None:
+            setattr(config, "trainer_batch_size", max(1, int(args.trainer_batch_size)))
+            details.append(f"trainer_batch={args.trainer_batch_size}")
+        if args.trainer_max_batch_size is not None:
+            setattr(config, "trainer_max_batch_size", max(1, int(args.trainer_max_batch_size)))
+            details.append(f"trainer_batch_cap={args.trainer_max_batch_size}")
         timing.set_details(", ".join(details))
 
+    memory_tracker = MemoryUsageTracker(logger, enabled=args.memory_debug)
+
     with log_timing(logger, "Constructing GuidedPopulation") as timing:
-        population = GuidedPopulation(config)
+        population = GuidedPopulation(config, memory_tracker=memory_tracker)
         timing.set_details(f"initial_pop={len(population.population)}")
 
     override_initial_population(population, config)
