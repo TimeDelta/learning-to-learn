@@ -794,6 +794,8 @@ class GuidedPopulation(Population):
             "structure_penalty_samples": 0,
             "decoder_max_nodes_hits": 0,
             "decoder_max_nodes_invalid": 0,
+            "decoder_max_edges_hits": 0,
+            "decoder_max_edges_invalid": 0,
             "inactive_details_total": 0,
             "inactive_details": [],
             "inactive_repair_salvaged": 0,
@@ -886,6 +888,8 @@ class GuidedPopulation(Population):
             "inactive_repair_salvaged_total": inactive_repair_total,
             "decoder_max_nodes_hits": int(stats.get("decoder_max_nodes_hits", 0) or 0),
             "decoder_max_nodes_invalid": int(stats.get("decoder_max_nodes_invalid", 0) or 0),
+            "decoder_max_edges_hits": int(stats.get("decoder_max_edges_hits", 0) or 0),
+            "decoder_max_edges_invalid": int(stats.get("decoder_max_edges_invalid", 0) or 0),
             "validator_failures": int(stats.get("validator_failures", 0) or 0),
         }
         if inactive_details:
@@ -937,6 +941,8 @@ class GuidedPopulation(Population):
         structure_penalty_steps: int = 0,
         decoder_max_nodes_hits: int = 0,
         decoder_max_nodes_invalid: int = 0,
+        decoder_max_edges_hits: int = 0,
+        decoder_max_edges_invalid: int = 0,
         inactive_details: Sequence[dict] | None = None,
         inactive_repair_salvaged: int = 0,
         validator_failures: int = 0,
@@ -962,6 +968,10 @@ class GuidedPopulation(Population):
             stats["decoder_max_nodes_hits"] += int(decoder_max_nodes_hits)
         if decoder_max_nodes_invalid:
             stats["decoder_max_nodes_invalid"] += int(decoder_max_nodes_invalid)
+        if decoder_max_edges_hits:
+            stats["decoder_max_edges_hits"] += int(decoder_max_edges_hits)
+        if decoder_max_edges_invalid:
+            stats["decoder_max_edges_invalid"] += int(decoder_max_edges_invalid)
         if inactive_details:
             stats["inactive_details_total"] += len(inactive_details)
             limit = self.guided_inactive_detail_limit
@@ -993,6 +1003,8 @@ class GuidedPopulation(Population):
             "structure_penalty_samples": stats.get("structure_penalty_samples", 0),
             "decoder_max_nodes_hits": stats.get("decoder_max_nodes_hits", 0),
             "decoder_max_nodes_invalid": stats.get("decoder_max_nodes_invalid", 0),
+            "decoder_max_edges_hits": stats.get("decoder_max_edges_hits", 0),
+            "decoder_max_edges_invalid": stats.get("decoder_max_edges_invalid", 0),
             "inactive_details_total": stats.get("inactive_details_total", 0),
             "inactive_repair_salvaged": stats.get("inactive_repair_salvaged", 0),
             "inactive_repair_salvaged_total": stats.get("inactive_repair_salvaged_total", 0),
@@ -1475,8 +1487,14 @@ class GuidedPopulation(Population):
             idx = NODE_TYPE_TO_INDEX.get(node.node_type)
             if idx is None:
                 raise KeyError(f"Unknown node_type {node.node_type!r}")
-            attr_names = [attribute_key_to_name(a) for a in node.dynamic_attributes.keys()]
-            attr_dict = copy.deepcopy(node.dynamic_attributes)
+            attr_dict: Dict[str, Any] = {}
+            attr_names: List[str] = []
+            for key, value in node.dynamic_attributes.items():
+                attr_name = attribute_key_to_name(key)
+                if not self.shared_attr_vocab.is_name_allowed(attr_name):
+                    continue
+                attr_dict[attr_name] = copy.deepcopy(value)
+                attr_names.append(attr_name)
             role = _role_for_node_key(nid)
             attr_dict["pin_role"] = role
             attr_names.append("pin_role")
@@ -2183,6 +2201,8 @@ class GuidedPopulation(Population):
         repair_salvaged = 0
         decoder_max_nodes_hits = 0
         decoder_max_nodes_invalid = 0
+        decoder_max_edges_hits = 0
+        decoder_max_edges_invalid = 0
         inactive_detail_samples: List[dict] = []
         inactive_repair_salvaged = 0
         debug_dir: Path | None = None
@@ -2212,6 +2232,8 @@ class GuidedPopulation(Population):
             graph_dict = decoded_graphs[0]
             hit_max_nodes_cap = bool(graph_dict.pop("_max_nodes_hit", False))
             decoder_max_nodes = graph_dict.pop("_decoder_max_nodes", None)
+            hit_max_edges_cap = bool(graph_dict.pop("_max_edges_hit", False))
+            decoder_max_edges = graph_dict.pop("_decoder_max_edges", None)
             child_record = self._begin_guided_child_record(
                 generation=generation_idx,
                 child_index=i,
@@ -2222,9 +2244,10 @@ class GuidedPopulation(Population):
                 nodes, edges = _graph_node_edge_counts(graph_dict)
                 child_record.raw_node_count = nodes
                 child_record.raw_edge_count = edges
-                child_record.hit_decoder_cap = hit_max_nodes_cap
+                child_record.hit_decoder_cap = hit_max_nodes_cap or hit_max_edges_cap
             min_nodes_required = self._minimum_required_node_count()
             original_node_count = len(graph_dict.get("node_attributes") or [])
+            original_edge_count = edges
             self._ensure_graph_node_capacity(graph_dict, min_nodes_required)
             if hit_max_nodes_cap:
                 decoder_max_nodes_hits += 1
@@ -2275,6 +2298,55 @@ class GuidedPopulation(Population):
                 # Treat decoder-capacity violations as failed offspring so NEAT
                 # reproduction can backfill with fresh children instead of
                 # keeping hopeless penalty genomes around.
+                abort_due_to_decoder_cap = True
+                break
+
+            if hit_max_edges_cap:
+                decoder_max_edges_hits += 1
+                if child_record and not child_record.failure_reason:
+                    child_record.failure_reason = "decoder_max_edges"
+                max_edges_value = None
+                if decoder_max_edges is not None:
+                    try:
+                        max_edges_value = int(decoder_max_edges)
+                    except (TypeError, ValueError):
+                        max_edges_value = None
+                if max_edges_value is None:
+                    try:
+                        max_edges_value = int(getattr(self.guide.decoder, "max_edges_per_graph", 0))
+                    except (TypeError, ValueError):
+                        max_edges_value = None
+                genome = genome_from_graph_dict(graph_dict, self.config.genome_config, key=i)
+                num_edges = len(genome.connections)
+                self._maybe_visualize_guided_invalid_graph(
+                    genome,
+                    graph_dict,
+                    reason="decoder_max_edges",
+                    child_index=i,
+                    num_edges=num_edges,
+                )
+                genome.graph_dict = graph_dict
+                penalty_details = {
+                    "decoded_edges": original_edge_count,
+                    "max_edges": max_edges_value,
+                }
+                self._assign_penalty(
+                    genome,
+                    reason="decoder_max_edges",
+                    skip_evaluation=True,
+                    penalty_details=penalty_details,
+                    graph_dict=graph_dict,
+                    record_decoder_failure=True,
+                )
+                self._buffer_decoder_replay_dict(graph_dict)
+                if last_valid_graph_dict is not None:
+                    self._buffer_decoder_replay_dict(last_valid_graph_dict)
+                decoder_max_edges_invalid += 1
+                invalid_reason_counts["decoder_max_edges"] += 1
+                graph_signature = graph_signature_from_dict(graph_dict)
+                if graph_signature:
+                    seen_graph_signatures.add(graph_signature)
+                new_genomes.append(genome)
                 abort_due_to_decoder_cap = True
                 break
             if original_node_count < min_nodes_required:
@@ -2533,6 +2605,7 @@ class GuidedPopulation(Population):
                         "latent_norm": latent_norm,
                         "latent_mean": latent_mean,
                         "decoder_max_nodes_hit": bool(hit_max_nodes_cap),
+                        "decoder_max_edges_hit": bool(hit_max_edges_cap),
                         "invalid_reason": "inactive_optimizer",
                         "num_edges": int(num_edges),
                     }
@@ -2577,6 +2650,14 @@ class GuidedPopulation(Population):
                 detail = "species=unknown"
             self.reporters.info(
                 f"Aborted guided offspring decoding early after hitting decoder max-nodes cap ({detail}, children_skipped={total_requested - len(new_genomes)})"
+            )
+        if abort_due_to_decoder_cap and decoder_max_edges_invalid and not decoder_max_nodes_invalid:
+            if species_key is not None:
+                detail = f"species={species_key}"
+            else:
+                detail = "species=unknown"
+            self.reporters.info(
+                f"Aborted guided offspring decoding early after hitting decoder max-edges cap ({detail}, children_skipped={total_requested - len(new_genomes)})"
             )
 
         if track_latents and latent_valid_flags is not None:
@@ -2646,6 +2727,8 @@ class GuidedPopulation(Population):
             structure_penalty_steps=structure_penalty_steps,
             decoder_max_nodes_hits=decoder_max_nodes_hits,
             decoder_max_nodes_invalid=decoder_max_nodes_invalid,
+            decoder_max_edges_hits=decoder_max_edges_hits,
+            decoder_max_edges_invalid=decoder_max_edges_invalid,
             inactive_details=inactive_detail_samples,
             inactive_repair_salvaged=inactive_repair_salvaged,
             validator_failures=inactive_optimizer_count,
@@ -3850,6 +3933,8 @@ class GuidedPopulation(Population):
         elif reason == "inactive_optimizer":
             scale = self.INACTIVE_OPTIMIZER_PENALTY_SCALE
         elif reason == "decoder_max_nodes":
+            scale = self.INVALID_PENALTY_MAX_SCALE
+        elif reason == "decoder_max_edges":
             scale = self.INVALID_PENALTY_MAX_SCALE
         clamped = max(self.INVALID_PENALTY_MIN_SCALE, min(self.INVALID_PENALTY_MAX_SCALE, scale))
         return float(clamped)

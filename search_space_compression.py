@@ -9,6 +9,7 @@ import os
 import random
 import time
 from collections import Counter, deque
+from collections.abc import MutableSet
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
@@ -31,9 +32,10 @@ from torch_geometric.utils import (
     to_dense_batch,
 )
 
+import genes
 from metrics import canonical_log_distance, sort_metrics_by_name
 from tasks import TASK_FEATURE_DIMS, TASK_INDEX_TO_DIM, TASK_TYPE_TO_INDEX
-from utility import generate_random_string
+from utility import MemoryUsageTracker, generate_random_string
 
 
 def _env_flag(name: str) -> bool:
@@ -301,6 +303,8 @@ class SharedAttributeVocab(nn.Module):
     can grow on‐the‐fly as new names are added.
     """
 
+    VALUE_LITERAL_PREFIX = "__value__"
+
     def __init__(self, initial_names: List[str], embedding_dim: int):
         super().__init__()
         self.name_to_index = {name: i for i, name in enumerate(initial_names)}
@@ -311,6 +315,9 @@ class SharedAttributeVocab(nn.Module):
                 self.name_to_index[token] = idx
                 self.index_to_name[idx] = token
         self.embedding = nn.Embedding(len(self.name_to_index), embedding_dim)
+        self._allowed_names: MutableSet[str] | None = None
+        self._always_allowed = {"<UNK>", "<EOS>", "<SOS>"}
+        self._banned_names = {"node_type"}
 
     @property
     def unk_index(self) -> int:
@@ -324,8 +331,49 @@ class SharedAttributeVocab(nn.Module):
     def sos_index(self) -> int:
         return self.name_to_index["<SOS>"]
 
+    def set_allowed_names(self, allowed_names: MutableSet[str] | Sequence[str] | None):
+        if allowed_names is None:
+            self._allowed_names = None
+            return
+        if isinstance(allowed_names, MutableSet):
+            self._allowed_names = allowed_names
+        else:
+            self._allowed_names = set(allowed_names)
+
+    def is_name_allowed(self, name: str) -> bool:
+        if not name:
+            return False
+        if name in self._always_allowed:
+            return True
+        if name in self._banned_names:
+            return False
+        if name.startswith("__"):
+            return True
+        if self._allowed_names is None:
+            return True
+        return name in self._allowed_names
+
+    def value_literal_token(self, literal: str) -> str:
+        literal = "" if literal is None else str(literal)
+        if literal.startswith(self.VALUE_LITERAL_PREFIX):
+            return literal
+        return f"{self.VALUE_LITERAL_PREFIX}{literal}"
+
+    def ensure_value_literal(self, literal: str) -> int:
+        return self.ensure_index(self.value_literal_token(literal))
+
     def add_names(self, new_names: List[str]):
-        names_to_add = [name for name in new_names if name not in self.name_to_index]
+        names_to_add: List[str] = []
+        for name in new_names:
+            if not isinstance(name, str):
+                name = str(name)
+            if name in self.name_to_index:
+                continue
+            if not self.is_name_allowed(name):
+                if name in self._banned_names:
+                    continue
+                raise ValueError(f"Attribute name {name!r} not in allowed set")
+            names_to_add.append(name)
 
         if not names_to_add:
             return
@@ -347,6 +395,10 @@ class SharedAttributeVocab(nn.Module):
 
     def ensure_index(self, name: str) -> int:
         if name not in self.name_to_index:
+            if name in self._banned_names:
+                return self.unk_index
+            if not self.is_name_allowed(name):
+                raise ValueError(f"Attribute name {name!r} not in allowed set")
             self.add_names([name])
         idx = self.name_to_index[name]
         if idx >= self.embedding.num_embeddings:
@@ -513,7 +565,9 @@ def build_teacher_attr_targets(
     for graph_attrs in per_graph_attrs:
         node_sequences: List[List[int]] = []
         for attrs in graph_attrs:
-            attr_names = [name for name, _value in _sorted_attribute_items(attrs or {})]
+            attr_names = [
+                name for name, _value in _sorted_attribute_items(attrs or {}) if shared_vocab.is_name_allowed(name)
+            ]
             tokens = [shared_vocab.ensure_index(name) for name in attr_names]
             tokens.append(shared_vocab.eos_index)
             node_sequences.append(tokens)
@@ -542,7 +596,7 @@ def build_teacher_attr_value_targets(
         elif isinstance(value, (int, float, bool)):
             tensor = torch.tensor([float(value)], dtype=torch.float32)
         elif isinstance(value, str):
-            index = shared_vocab.ensure_index(value)
+            index = shared_vocab.ensure_value_literal(value)
             tensor = shared_vocab.embedding.weight.detach().cpu()[index].view(-1).float()
         else:
             tensor = torch.zeros(1, dtype=torch.float32)
@@ -556,7 +610,9 @@ def build_teacher_attr_value_targets(
         node_sequences: List[List[torch.Tensor]] = []
         for attrs in graph_attrs:
             attr_values: List[torch.Tensor] = []
-            for _name, value in _sorted_attribute_items(attrs or {}):
+            for name, value in _sorted_attribute_items(attrs or {}):
+                if not shared_vocab.is_name_allowed(name):
+                    continue
                 attr_values.append(tensorize_value(value))
             node_sequences.append(attr_values)
         sequences.append(node_sequences)
@@ -624,16 +680,26 @@ class NodeAttributeDeepSetEncoder(nn.Module):
     def get_value_tensor(self, value: Any):
         if value is None:
             value = torch.zeros(1, dtype=torch.float)
-        if isinstance(value, (int, float)):
-            value = torch.tensor([value], dtype=torch.float)
-        elif isinstance(value, str):
-            index = self.shared_attr_vocab.ensure_index(value)
-            index = torch.tensor(index, dtype=torch.long, device=self.shared_attr_vocab.embedding.weight.device)
-            value = self.shared_attr_vocab.embedding(index)
         elif isinstance(value, torch.Tensor):
             # Flatten user provided tensors while preserving autograd info when possible.
             if not value.is_floating_point():
                 value = value.to(torch.float)
+        elif isinstance(value, np.ndarray):
+            value = torch.from_numpy(value).to(torch.float)
+        elif isinstance(value, (list, tuple)):
+            if len(value) == 0:
+                value = torch.zeros(1, dtype=torch.float)
+            else:
+                try:
+                    value = torch.as_tensor(value, dtype=torch.float)
+                except (TypeError, ValueError) as err:
+                    raise TypeError(f"Unsupported attribute value type: {type(value)}") from err
+        elif isinstance(value, (int, float, bool)):
+            value = torch.tensor([float(value)], dtype=torch.float)
+        elif isinstance(value, str):
+            index = self.shared_attr_vocab.ensure_value_literal(value)
+            index = torch.tensor(index, dtype=torch.long, device=self.shared_attr_vocab.embedding.weight.device)
+            value = self.shared_attr_vocab.embedding(index)
         else:
             raise TypeError(f"Unsupported attribute value type: {type(value)}")
         value = value.reshape(-1)
@@ -653,9 +719,10 @@ class NodeAttributeDeepSetEncoder(nn.Module):
             attr_dict.items(), key=lambda item: attribute_key_to_name(item[0])
         ):  # consistent ordering
             attr_name = attribute_key_to_name(attr)
-            if attr_name == "pin_role":
+            if attr_name in {"pin_role", "pin_slot_index"}:
                 continue
-            attr_name = attribute_key_to_name(attr)
+            if not self.shared_attr_vocab.is_name_allowed(attr_name):
+                continue
             name_idx = self.shared_attr_vocab.ensure_index(attr_name)
             name_index = torch.tensor(name_idx, dtype=torch.long, device=self.shared_attr_vocab.embedding.weight.device)
             value = self.get_value_tensor(value)
@@ -855,7 +922,7 @@ class GraphDecoder(nn.Module):
         gdn_layers: int = 2,
         edge_threshold: float = 0.5,
         max_edges_per_node: int = 256,
-        max_edges_per_graph: int = 4096,
+        max_edges_per_graph: int = 1000,
         min_pin_nodes: int | None = None,
         required_input_count: int | None = None,
         required_output_slots: Sequence[int] | None = None,
@@ -885,6 +952,10 @@ class GraphDecoder(nn.Module):
         self.attr_sos_index = self.shared_attr_vocab.sos_index
         self.attr_eos_index = self.shared_attr_vocab.eos_index
         self.attr_unk_index = self.shared_attr_vocab.unk_index
+        self._attr_name_cache_version = -1
+        self._attr_name_vocab_size = self.shared_attr_vocab.embedding.num_embeddings
+        self._attr_name_allowed_cache: Dict[int, Set[int]] = {}
+        self._attr_name_invalid_cache: Dict[int, Tuple[int, ...]] = {}
 
         # — GraphDeconvNet stack (learned spectral decoders)
         self.gdns = nn.ModuleList([GraphDeconvNet(hidden_dim, hidden_dim) for _ in range(gdn_layers)])
@@ -932,6 +1003,10 @@ class GraphDecoder(nn.Module):
         self.node_stop_decay_start_ratio = 0.85  # begin decaying continue prob after ~85% of the budget
         self.node_stop_decay_margin = 16  # ensure a small grace window even for tiny budgets
         self.node_stop_decay_min = 0.02  # never drive continue prob fully to zero so the sampler can explore
+        # Apply the same soft-stop strategy to edge sampling to keep graphs tractable.
+        self.edge_stop_decay_start_ratio = 0.85
+        self.edge_stop_decay_margin = 64
+        self.edge_stop_decay_min = 0.02
 
     def _resolved_required_input_slots(self) -> int:
         configured = 1
@@ -973,6 +1048,31 @@ class GraphDecoder(nn.Module):
             adjusted = adjusted.clamp_(0.0, 1.0)
         return adjusted
 
+    def _apply_edge_continue_decay(
+        self,
+        edge_prob: torch.Tensor,
+        emitted_edges: int,
+    ) -> torch.Tensor:
+        """Mirror the node soft-stop logic for edge sampling."""
+        if self.max_edges_per_graph <= 0:
+            return edge_prob
+        decay_start = int(self.max_edges_per_graph * self.edge_stop_decay_start_ratio)
+        decay_start = max(0, decay_start - self.edge_stop_decay_margin)
+        decay_start = min(decay_start, self.max_edges_per_graph)
+        if emitted_edges < decay_start:
+            return edge_prob
+        span = max(1, self.max_edges_per_graph - decay_start)
+        distance = max(0, emitted_edges - decay_start + 1)
+        scale = 1.0 - (distance / span)
+        scale = float(max(self.edge_stop_decay_min, min(1.0, scale)))
+        decay = edge_prob.new_full(edge_prob.shape, scale)
+        adjusted = edge_prob * decay
+        if self.edge_stop_decay_min > 0:
+            adjusted = adjusted.clamp_(self.edge_stop_decay_min, 1.0)
+        else:
+            adjusted = adjusted.clamp_(0.0, 1.0)
+        return adjusted
+
     def _emit_pin_debug_snapshot(self, node_attributes: List[Dict[str, Any]]) -> None:
         try:
             base = Path("debug_guided_offspring") / "pin_debug"
@@ -988,6 +1088,80 @@ class GraphDecoder(nn.Module):
             path.write_text(json.dumps(payload, indent=2, default=str))
         except Exception as exc:  # pragma: no cover - diagnostic path
             logger.exception("Failed to write pin debug snapshot: %s", exc)
+
+    def _node_type_index_for(self, node_types: Sequence[Any], node_idx: int) -> Optional[int]:
+        if node_idx >= len(node_types):
+            return None
+        raw = node_types[node_idx]
+        if isinstance(raw, (list, tuple)):
+            raw = raw[0] if raw else None
+        if raw is None:
+            return None
+        if torch.is_tensor(raw):
+            if raw.numel() == 0:
+                return None
+            raw = raw.view(-1)[0].item()
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return None
+        if value < 0:
+            return None
+        return value
+
+    def _refresh_attr_name_cache(self) -> None:
+        vocab_size = self.shared_attr_vocab.embedding.num_embeddings
+        version = genes.ATTRIBUTE_NAMES_VERSION
+        if self._attr_name_cache_version == version and self._attr_name_vocab_size == vocab_size:
+            return
+        self._attr_name_cache_version = version
+        self._attr_name_vocab_size = vocab_size
+        self._attr_name_allowed_cache.clear()
+        self._attr_name_invalid_cache.clear()
+
+    def _allowed_name_indices_for_type(self, node_type_idx: Optional[int]) -> Set[int]:
+        self._refresh_attr_name_cache()
+        cache_key = -1 if node_type_idx is None else int(node_type_idx)
+        cached = self._attr_name_allowed_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        allowed: Set[int] = {self.attr_eos_index, self.attr_sos_index, self.attr_unk_index}
+        node_type_name = None
+        if node_type_idx is not None and 0 <= node_type_idx < len(genes.NODE_TYPE_OPTIONS):
+            node_type_name = genes.NODE_TYPE_OPTIONS[node_type_idx]
+        if node_type_name:
+            for name in genes.canonical_attribute_names_for_kind(node_type_name):
+                if not self.shared_attr_vocab.is_name_allowed(name):
+                    continue
+                idx = self.shared_attr_vocab.name_to_index.get(name)
+                if idx is not None:
+                    allowed.add(idx)
+        for name, idx in self.shared_attr_vocab.name_to_index.items():
+            if name.startswith("__"):
+                allowed.add(idx)
+        self._attr_name_allowed_cache[cache_key] = allowed
+        vocab_size = self.shared_attr_vocab.embedding.num_embeddings
+        invalid = tuple(i for i in range(vocab_size) if i not in allowed)
+        self._attr_name_invalid_cache[cache_key] = invalid
+        return allowed
+
+    def _is_name_allowed_for_type(self, node_type_idx: Optional[int], name_index: int) -> bool:
+        allowed = self._allowed_name_indices_for_type(node_type_idx)
+        return name_index in allowed
+
+    def _mask_logits_for_type(self, node_type_idx: Optional[int], logits: torch.Tensor) -> torch.Tensor:
+        if logits.numel() == 0:
+            return logits
+        self._allowed_name_indices_for_type(node_type_idx)
+        cache_key = -1 if node_type_idx is None else int(node_type_idx)
+        invalid = self._attr_name_invalid_cache.get(cache_key)
+        if not invalid:
+            return logits
+        invalid_idx = torch.as_tensor(invalid, dtype=torch.long, device=logits.device)
+        mask_value = torch.finfo(logits.dtype).min if torch.is_floating_point(logits) else -1e9
+        masked = logits.clone()
+        masked.index_fill_(0, invalid_idx, mask_value)
+        return masked
 
     def _enforce_required_pin_metadata(self, node_attributes: List[Dict[str, Any]]):
         if not node_attributes:
@@ -1129,6 +1303,7 @@ class GraphDecoder(nn.Module):
                     node_loop_timer = time.perf_counter()
                     node_loop_iters = 0
                     hit_max_nodes_cap = False
+                    hit_max_edges_cap = False
                     teacher_force_nodes = self.training and (target_node_count is not None)
                     forced_pin_roles: List[str | None] = []
                     forced_pin_slots: List[int | None] = []
@@ -1229,6 +1404,7 @@ class GraphDecoder(nn.Module):
                                 if node_edge_budget >= self.max_edges_per_node:
                                     break
                                 if total_edge_budget >= self.max_edges_per_graph:
+                                    hit_max_edges_cap = True
                                     break
                                 hidden_edge = self.edge_rnn(edge_in, hidden_edge)
                                 edge_logit = self.edge_head(hidden_edge).view(-1)
@@ -1244,7 +1420,11 @@ class GraphDecoder(nn.Module):
                                 if teacher_force_nodes:
                                     edge_active = bool((p_edge > self.edge_threshold).item())
                                 else:
-                                    edge_sample = torch.bernoulli(p_edge)
+                                    sample_prob = self._apply_edge_continue_decay(
+                                        p_edge,
+                                        emitted_edges=total_edge_budget,
+                                    )
+                                    edge_sample = torch.bernoulli(sample_prob)
                                     edge_active = bool(edge_sample.item())
                                 if edge_active:
                                     edges.append([i, node_index])
@@ -1307,12 +1487,17 @@ class GraphDecoder(nn.Module):
                     if node_edge_budget >= self.max_edges_per_node:
                         break
                     if total_edge_budget >= self.max_edges_per_graph:
+                        hit_max_edges_cap = True
                         break
                     hidden_edge = self.edge_rnn(edge_in, hidden_edge)
                     edge_logit = self.edge_head(hidden_edge).view(-1)
                     p_edge = torch.sigmoid(edge_logit)
                     p_edge = torch.nan_to_num(p_edge, nan=0.0).clamp(0.0, 1.0)
-                    edge_sample = torch.bernoulli(p_edge)
+                    sample_prob = self._apply_edge_continue_decay(
+                        p_edge,
+                        emitted_edges=total_edge_budget,
+                    )
+                    edge_sample = torch.bernoulli(sample_prob)
                     edge_active = bool(edge_sample.item())
                     if edge_active:
                         edges.append([i, node_index])
@@ -1405,6 +1590,7 @@ class GraphDecoder(nn.Module):
                     node_teacher_targets = graph_teacher_targets[node_idx] or None
                 if graph_value_targets is not None and node_idx < len(graph_value_targets):
                     node_value_targets = graph_value_targets[node_idx] or None
+                node_type_idx = self._node_type_index_for(node_types, node_idx)
 
                 def project_name_logits(name_out: torch.Tensor) -> torch.Tensor:
                     return self.attr_name_head(name_out).reshape(-1)
@@ -1513,6 +1699,7 @@ class GraphDecoder(nn.Module):
                                 self.shared_attr_vocab.embedding.weight,
                                 project_name_logits(name_out),
                             )
+                            similarity_logits = self._mask_logits_for_type(node_type_idx, similarity_logits)
                             if DEBUG_DECODER:
                                 top_logit, top_idx = torch.max(similarity_logits, dim=0)
                                 last_attr_logits = (
@@ -1534,8 +1721,10 @@ class GraphDecoder(nn.Module):
                                 break
                             name = self.shared_attr_vocab.index_to_name.get(target_idx)
                             if name is None:
-                                name = generate_random_string(8)
-                                target_idx = self.shared_attr_vocab.ensure_index(name)
+                                continue
+                            if not self._is_name_allowed_for_type(node_type_idx, target_idx):
+                                continue
+                            target_idx = self.shared_attr_vocab.ensure_index(name)
                             target_tensor = None
                             if node_value_targets and value_target_idx < len(node_value_targets):
                                 target_tensor = node_value_targets[value_target_idx]
@@ -1578,6 +1767,7 @@ class GraphDecoder(nn.Module):
                                 self.shared_attr_vocab.embedding.weight,
                                 project_name_logits(name_out),
                             )
+                            similarity_logits = self._mask_logits_for_type(node_type_idx, similarity_logits)
                             if DEBUG_DECODER:
                                 top_logit, top_idx = torch.max(similarity_logits, dim=0)
                                 last_attr_logits = (
@@ -1597,17 +1787,13 @@ class GraphDecoder(nn.Module):
                             if name_index == self.attr_eos_index:
                                 break
                             elif name_index == self.attr_unk_index:
-                                name = generate_random_string(8)
-                                while name in attrs:
-                                    name = generate_random_string(8)
-                                name_index = self.shared_attr_vocab.ensure_index(name)
+                                attr_exit_reason = "unknown_token"
+                                break
                             else:
                                 name = self.shared_attr_vocab.index_to_name.get(name_index)
-                                if name is None:
-                                    name = generate_random_string(8)
-                                    name_index = self.shared_attr_vocab.ensure_index(name)
-                                else:
-                                    name_index = self.shared_attr_vocab.ensure_index(name)
+                                if name is None or not self._is_name_allowed_for_type(node_type_idx, name_index):
+                                    continue
+                                name_index = self.shared_attr_vocab.ensure_index(name)
                                 if name in attrs:
                                     continue
 
@@ -1655,6 +1841,9 @@ class GraphDecoder(nn.Module):
             if hit_max_nodes_cap:
                 graph_payload["_max_nodes_hit"] = True
                 graph_payload["_decoder_max_nodes"] = int(self.max_nodes)
+            if hit_max_edges_cap:
+                graph_payload["_max_edges_hit"] = True
+                graph_payload["_decoder_max_edges"] = int(self.max_edges_per_graph)
             all_graphs.append(graph_payload)
             if DEBUG_DECODER:
                 attr_time = time.perf_counter() - decode_stats["attr_start"]
@@ -2057,10 +2246,12 @@ class OnlineTrainer:
         decoder_excess_node_penalty: float = 0.0,
         decoder_stop_loss_weight: float = 1.0,
         grad_clip_norm: float = 5.0,
+        memory_tracker: MemoryUsageTracker | None = None,
     ):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = model.to(self.device)
         self.optimizer = optimizer
+        self.memory_tracker = memory_tracker
         self.dataset = []
         self.invalid_dataset = []
         self._graph_signatures: Set[str] = set()

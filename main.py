@@ -1065,6 +1065,8 @@ if __name__ == "__main__":
                         "guided_latent_structure_penalty_samples": stats.get("structure_penalty_samples"),
                         "guided_decoder_max_nodes_hits": stats.get("decoder_max_nodes_hits"),
                         "guided_decoder_max_nodes_invalid": stats.get("decoder_max_nodes_invalid"),
+                        "guided_decoder_max_edges_hits": stats.get("decoder_max_edges_hits"),
+                        "guided_decoder_max_edges_invalid": stats.get("decoder_max_edges_invalid"),
                         "guided_inactive_details_total": stats.get("inactive_details_total"),
                         "guided_inactive_repair_salvaged": stats.get("inactive_repair_salvaged"),
                         "guided_inactive_repair_salvaged_total": stats.get("inactive_repair_salvaged_total"),
@@ -1087,6 +1089,8 @@ if __name__ == "__main__":
                     )
                     if stats.get("decoder_max_nodes_hits"):
                         summary += f", max_nodes_hits={stats.get('decoder_max_nodes_hits')}"
+                    if stats.get("decoder_max_edges_hits"):
+                        summary += f", max_edges_hits={stats.get('decoder_max_edges_hits')}"
                     if stats.get("inactive_details_total"):
                         summary += f", inactive_cases={stats.get('inactive_details_total')}"
                     if stats.get("inactive_repair_salvaged"):
@@ -1305,6 +1309,8 @@ if __name__ == "__main__":
                     "guided_latent_structure_penalty_samples": stats.get("structure_penalty_samples"),
                     "guided_decoder_max_nodes_hits": stats.get("decoder_max_nodes_hits"),
                     "guided_decoder_max_nodes_invalid": stats.get("decoder_max_nodes_invalid"),
+                    "guided_decoder_max_edges_hits": stats.get("decoder_max_edges_hits"),
+                    "guided_decoder_max_edges_invalid": stats.get("decoder_max_edges_invalid"),
                     "guided_inactive_details_total": stats.get("inactive_details_total"),
                     "guided_inactive_repair_salvaged": stats.get("inactive_repair_salvaged"),
                     "guided_inactive_repair_salvaged_total": stats.get("inactive_repair_salvaged_total"),
@@ -1327,6 +1333,8 @@ if __name__ == "__main__":
                 )
                 if stats.get("decoder_max_nodes_hits"):
                     summary += f", max_nodes_hits={stats.get('decoder_max_nodes_hits')}"
+                if stats.get("decoder_max_edges_hits"):
+                    summary += f", max_edges_hits={stats.get('decoder_max_edges_hits')}"
                 if stats.get("inactive_details_total"):
                     summary += f", inactive_cases={stats.get('inactive_details_total')}"
                 if stats.get("inactive_repair_salvaged"):

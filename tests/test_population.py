@@ -427,6 +427,31 @@ def test_generate_guided_offspring_penalizes_max_nodes(monkeypatch):
     assert stats["decoder_max_nodes_invalid"] == 1
 
 
+def test_generate_guided_offspring_penalizes_max_edges(monkeypatch):
+    base_factory = make_graph_factory(0.1)
+
+    def capped_factory():
+        graph = base_factory()
+        graph["_max_edges_hit"] = True
+        graph["_decoder_max_edges"] = 2
+        return graph
+
+    pop, config = configure_stub_population([capped_factory], monkeypatch)
+    pop._reset_guided_offspring_stats()
+
+    offspring = pop.generate_guided_offspring([], config, n_offspring=1, latent_steps=1)
+
+    assert offspring
+    genome = offspring[0]
+    assert getattr(genome, "invalid_graph", False)
+    assert genome.invalid_reason == "decoder_max_edges"
+    assert genome.skip_evaluation is True
+    assert genome.invalid_penalty_details.get("max_edges") == 2
+    stats = pop._guided_offspring_stats
+    assert stats["decoder_max_edges_hits"] == 1
+    assert stats["decoder_max_edges_invalid"] == 1
+
+
 def test_generate_guided_offspring_records_inactive_details(monkeypatch):
     config = make_neat_config()
     config.guided_replay_fraction = 0.0

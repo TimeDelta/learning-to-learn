@@ -399,6 +399,21 @@ def test_graph_decoder_marks_max_nodes_hit():
     assert graph.get("_decoder_max_nodes") == 0
 
 
+def test_graph_decoder_marks_max_edges_hit():
+    vocab = SharedAttributeVocab([], embedding_dim=4)
+    decoder = GraphDecoder(num_node_types=3, latent_dim=8, shared_attr_vocab=vocab, hidden_dim=4)
+    decoder.max_edges_per_graph = 0
+    decoder.eval()
+
+    latent = torch.zeros(1, decoder.latent_dim)
+    graphs = decoder(latent)
+
+    assert graphs, "decoder returned no graphs"
+    graph = graphs[0]
+    assert graph.get("_max_edges_hit") is True
+    assert graph.get("_decoder_max_edges") == 0
+
+
 def test_graph_decoder_soft_stop_reduces_continue_probability():
     vocab = SharedAttributeVocab([], embedding_dim=4)
     decoder = GraphDecoder(num_node_types=3, latent_dim=8, shared_attr_vocab=vocab, hidden_dim=4)
@@ -413,6 +428,22 @@ def test_graph_decoder_soft_stop_reduces_continue_probability():
 
     near_cap = decoder._apply_node_continue_decay(baseline.clone(), emitted_nodes=9, minimum_required_nodes=1)
     assert decoder.node_stop_decay_min <= near_cap.item() < baseline.item()
+
+
+def test_graph_decoder_edge_soft_stop_reduces_probability():
+    vocab = SharedAttributeVocab([], embedding_dim=4)
+    decoder = GraphDecoder(num_node_types=3, latent_dim=8, shared_attr_vocab=vocab, hidden_dim=4)
+    decoder.max_edges_per_graph = 100
+    decoder.edge_stop_decay_start_ratio = 0.5
+    decoder.edge_stop_decay_margin = 0
+    decoder.edge_stop_decay_min = 0.05
+
+    baseline = torch.full((1,), 0.7)
+    early = decoder._apply_edge_continue_decay(baseline.clone(), emitted_edges=10)
+    assert torch.allclose(early, baseline)
+
+    near_cap = decoder._apply_edge_continue_decay(baseline.clone(), emitted_edges=90)
+    assert decoder.edge_stop_decay_min <= near_cap.item() < baseline.item()
 
 
 def test_graph_decoder_enforces_min_pin_nodes():
