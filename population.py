@@ -734,6 +734,13 @@ class GuidedPopulation(Population):
         self._guided_child_records: List[GuidedChildRecord] = []
         self.guided_debug_dump_enabled = bool(getattr(config, "guided_debug_dump_enabled", False))
         self.guided_debug_dump_limit = max(0, int(getattr(config, "guided_debug_dump_limit", 5)))
+        raw_debug_dir = getattr(config, "guided_debug_dump_dir", None)
+        if raw_debug_dir:
+            self.guided_debug_dump_dir = Path(raw_debug_dir)
+        else:
+            self.guided_debug_dump_dir = Path("debug_guided_offspring")
+        self._guided_debug_dump_generation: int | None = None
+        self._guided_debug_dump_used = 0
         self.validator_compare_main_task = bool(getattr(config, "validator_compare_main_task", True))
         self.validator_mode = str(getattr(config, "validator_mode", "synthetic_fast")).strip().lower()
         self.validator_reset_state = bool(getattr(config, "validator_reset_state", True))
@@ -1348,6 +1355,44 @@ class GuidedPopulation(Population):
 
         if produced_any:
             self._guided_invalid_viz_used += 1
+
+    def _maybe_dump_guided_debug_graph(
+        self,
+        graph_dict: dict | None,
+        *,
+        reason: str,
+        generation: int | None,
+        child_index: int | None,
+        num_edges: int | None,
+    ) -> None:
+        if not self.guided_debug_dump_enabled or self.guided_debug_dump_limit <= 0:
+            return
+        if not graph_dict:
+            return
+        generation_idx = generation if isinstance(generation, int) else -1
+        if generation_idx != self._guided_debug_dump_generation:
+            self._guided_debug_dump_generation = generation_idx
+            self._guided_debug_dump_used = 0
+        if self._guided_debug_dump_used >= self.guided_debug_dump_limit:
+            return
+        try:
+            self.guided_debug_dump_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            warn(f"Failed to create guided debug dump dir '{self.guided_debug_dump_dir}': {exc}")
+            self.guided_debug_dump_enabled = False
+            return
+        safe_reason = re.sub(r"[^A-Za-z0-9_.-]+", "_", reason or "invalid")
+        child_label = child_index if child_index is not None else "X"
+        edge_label = num_edges if num_edges is not None else "X"
+        filename = f"gen{generation_idx:05d}_child{child_label}_edges{edge_label}_{safe_reason}.pt"
+        dump_path = self.guided_debug_dump_dir / filename
+        payload = self._clone_graph_dict(graph_dict)
+        try:
+            torch.save(payload, dump_path)
+        except Exception as exc:
+            warn(f"Failed to write guided debug dump '{dump_path}': {exc}")
+            return
+        self._guided_debug_dump_used += 1
 
     def _consume_decoder_replay_graphs(self) -> list[dict]:
         if not self._decoder_replay_cache:
@@ -2205,13 +2250,6 @@ class GuidedPopulation(Population):
         decoder_max_edges_invalid = 0
         inactive_detail_samples: List[dict] = []
         inactive_repair_salvaged = 0
-        debug_dir: Path | None = None
-        debug_save_limit = 0
-        debug_saved = 0
-        if self.guided_debug_dump_enabled:
-            debug_dir = Path("debug_guided_offspring")
-            debug_dir.mkdir(parents=True, exist_ok=True)
-            debug_save_limit = self.guided_debug_dump_limit
         generation_idx = getattr(self, "generation", -1)
         seen_graph_signatures: Set[str] = set()
         total_requested = z_g.size(0)
@@ -2273,6 +2311,13 @@ class GuidedPopulation(Population):
                     child_index=i,
                     num_edges=num_edges,
                 )
+                self._maybe_dump_guided_debug_graph(
+                    graph_dict,
+                    reason="decoder_max_nodes",
+                    generation=generation_idx,
+                    child_index=i,
+                    num_edges=num_edges,
+                )
                 genome.graph_dict = graph_dict
                 penalty_details = {
                     "decoded_nodes": original_node_count,
@@ -2325,6 +2370,13 @@ class GuidedPopulation(Population):
                     child_index=i,
                     num_edges=num_edges,
                 )
+                self._maybe_dump_guided_debug_graph(
+                    graph_dict,
+                    reason="decoder_max_edges",
+                    generation=generation_idx,
+                    child_index=i,
+                    num_edges=num_edges,
+                )
                 genome.graph_dict = graph_dict
                 penalty_details = {
                     "decoded_edges": original_edge_count,
@@ -2359,6 +2411,13 @@ class GuidedPopulation(Population):
                     genome,
                     graph_dict,
                     reason=reason,
+                    child_index=i,
+                    num_edges=num_edges,
+                )
+                self._maybe_dump_guided_debug_graph(
+                    graph_dict,
+                    reason=reason,
+                    generation=generation_idx,
                     child_index=i,
                     num_edges=num_edges,
                 )
@@ -2439,6 +2498,13 @@ class GuidedPopulation(Population):
                     child_index=i,
                     num_edges=num_edges,
                 )
+                self._maybe_dump_guided_debug_graph(
+                    graph_dict,
+                    reason=repair_reason,
+                    generation=generation_idx,
+                    child_index=i,
+                    num_edges=num_edges,
+                )
                 genome.graph_dict = graph_dict
                 penalty_details = repair_details or {}
                 self._assign_penalty(
@@ -2458,12 +2524,6 @@ class GuidedPopulation(Population):
                 new_genomes.append(genome)
                 continue
 
-            if self.guided_debug_dump_enabled and debug_dir is not None:
-                if num_edges == 0 or debug_saved < debug_save_limit:
-                    debug_path = debug_dir / f"gen{generation_idx}_child{i}_edges{num_edges}.pt"
-                    torch.save(graph_dict, debug_path)
-                    debug_saved += 1
-
             if num_edges == 0:
                 empty_graph_count += 1
                 if child_record:
@@ -2473,6 +2533,13 @@ class GuidedPopulation(Population):
                     genome,
                     graph_dict,
                     reason="empty_graph",
+                    child_index=i,
+                    num_edges=num_edges,
+                )
+                self._maybe_dump_guided_debug_graph(
+                    graph_dict,
+                    reason="empty_graph",
+                    generation=generation_idx,
                     child_index=i,
                     num_edges=num_edges,
                 )
@@ -2531,6 +2598,13 @@ class GuidedPopulation(Population):
                     child_index=i,
                     num_edges=num_edges,
                 )
+                self._maybe_dump_guided_debug_graph(
+                    graph_dict,
+                    reason="missing_output_slots",
+                    generation=generation_idx,
+                    child_index=i,
+                    num_edges=num_edges,
+                )
                 genome.graph_dict = graph_dict
                 total_slots = len(getattr(self.config.genome_config, "output_keys", []))
                 wrong_type_slots = slot_details.get("wrong_type_slots") or slot_details.get("wrong_role_slots") or []
@@ -2572,6 +2646,13 @@ class GuidedPopulation(Population):
                         genome,
                         graph_dict,
                         reason="inactive_optimizer",
+                        child_index=i,
+                        num_edges=num_edges,
+                    )
+                    self._maybe_dump_guided_debug_graph(
+                        graph_dict,
+                        reason="inactive_optimizer",
+                        generation=generation_idx,
                         child_index=i,
                         num_edges=num_edges,
                     )
@@ -2639,6 +2720,13 @@ class GuidedPopulation(Population):
             if child_record:
                 child_record.failure_reason = "rebuild_failed"
             warn("Guided offspring decoder failed to rebuild a valid optimizer; skipping child.")
+            self._maybe_dump_guided_debug_graph(
+                graph_dict,
+                reason="rebuild_failed",
+                generation=generation_idx,
+                child_index=i,
+                num_edges=num_edges,
+            )
             self._buffer_decoder_replay_dict(graph_dict)
             if last_valid_graph_dict is not None:
                 self._buffer_decoder_replay_dict(last_valid_graph_dict)
