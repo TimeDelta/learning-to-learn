@@ -749,6 +749,19 @@ class GuidedPopulation(Population):
         self.validator_check_steps = max(1, int(getattr(config, "validator_check_steps", 2)))
         self._validator_confusion: Counter = Counter()
         self.structure_penalty_enabled = bool(getattr(config, "structure_penalty_enabled", True))
+        self.decoder_relax_weight = max(0.0, float(getattr(config, "guided_decoder_relax_weight", 0.1)))
+        self.decoder_relax_steps = max(1, int(getattr(config, "guided_decoder_relax_steps", 24)))
+        self.decoder_relax_edge_depth = max(1, int(getattr(config, "guided_decoder_relax_edge_depth", 12)))
+        self.decoder_relax_min_continue = min(
+            0.999,
+            max(0.0, float(getattr(config, "guided_decoder_relax_min_continue", 0.65))),
+        )
+        default_edge_target = float(len(getattr(self.guide.decoder, "required_output_slots", []) or [0]) or 1)
+        self.decoder_relax_edge_target = max(
+            0.0, float(getattr(config, "guided_decoder_relax_edge_target", max(1.0, default_edge_target)))
+        )
+        self.decoder_relax_edge_weight = max(0.0, float(getattr(config, "guided_decoder_relax_edge_weight", 1.0)))
+        self._decoder_relax_stats: dict | None = None
         self.repair_activity_probe_fraction = float(getattr(config, "repair_activity_probe_fraction", 0.0))
         self.repair_activity_probe_max = max(0, int(getattr(config, "repair_activity_probe_max", 8)))
         self._repair_activity_probes_used = 0
@@ -946,6 +959,9 @@ class GuidedPopulation(Population):
         structure_penalty_last: float | None = None,
         structure_penalty_sum: float | None = None,
         structure_penalty_steps: int = 0,
+        decoder_relax_last: float | None = None,
+        decoder_relax_sum: float | None = None,
+        decoder_relax_steps: int = 0,
         decoder_max_nodes_hits: int = 0,
         decoder_max_nodes_invalid: int = 0,
         decoder_max_edges_hits: int = 0,
@@ -971,6 +987,11 @@ class GuidedPopulation(Population):
         if structure_penalty_steps and structure_penalty_sum is not None:
             stats["structure_penalty_mean"] = float(structure_penalty_sum) / max(1, structure_penalty_steps)
             stats["structure_penalty_samples"] = int(structure_penalty_steps)
+        if decoder_relax_last is not None:
+            stats["decoder_relax_last"] = float(decoder_relax_last)
+        if decoder_relax_steps and decoder_relax_sum is not None:
+            stats["decoder_relax_mean"] = float(decoder_relax_sum) / max(1, decoder_relax_steps)
+            stats["decoder_relax_samples"] = int(decoder_relax_steps)
         if decoder_max_nodes_hits:
             stats["decoder_max_nodes_hits"] += int(decoder_max_nodes_hits)
         if decoder_max_nodes_invalid:
@@ -979,6 +1000,9 @@ class GuidedPopulation(Population):
             stats["decoder_max_edges_hits"] += int(decoder_max_edges_hits)
         if decoder_max_edges_invalid:
             stats["decoder_max_edges_invalid"] += int(decoder_max_edges_invalid)
+        relax_stats = self._decoder_relax_stats
+        if relax_stats:
+            stats["decoder_relax_metrics"] = dict(relax_stats)
         if inactive_details:
             stats["inactive_details_total"] += len(inactive_details)
             limit = self.guided_inactive_detail_limit
@@ -1877,6 +1901,98 @@ class GuidedPopulation(Population):
         min_nodes = max(min_nodes, required_inputs + len(required_output_slots), 1)
         return required_inputs, required_output_slots, min_nodes
 
+    def _latent_decoder_relax_penalty(self, latents: torch.Tensor) -> torch.Tensor:
+        if self.decoder_relax_weight <= 0 or latents.numel() == 0:
+            return torch.zeros((), dtype=latents.dtype, device=latents.device)
+        decoder = getattr(self.guide, "decoder", None)
+        if decoder is None:
+            return torch.zeros((), dtype=latents.dtype, device=latents.device)
+        required_attrs = (
+            "node_hidden_state_init",
+            "node_rnn",
+            "stop_head",
+            "edge_rnn",
+            "edge_head",
+        )
+        missing = [name for name in required_attrs if not hasattr(decoder, name)]
+        if missing:
+            return torch.zeros((), dtype=latents.dtype, device=latents.device)
+        required_inputs, required_outputs, min_nodes = self._decoder_pin_requirements()
+        try:
+            decoder_max_nodes = int(getattr(decoder, "max_nodes", self.decoder_relax_steps))
+        except (TypeError, ValueError):
+            decoder_max_nodes = self.decoder_relax_steps
+        steps = max(min_nodes, min(self.decoder_relax_steps, max(1, decoder_max_nodes)))
+        batch_size = latents.size(0)
+        zero_node_input = torch.zeros(batch_size, 0, device=latents.device, dtype=latents.dtype)
+        hidden = torch.relu(decoder.node_hidden_state_init(latents))
+        node_states: List[torch.Tensor] = []
+        continue_probs: List[torch.Tensor] = []
+        for _ in range(steps):
+            hidden = decoder.node_rnn(zero_node_input, hidden)
+            stop_logit = decoder.stop_head(hidden)
+            stop_prob = torch.sigmoid(stop_logit)
+            continue_prob = (1.0 - stop_prob).clamp(min=1e-4, max=1.0)
+            continue_probs.append(continue_prob.view(batch_size, 1))
+            node_states.append(hidden)
+        if not continue_probs:
+            return torch.zeros((), dtype=latents.dtype, device=latents.device)
+        continue_stack = torch.cat(continue_probs, dim=1)
+        exist_probs = torch.ones(batch_size, steps, device=latents.device, dtype=latents.dtype)
+        if steps > 1:
+            survive = torch.cumprod(continue_stack[:, :-1], dim=1)
+            exist_probs[:, 1:] = survive
+        expected_nodes = exist_probs.sum(dim=1)
+        node_shortfall = torch.clamp(latents.new_tensor(min_nodes) - expected_nodes, min=0.0)
+        enforce_steps = min(steps, min_nodes)
+        continue_term = torch.zeros_like(node_shortfall)
+        if enforce_steps > 0 and self.decoder_relax_min_continue > 0:
+            target = torch.full(
+                (batch_size, enforce_steps),
+                float(self.decoder_relax_min_continue),
+                device=latents.device,
+                dtype=latents.dtype,
+            )
+            continue_term = torch.relu(target - continue_stack[:, :enforce_steps]).mean(dim=1)
+        expected_edges = None
+        if steps > 1 and self.decoder_relax_edge_weight > 0 and self.decoder_relax_edge_target > 0:
+            edge_depth = min(self.decoder_relax_edge_depth, steps - 1)
+            if edge_depth > 0:
+                expected_edges = torch.zeros(batch_size, device=latents.device, dtype=latents.dtype)
+                zero_edge_input = torch.zeros(batch_size, 1, device=latents.device, dtype=latents.dtype)
+                for node_idx in range(1, steps):
+                    target_exist = exist_probs[:, node_idx]
+                    hidden_edge = node_states[node_idx]
+                    edge_in = zero_edge_input
+                    depth = min(node_idx, edge_depth)
+                    for prev_idx in range(depth):
+                        hidden_edge = decoder.edge_rnn(edge_in, hidden_edge)
+                        edge_logit = decoder.edge_head(hidden_edge)
+                        edge_prob = torch.sigmoid(edge_logit).view(batch_size)
+                        src_exist = exist_probs[:, prev_idx]
+                        expected_edges = expected_edges + edge_prob * target_exist * src_exist
+                        edge_in = edge_prob.unsqueeze(1)
+        edge_term = None
+        if expected_edges is not None:
+            edge_term = torch.clamp(self.decoder_relax_edge_target - expected_edges, min=0.0)
+        per_latent = node_shortfall + continue_term
+        if edge_term is not None:
+            per_latent = per_latent + self.decoder_relax_edge_weight * edge_term
+        penalty = per_latent.mean() * self.decoder_relax_weight
+        with torch.no_grad():
+            stats = {
+                "expected_nodes": float(expected_nodes.mean().detach().cpu().item()),
+                "node_shortfall": float(node_shortfall.mean().detach().cpu().item()),
+                "continue_gap": float(continue_term.mean().detach().cpu().item()),
+            }
+            if expected_edges is not None:
+                stats["expected_edges"] = float(expected_edges.mean().detach().cpu().item())
+                stats["edge_shortfall"] = (
+                    float(edge_term.mean().detach().cpu().item()) if edge_term is not None else 0.0
+                )
+        self._decoder_relax_stats = stats
+        return penalty
+
     def _ensure_replay_pin_metadata(self, graph_dict: dict | None) -> None:
         if not graph_dict:
             return
@@ -2192,6 +2308,9 @@ class GuidedPopulation(Population):
         structure_penalty_sum = 0.0
         structure_penalty_steps = 0
         structure_penalty_last = None
+        decoder_relax_sum = 0.0
+        decoder_relax_steps = 0
+        decoder_relax_last = None
         for _ in range(latent_steps):
             pred, _, convex_pred = self.guide.fitness_predictor(z_g)
             guiding_pred = convex_pred if convex_pred is not None else pred
@@ -2210,6 +2329,15 @@ class GuidedPopulation(Population):
                 structure_penalty_sum += penalty_value
                 structure_penalty_steps += 1
                 structure_penalty_last = penalty_value
+            decoder_relax = self._latent_decoder_relax_penalty(z_g)
+            decoder_value = None
+            if decoder_relax.numel():
+                loss = loss + decoder_relax
+                decoder_value = float(decoder_relax.detach().item())
+            if decoder_value is not None:
+                decoder_relax_sum += decoder_value
+                decoder_relax_steps += 1
+                decoder_relax_last = decoder_value
             per_latent_tether = F.mse_loss(z_g, z_g_initial, reduction="none").mean(dim=1)
             if learnable_tether and latent_tether_logit is not None:
                 weights = F.softplus(latent_tether_logit).view(-1)
@@ -2231,6 +2359,13 @@ class GuidedPopulation(Population):
             self.reporters.info(
                 "Latent structure penalty mean %.6f (last=%.6f, samples=%d)"
                 % (structure_penalty_mean, structure_penalty_last or 0.0, structure_penalty_steps)
+            )
+        decoder_relax_mean = None
+        if decoder_relax_steps > 0:
+            decoder_relax_mean = decoder_relax_sum / decoder_relax_steps
+            self.reporters.info(
+                "Latent decoder relax penalty mean %.6f (last=%.6f, samples=%d)"
+                % (decoder_relax_mean, decoder_relax_last or 0.0, decoder_relax_steps)
             )
 
         child_graph_stats = []
@@ -2813,6 +2948,9 @@ class GuidedPopulation(Population):
             structure_penalty_last=structure_penalty_last,
             structure_penalty_sum=structure_penalty_sum if structure_penalty_steps else None,
             structure_penalty_steps=structure_penalty_steps,
+            decoder_relax_last=decoder_relax_last,
+            decoder_relax_sum=decoder_relax_sum if decoder_relax_steps else None,
+            decoder_relax_steps=decoder_relax_steps,
             decoder_max_nodes_hits=decoder_max_nodes_hits,
             decoder_max_nodes_invalid=decoder_max_nodes_invalid,
             decoder_max_edges_hits=decoder_max_edges_hits,

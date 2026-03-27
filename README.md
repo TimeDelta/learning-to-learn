@@ -140,6 +140,19 @@ These phases are also logged to MLflow via the `trainer_module_active_*` metrics
 Leaving the cycle unset defaults to a balanced round-robin across whatever modules exist in the current guide.
 The teacher-forcing refresh temporarily unfreezes all heads so the auxiliary rehearsal can update the entire stack regardless of the main-cycle state.
 
+### Latent Decoder Relaxation
+
+During guided offspring generation the latent optimizer now runs an extra "relaxed" decode after every gradient step. Instead of sampling discrete nodes/edges, this pass tracks the decoder's stop and edge logits directly, which keeps the computation graph differentiable. The relaxed decode penalizes latents whose expected node count falls below the enforced pin quota, whose continue probabilities collapse before hitting the output slots, or whose expected edge mass is near zero. This injects structural feedback early, so the ICNN/MLP heads are no longer the only sources of gradients.
+
+Fine-tune the behavior via the `[GuidedPopulation]` config keys:
+
+- `guided_decoder_relax_weight` (default `0.1`): scales the new penalty; set to `0` to disable.
+- `guided_decoder_relax_steps` / `guided_decoder_relax_edge_depth`: cap how many GRU iterations the relaxed decode performs for nodes and edges.
+- `guided_decoder_relax_min_continue`: target minimum continue probability for the first `min_pin_nodes` iterations.
+- `guided_decoder_relax_edge_target` and `guided_decoder_relax_edge_weight`: require a minimum expected edge mass and control how hard that constraint pushes.
+
+The resulting statistics (expected nodes, edges, shortfall, etc.) are logged in the guided-offspring diagnostics so you can see whether latent updates are fighting decoder constraints or the surrogate fitness loss.
+
 ### Generative Cross-Species Crossover (Graph-VAE)
 
 Another key innovation is a Variational Autoencoder (VAE) that enables unrestricted structural recombination of neural network architectures.

@@ -166,6 +166,28 @@ class StubGuide:
         return [graph]
 
 
+class RelaxDecoderStub(torch.nn.Module):
+    def __init__(self, latent_dim, hidden_dim=4):
+        super().__init__()
+        self.node_hidden_state_init = torch.nn.Linear(latent_dim, hidden_dim)
+        self.stop_head = torch.nn.Linear(hidden_dim, 1)
+        self.edge_head = torch.nn.Linear(hidden_dim, 1)
+        self.required_output_slots = [0, 1]
+        self._min_required_nodes = 3
+        self.max_nodes = 8
+        self._resolved_inputs = 1
+
+    def _resolved_required_input_slots(self):
+        return self._resolved_inputs
+
+    def node_rnn(self, zero_input, hidden):  # pragma: no cover - simple activation
+        return torch.tanh(hidden)
+
+    def edge_rnn(self, edge_input, hidden):  # pragma: no cover - simple activation
+        del edge_input
+        return torch.tanh(hidden)
+
+
 class RecordingReporters:
     def __init__(self):
         self.messages: list[str] = []
@@ -703,6 +725,30 @@ def test_generate_guided_offspring_tracks_structure_penalty(monkeypatch):
     assert stats["structure_penalty_last"] == pytest.approx(expected_values[-1])
     expected_mean = sum(expected_values) / expected_samples
     assert stats["structure_penalty_mean"] == pytest.approx(expected_mean)
+
+
+def test_latent_decoder_relax_penalty_tracks_stats():
+    config = make_neat_config()
+    config.guided_decoder_relax_weight = 1.0
+    config.guided_decoder_relax_steps = 4
+    config.guided_decoder_relax_edge_depth = 2
+    pop = GuidedPopulation(config)
+    latent_dim = pop.guide.graph_encoder.latent_dim
+    decoder_stub = RelaxDecoderStub(latent_dim)
+    decoder_stub.stop_head.bias.data.fill_(5.0)
+    decoder_stub.edge_head.bias.data.fill_(-5.0)
+    pop.guide.decoder = decoder_stub
+    latents = torch.zeros((2, latent_dim), dtype=torch.float32, requires_grad=True)
+
+    penalty = pop._latent_decoder_relax_penalty(latents)
+
+    assert penalty.item() > 0
+    penalty.backward()
+    assert latents.grad is not None
+    stats = pop._decoder_relax_stats
+    _, _, min_nodes = pop._decoder_pin_requirements()
+    assert stats["expected_nodes"] < float(min_nodes)
+    assert "expected_edges" in stats
 
 
 def test_decoder_replay_seed_support_follows_validator_fail_ratio():
