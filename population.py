@@ -43,6 +43,7 @@ from loop_blocks import (
 )
 from metrics import *
 from models import *
+from novelty import NoveltyArchive, NoveltyMetric, graph_behavior_descriptor
 from pareto import *
 from reproduction import GuidedReproduction
 from search_space_compression import *
@@ -457,7 +458,54 @@ class GuidedPopulation(Population):
             )
         else:
             logger.info("Validator task disabled; falling back to main task for optimizer checks")
-        self.metric_keys = self._evaluation_metric_keys(self.task)
+        base_metric_keys = self._evaluation_metric_keys(self.task)
+        self.novelty_archive_enabled = bool(getattr(config, "novelty_archive_enabled", True))
+        raw_bins = getattr(config, "novelty_descriptor_top_types", 4)
+        try:
+            bins_val = int(raw_bins)
+        except (TypeError, ValueError):
+            bins_val = 4
+        self.novelty_descriptor_top_types = max(1, bins_val)
+        if self.novelty_archive_enabled:
+            raw_k = getattr(config, "novelty_k", 15)
+            raw_max = getattr(config, "novelty_archive_max", 512)
+            raw_min_fill = getattr(config, "novelty_archive_min_fill", None)
+            try:
+                novelty_k = max(1, int(raw_k))
+            except (TypeError, ValueError):
+                novelty_k = 15
+            try:
+                novelty_max = max(1, int(raw_max))
+            except (TypeError, ValueError):
+                novelty_max = 512
+            if raw_min_fill is None:
+                novelty_min_fill = novelty_k
+            else:
+                try:
+                    novelty_min_fill = max(novelty_k, int(raw_min_fill))
+                except (TypeError, ValueError):
+                    novelty_min_fill = novelty_k
+            novelty_insert_probability = float(getattr(config, "novelty_insert_probability", 0.2))
+            novelty_insert_probability = max(0.0, min(1.0, novelty_insert_probability))
+            novelty_threshold = getattr(config, "novelty_add_threshold", None)
+            if novelty_threshold is not None:
+                try:
+                    novelty_threshold = float(novelty_threshold)
+                except (TypeError, ValueError):
+                    novelty_threshold = None
+            base_metric_keys = list(base_metric_keys)
+            base_metric_keys.append(NoveltyMetric)
+            base_metric_keys = sort_metrics_by_name(base_metric_keys)
+            self.novelty_archive = NoveltyArchive(
+                k=novelty_k,
+                max_size=novelty_max,
+                min_fill=novelty_min_fill,
+                insertion_probability=novelty_insert_probability,
+                score_threshold=novelty_threshold,
+            )
+        else:
+            self.novelty_archive = None
+        self.metric_keys = base_metric_keys
         self.metric_best_values = self._metric_best_values(self.metric_keys)
         self.metric_guidance_weights = self._metric_guidance_weights(self.metric_keys)
         # Configure how large the decoded attribute tensors may be. This cap must be
@@ -3929,11 +3977,12 @@ class GuidedPopulation(Population):
         """
         Evaluate each genome by using its network as a meta–optimizer.
         """
-        metric_keys = self._evaluation_metric_keys(self.task)
+        metric_keys = self.metric_keys
         raw_metrics: Dict[int, Dict[str, float]] = {}
         invalid_genomes: List[int] = []
         invalid_reason_counts: Counter = Counter()
         genome_map = {gid: g for gid, g in genomes}
+        novelty_descriptors: Dict[int, Tuple[float, ...]] = {}
 
         model = ManyLossMinimaModel(self.task.train_data.num_input_features)
         for genome_id, genome in genomes:
@@ -3969,6 +4018,11 @@ class GuidedPopulation(Population):
             validation_metrics[AreaUnderTaskMetrics] = area_under_metrics
             validation_metrics[TimeCost] = time_cost
             validation_metrics[MemoryCost] = mem_cost
+            if self.novelty_archive_enabled:
+                novelty_descriptors[genome_id] = graph_behavior_descriptor(
+                    genome,
+                    top_type_bins=self.novelty_descriptor_top_types,
+                )
 
             # Guard against accidental over-long/unnamed fitness vectors by
             # stripping any keys that are not part of the expected metric list.
@@ -3977,6 +4031,9 @@ class GuidedPopulation(Population):
             for metric in metric_keys:
                 value = validation_metrics.get(metric)
                 if value is None:
+                    if self.novelty_archive_enabled and metric is NoveltyMetric:
+                        filtered_metrics[metric] = 0.0
+                        continue
                     missing_metrics.append(metric.name if hasattr(metric, "name") else str(metric))
                     filtered_metrics[metric] = self.INVALID_METRIC_VALUE
                 else:
@@ -4003,6 +4060,18 @@ class GuidedPopulation(Population):
                 f"All genomes invalid this generation ({len(invalid_genomes)}/{len(genome_map)}); skipping Pareto ranking"
             )
             return genomes
+
+        if self.novelty_archive_enabled:
+            evaluated_descriptors = {
+                gid: novelty_descriptors[gid] for gid in raw_metrics.keys() if gid in novelty_descriptors
+            }
+            if evaluated_descriptors:
+                novelty_scores = self.novelty_archive.score_population(evaluated_descriptors)
+                for gid, score in novelty_scores.items():
+                    raw_metrics[gid][NoveltyMetric] = score
+                invalid_set = set(invalid_genomes)
+                valid_ids = [gid for gid in evaluated_descriptors.keys() if gid not in invalid_set]
+                self.novelty_archive.update(evaluated_descriptors, novelty_scores, valid_ids)
 
         # 3. Pareto front ranking (exclude penalized metrics from dominance calc)
         print("  Calculating Pareto Fronts")
