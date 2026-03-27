@@ -728,6 +728,7 @@ class GuidedPopulation(Population):
         self._initial_compression_done = False
         self._enable_initial_compression = getattr(config, "enable_initial_compression", False)
         self.guided_stats_callback = None
+        self.neat_invalid_stats_callback = None
         self._guided_offspring_stats = None
         self._prev_guided_offspring_stats = None
         self._total_repair_salvaged = 0
@@ -1115,6 +1116,19 @@ class GuidedPopulation(Population):
         if requested <= 0:
             return 0.0
         return max(0.0, min(1.0, failures / requested))
+
+    def _emit_neat_invalid_stats(self, total_genomes: int, invalid_counts: Counter) -> None:
+        if self.neat_invalid_stats_callback is None:
+            return
+        by_reason = {str(reason): int(count) for reason, count in (invalid_counts or {}).items()}
+        stats = {
+            "generation": self.generation,
+            "evaluated": int(total_genomes),
+            "invalid_total": int(sum(by_reason.values())),
+            "inactive_invalid": int(by_reason.get("inactive_optimizer", 0)),
+            "invalid_by_reason": by_reason,
+        }
+        self.neat_invalid_stats_callback(stats)
 
     def _emit_dataset_stats(self, valid_size: int, invalid_size: int):
         if not self.dataset_stats_callback:
@@ -4048,6 +4062,8 @@ class GuidedPopulation(Population):
                 )
 
             raw_metrics[genome_id] = filtered_metrics
+
+        self._emit_neat_invalid_stats(len(genome_map), invalid_reason_counts)
 
         if not raw_metrics:
             self.reporters.info(

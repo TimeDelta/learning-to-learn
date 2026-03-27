@@ -1355,6 +1355,35 @@ if __name__ == "__main__":
 
             population.guided_stats_callback = _log_guided_stats
 
+            def _log_neat_invalid_stats(stats: dict):
+                if not stats:
+                    return
+                step = trainer_last_step.get("value", 0)
+                invalid_by_reason = stats.get("invalid_by_reason") or {}
+                metrics = {
+                    "population_invalid_total": stats.get("invalid_total"),
+                    "population_inactive_invalid": stats.get("inactive_invalid"),
+                    "population_evaluated_genomes": stats.get("evaluated"),
+                }
+                for reason, count in invalid_by_reason.items():
+                    metrics[f"population_invalid_{reason}"] = count
+                metrics = {k: v for k, v in metrics.items() if v is not None}
+                if metrics:
+                    mlflow_run.log_metrics(metrics, step=step)
+                summary = (
+                    f"Population invalid gen {stats.get('generation')}: "
+                    f"evaluated={stats.get('evaluated', 0)} "
+                    f"invalid_total={stats.get('invalid_total', 0)} "
+                    f"inactive={stats.get('inactive_invalid', 0)}"
+                )
+                if invalid_by_reason:
+                    parts = ", ".join(f"{reason}={count}" for reason, count in sorted(invalid_by_reason.items()))
+                    summary += f" :: {parts}"
+                mlflow_run.append_log_line(summary)
+                mlflow_run.flush_log()
+
+            population.neat_invalid_stats_callback = _log_neat_invalid_stats
+
             def _log_dataset_stats(stats: dict):
                 if not stats:
                     return
