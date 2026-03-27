@@ -129,7 +129,6 @@ class _DummyFitnessHead(torch.nn.Module):
         self.fc1 = torch.nn.Linear(1, 1)
         self.fc2 = torch.nn.Linear(1, 1)
         self.log_metric_scale = torch.nn.Parameter(torch.zeros(1))
-        self.icnn = None
 
     def forward(self, *args, **kwargs):  # pragma: no cover - not needed for tests
         raise NotImplementedError
@@ -156,7 +155,7 @@ class StubFitnessPredictor(torch.nn.Module):
 
     def forward(self, z):  # pragma: no cover - simple stub
         zeros = torch.zeros(z.size(0), self.output_dim, device=z.device, dtype=z.dtype)
-        return zeros, torch.zeros_like(zeros), None
+        return zeros, torch.zeros_like(zeros)
 
 
 class StubGuide:
@@ -1507,24 +1506,24 @@ def test_fitness_predictor_returns_per_metric_log_scales():
     z_graph = torch.randn(5, 4)
     predictor.log_metric_scale.data = torch.tensor([0.1, -0.2, 0.05])
 
-    preds, log_scales, convex_pred = predictor(z_graph)
+    preds, log_scales = predictor(z_graph)
 
     assert preds.shape == (5, 3)
     assert log_scales.shape == (5, 3)
-    assert convex_pred is None
     # All rows should share the learned scale parameters
     expected = predictor.log_metric_scale.detach()
     assert torch.allclose(log_scales[0], expected)
     assert torch.allclose(log_scales, expected.unsqueeze(0).expand_as(log_scales))
 
 
-def test_fitness_predictor_emits_convex_predictions():
+def test_fitness_predictor_uses_icnn_outputs():
     predictor = FitnessPredictor(latent_dim=4, hidden_dim=8, fitness_dim=2, icnn_hidden_dims=(4, 2))
     z_graph = torch.randn(3, 4)
-    preds, log_scales, convex_pred = predictor(z_graph)
+    preds, log_scales = predictor(z_graph)
+    direct = predictor.icnn(z_graph)
     assert preds.shape == (3, 2)
     assert log_scales.shape == (3, 2)
-    assert convex_pred.shape == (3, 2)
+    assert torch.allclose(preds, direct)
 
 
 def test_flatten_task_features_respects_expected_length():

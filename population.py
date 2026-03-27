@@ -707,7 +707,6 @@ class GuidedPopulation(Population):
         self.repair_randomize_connections = bool(getattr(config, "repair_randomize_connections", False))
         self.trainer.configure_module_freeze_cycle(getattr(config, "trainer_freeze_cycle", None))
         self.trainer.module_freeze_verbose = bool(getattr(config, "trainer_freeze_verbose", False))
-        self.convex_surrogate_weight = float(getattr(config, "convex_surrogate_weight", 0.5))
         beta_schedule = StagedBetaSchedule(
             start_beta=0.05,
             target_beta=0.15,
@@ -2361,8 +2360,7 @@ class GuidedPopulation(Population):
         decoder_relax_steps = 0
         decoder_relax_last = None
         for _ in range(latent_steps):
-            pred, _, convex_pred = self.guide.fitness_predictor(z_g)
-            guiding_pred = convex_pred if convex_pred is not None else pred
+            guiding_pred, _ = self.guide.fitness_predictor(z_g)
             canonical = canonical_log_distance(guiding_pred, best_tensor)
             if self.guided_pareto_enabled and predictor_dim > 1:
                 loss = self._pareto_latent_loss(canonical, weight_tensor)
@@ -3887,7 +3885,6 @@ class GuidedPopulation(Population):
                     epochs=schedule["epochs"],
                     batch_size=batch,
                     generation=self.generation,
-                    convex_weight=self.convex_surrogate_weight,
                     warmup_epochs=schedule["warmup_epochs"],
                     loss_threshold=schedule["loss_threshold"],
                     baseline_window=schedule["baseline_window"],

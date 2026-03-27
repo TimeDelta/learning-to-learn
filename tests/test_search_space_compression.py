@@ -36,7 +36,6 @@ class _MinimalFitness(torch.nn.Module):
         self.fc1 = torch.nn.Linear(1, 1)
         self.fc2 = torch.nn.Linear(1, 1)
         self.log_metric_scale = torch.nn.Parameter(torch.zeros(1))
-        self.icnn = None
 
     def forward(self, *args, **kwargs):  # pragma: no cover - not exercised in unit tests
         raise NotImplementedError

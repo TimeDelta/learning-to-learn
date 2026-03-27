@@ -1982,7 +1982,7 @@ class InputConvexNN(nn.Module):
 
 class FitnessPredictor(nn.Module):
     """
-    Heteroscedastic predictor paired with an optional ICNN convex surrogate
+    Heteroscedastic fitness predictor implemented as a single ICNN head
     (see "Input Convex Neural Networks" by Brandon Amos, Lei Xu, J. Zico Kolter [2017]).
     """
 
@@ -1995,30 +1995,22 @@ class FitnessPredictor(nn.Module):
         icnn_activation=F.softplus,
     ):
         super().__init__()
-        self.fc1 = nn.Linear(latent_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, fitness_dim)
         self.output_dim = fitness_dim
         self.latent_dim = latent_dim
         self.log_metric_scale = nn.Parameter(torch.zeros(fitness_dim))
-        if icnn_hidden_dims:
-            self.icnn = InputConvexNN(latent_dim, icnn_hidden_dims, fitness_dim, activation=icnn_activation)
+        if icnn_hidden_dims is None:
+            icnn_dims: Sequence[int] = (int(hidden_dim),) if hidden_dim else ()
         else:
-            self.icnn = None
+            icnn_dims = tuple(int(dim) for dim in icnn_hidden_dims if int(dim) > 0)
+        self.icnn = InputConvexNN(latent_dim, icnn_dims, fitness_dim, activation=icnn_activation)
 
     def forward(self, z_graph: torch.Tensor):
-        pred = self.fc2(F.relu(self.fc1(z_graph)))
+        pred = self.icnn(z_graph)
         log_scales = self.log_metric_scale.unsqueeze(0).expand(pred.size(0), -1)
-        convex_pred = self.icnn(z_graph) if self.icnn is not None else None
-        return pred, log_scales, convex_pred
+        return pred, log_scales
 
     def prune_latent_dims(self, kept_idx: torch.LongTensor):
-        kept = kept_idx.to(self.fc1.weight.device)
-        new_fc1 = nn.Linear(len(kept), self.fc1.out_features).to(self.fc1.weight.device)
-        new_fc1.weight.data.copy_(self.fc1.weight.data[:, kept])
-        new_fc1.bias.data.copy_(self.fc1.bias.data)
-        self.fc1 = new_fc1
-        if self.icnn is not None:
-            self.icnn.prune_latent_dims(kept_idx)
+        self.icnn.prune_latent_dims(kept_idx)
         self.latent_dim = len(kept_idx)
 
 
@@ -2117,12 +2109,11 @@ class SelfCompressingFitnessRegularizedDAGVAE(nn.Module):
             decoded_graphs, decoder_aux = decoded
         else:
             decoded_graphs, decoder_aux = decoded, None
-        fitness_pred, metric_log_scales, convex_pred = self.fitness_predictor(graph_latent)
+        fitness_pred, metric_log_scales = self.fitness_predictor(graph_latent)
         return (
             decoded_graphs,
             fitness_pred,
             metric_log_scales,
-            convex_pred,
             graph_latent,
             mu_g,
             lv_g,
@@ -2222,7 +2213,7 @@ class OnlineTrainer:
     supporting variable node-feature dimensions via list-of-graphs decoding.
     """
 
-    _BASE_MODULE_ORDER = ("encoder", "decoder", "fitness", "icnn")
+    _BASE_MODULE_ORDER = ("encoder", "decoder", "fitness")
     _MODULE_SYNONYMS = {
         "enc": "encoder",
         "encoder": "encoder",
@@ -2231,8 +2222,6 @@ class OnlineTrainer:
         "decoder": "decoder",
         "fitness": "fitness",
         "surrogate": "fitness",
-        "icnn": "icnn",
-        "convex": "icnn",
     }
 
     def __init__(
@@ -2293,10 +2282,7 @@ class OnlineTrainer:
 
     def _build_module_param_groups(self) -> dict[str, tuple[torch.nn.Parameter, ...]]:
         fitness = self.model.fitness_predictor
-        fitness_params: list[torch.nn.Parameter] = []
-        fitness_params.extend(list(fitness.fc1.parameters()))
-        fitness_params.extend(list(fitness.fc2.parameters()))
-        fitness_params.append(fitness.log_metric_scale)
+        fitness_params: list[torch.nn.Parameter] = list(fitness.parameters())
         groups: dict[str, list[torch.nn.Parameter]] = {
             "encoder": list(self.model.graph_encoder.parameters()),
             "decoder": list(self.model.decoder.parameters()),
@@ -2304,9 +2290,6 @@ class OnlineTrainer:
         }
         if hasattr(self.model, "log_alpha_g") and isinstance(self.model.log_alpha_g, torch.nn.Parameter):
             groups["encoder"].append(self.model.log_alpha_g)
-        icnn = getattr(fitness, "icnn", None)
-        if icnn is not None:
-            groups["icnn"] = list(icnn.parameters())
         return {name: tuple(params) for name, params in groups.items() if params}
 
     def configure_module_freeze_cycle(self, cycle_spec: Optional[Sequence[str] | str]):
@@ -2669,7 +2652,6 @@ class OnlineTrainer:
         batch_size=16,
         kl_weight=10.0,
         fitness_weight=1.5,
-        convex_weight=0.5,
         warmup_epochs=None,
         loss_threshold=0.9,
         min_prune_break=5,
@@ -2709,7 +2691,6 @@ class OnlineTrainer:
             "attribute_recon",
             "graph_kl",
             "fitness",
-            "convex_surrogate",
             "wl_structural",
         ]
         num_loss_terms = len(loss_term_labels)
@@ -2762,7 +2743,6 @@ class OnlineTrainer:
                     decoded_graphs,
                     fitness_pred,
                     metric_log_scales,
-                    convex_pred,
                     graph_latent,
                     mu_g,
                     lv_g,
@@ -2823,20 +2803,12 @@ class OnlineTrainer:
                 per_metric_error_sum += raw_weighted_error.detach().sum(dim=0).cpu()
                 per_metric_weight_sum += weight_expand.detach().sum(dim=0).cpu()
 
-                loss_convex = torch.tensor(0.0, device=self.device)
-                if convex_pred is not None:
-                    convex_canonical = canonical_log_distance(convex_pred, best)
-                    convex_error = (convex_canonical - target_canonical).pow(2)
-                    convex_weighted = convex_error * weight_expand
-                    loss_convex = convex_weighted.sum() / denom
-
                 wl_loss = self._structural_alignment_loss(batch, graph_latent)
 
                 loss_adj = _finite_loss(loss_adj)
                 loss_feat = _finite_loss(loss_feat)
                 graph_kl_loss = _finite_loss(graph_kl_loss)
                 loss_fitness = _finite_loss(loss_fitness)
-                loss_convex = _finite_loss(loss_convex)
                 wl_loss = _finite_loss(wl_loss)
 
                 # --- 5) total & backward ---
@@ -2845,7 +2817,6 @@ class OnlineTrainer:
                     loss_feat,
                     current_kl_weight * graph_kl_loss,
                     fitness_weight * loss_fitness,
-                    convex_weight * loss_convex,
                     self.wl_loss_weight * wl_loss,
                 ]
                 sum(loss_terms).backward()
@@ -2876,21 +2847,6 @@ class OnlineTrainer:
                         "WL structural loss is %.2f%% of total; consider lowering wl_kernel_loss_weight to avoid overpowering reconstruction/fitness terms.",
                         ratio * 100.0,
                     )
-
-            convex_idx = loss_term_labels.index("convex_surrogate")
-            convex_value = float(avg_loss_terms[convex_idx].item())
-            if (
-                self.wl_loss_weight > 0
-                and convex_weight > 0
-                and wl_value > 0
-                and convex_value > 0
-                and (wl_value / max(convex_value, 1e-8)) > 2.0
-            ):
-                logger.warning(
-                    "WL structural loss (%.4f) dominates convex surrogate loss (%.4f); the two regularizers may be fighting—try reducing wl_kernel_loss_weight or convex_surrogate_weight.",
-                    wl_value,
-                    convex_value,
-                )
 
             per_metric_losses = {}
             if per_metric_weight_sum is not None and per_metric_weight_sum.numel() > 0:
@@ -3032,7 +2988,6 @@ class OnlineTrainer:
                     decoded_graphs,
                     _fitness_pred,
                     _metric_log_scales,
-                    _convex_pred,
                     _graph_latent,
                     _mu_g,
                     _lv_g,

@@ -131,8 +131,8 @@ The online trainer can rotate which submodules receive gradients each epoch to k
 Configure this with the `[GuidedPopulation]` keys `trainer_freeze_cycle` and `trainer_freeze_verbose` inside `neat-config`:
 
 - `trainer_freeze_cycle` accepts a comma-separated list of phases.
-Each phase is a `+`-delimited set of module aliases drawn from `{encoder, decoder, fitness, icnn}` (`all`/`*` expand to every available module).
-Example: `trainer_freeze_cycle = decoder,encoder+fitness,icnn,all` spends one epoch on decoder-only updates, the next on encoder+predictor, the third on the convex ICNN head, and the fourth on a full joint update before repeating.
+Each phase is a `+`-delimited set of module aliases drawn from `{encoder, decoder, fitness}` (`all`/`*` expand to every available module).
+Example: `trainer_freeze_cycle = decoder,encoder+fitness,all` spends one epoch on decoder-only updates, the next on encoder+fitness, and the third on a full joint update before repeating.
 - `trainer_freeze_verbose = true` prints the active phase whenever it changes so you can correlate empty-graph spikes with a specific training slice.
 These phases are also logged to MLflow via the `trainer_module_active_*` metrics and the `active_modules=...` suffix in trainer log lines.
 - `trainer_attr_type_mismatch_skips` tracks how many nodes in that epoch skipped teacher-forced attribute/name/value supervision because the decoder predicted the wrong node type compared to the teacher graph’s `node_types`. When this value spikes, the attr-name RNN is being asked to learn for nodes whose op kind is already incorrect, so the trainer withholds the loss to avoid corrupting the schema-specific vocab; lowering it indicates the decoder is matching operator kinds before emitting attributes.
@@ -142,7 +142,7 @@ The teacher-forcing refresh temporarily unfreezes all heads so the auxiliary reh
 
 ### Latent Decoder Relaxation
 
-During guided offspring generation the latent optimizer now runs an extra "relaxed" decode after every gradient step. Instead of sampling discrete nodes/edges, this pass tracks the decoder's stop and edge logits directly, which keeps the computation graph differentiable. The relaxed decode penalizes latents whose expected node count falls below the enforced pin quota, whose continue probabilities collapse before hitting the output slots, or whose expected edge mass is near zero. This injects structural feedback early, so the ICNN/MLP heads are no longer the only sources of gradients.
+During guided offspring generation the latent optimizer now runs an extra "relaxed" decode after every gradient step. Instead of sampling discrete nodes/edges, this pass tracks the decoder's stop and edge logits directly, which keeps the computation graph differentiable. The relaxed decode penalizes latents whose expected node count falls below the enforced pin quota, whose continue probabilities collapse before hitting the output slots, or whose expected edge mass is near zero. This injects structural feedback early, so the ICNN fitness head is no longer the only source of gradients.
 
 Fine-tune the behavior via the `[GuidedPopulation]` config keys:
 
@@ -172,11 +172,10 @@ This means the VAE is encouraged to organize the latent space such that importan
 Dimensions of the latent vector that do not contribute to explaining variation in performance tend to be pruned out automatically (using techniques like Automatic Relevance Determination).
 The result is a compressed, fitness-informed search space: a smooth landscape where distances reflect meaningful differences in network capability.
 * **Convex ICNN Guidance:**
-To keep latent descent smooth without losing the heteroscedastic fitness predictor, the guide model includes an Input Convex Neural Network (ICNN) surrogate inspired by the convexity regularized latent space optimization (CR-LSO) paper ([56](#references)).
-The ICNN enforces non-negative skip weights so the latent-to-fitness surface stays convex, which is exploited in two places.
-Generation of guided offspring follows the ICNN gradient when refining latent codes, falling back to the MLP head if the ICNN is disabled.
-This reduces empty or duplicate decodes caused by jagged surrogate landscapes.
-The ICNN head is jointly trained alongside the rest of the signals (reconstruction from decoder, KL divergence, and learned L2 log-variancefrom the heteroscedastic fitness head).
+To keep latent descent smooth without losing the heteroscedastic fitness predictor, the guide model’s fitness head itself is an Input Convex Neural Network (ICNN) inspired by the convexity-regularized latent space optimization (CR-LSO) paper ([56](#references)).
+The ICNN enforces non-negative skip weights so the latent-to-fitness surface stays convex, letting guided offspring generation follow a single, well-behaved gradient from the fitness predictor.
+This reduces empty or duplicate decodes caused by jagged surrogate landscapes and eliminates the need for a parallel MLP head.
+The ICNN predictor is jointly trained alongside the other signals (reconstruction from decoder, KL divergence, and learned L2 log-variance).
 * **Cross-Species Mating via Latent Interpolation:**
 Once networks are encoded in this latent space, **any two networks** can be recombined by interpolating or randomly mixing their latent vectors and then decoding the result.
 In other words, the VAE enables **cross-species crossover**-two parent networks from entirely different niches or architectures can produce an offspring network.
