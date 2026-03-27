@@ -506,6 +506,7 @@ class GuidedPopulation(Population):
         else:
             self.novelty_archive = None
         self.metric_keys = base_metric_keys
+        self.trainer_metric_keys = [metric for metric in self.metric_keys if metric is not NoveltyMetric]
         self.metric_best_values = self._metric_best_values(self.metric_keys)
         self.metric_guidance_weights = self._metric_guidance_weights(self.metric_keys)
         # Configure how large the decoded attribute tensors may be. This cap must be
@@ -579,7 +580,7 @@ class GuidedPopulation(Population):
         predictor = FitnessPredictor(
             latent_dim=graph_latent_dim,
             hidden_dim=64,
-            fitness_dim=len(self.metric_keys),
+            fitness_dim=len(self.trainer_metric_keys),
             icnn_hidden_dims=icnn_hidden_dims or None,
         )
 
@@ -592,7 +593,7 @@ class GuidedPopulation(Population):
         self.trainer = OnlineTrainer(
             self.guide,
             self.optimizer,
-            metric_keys=self.metric_keys,
+            metric_keys=self.trainer_metric_keys,
             decoder_empty_penalty=self.decoder_empty_penalty,
             decoder_missing_node_penalty=self.decoder_missing_node_penalty,
             decoder_excess_node_penalty=self.decoder_excess_node_penalty,
@@ -3723,34 +3724,30 @@ class GuidedPopulation(Population):
                 continue
             _reset_optimizer_state_buffers()
             if stage == "synthetic":
-                with log_timing(logger, "Optimizer validation (synthetic probe)", log_on_start=True) as timing:
-                    probe_model = torch.nn.Linear(2, 2, bias=False)
-                    probe_params = list(probe_model.named_parameters())
-                    probe_baseline = _capture_baseline(probe_params)
-                    probe_metrics = torch.ones(2, dtype=torch.float32)
-                    updated_probe = _run_optimizer_once(probe_params, probe_metrics, torch.zeros_like(probe_metrics))
-                    if updated_probe is not None:
+                probe_model = torch.nn.Linear(2, 2, bias=False)
+                probe_params = list(probe_model.named_parameters())
+                probe_baseline = _capture_baseline(probe_params)
+                probe_metrics = torch.ones(2, dtype=torch.float32)
+                updated_probe = _run_optimizer_once(probe_params, probe_metrics, torch.zeros_like(probe_metrics))
+                if updated_probe is not None:
+                    saw_state = True
+                    probe_state = self._normalize_state_dict(updated_probe, probe_params)
+                    stage_delta, missing = _state_delta(probe_state, probe_baseline)
+                    missing_names.update(missing)
+                    peak_delta = max(peak_delta, stage_delta)
+            elif stage == "fast":
+                named_params = list(model.named_parameters())
+                baseline = _capture_baseline(named_params)
+                metrics = task.evaluate_metrics(model, task.train_data)
+                if torch.isfinite(metrics).all():
+                    prev = torch.zeros_like(metrics)
+                    updated_state = _run_optimizer_once(named_params, metrics, prev)
+                    if updated_state is not None:
                         saw_state = True
-                        probe_state = self._normalize_state_dict(updated_probe, probe_params)
-                        stage_delta, missing = _state_delta(probe_state, probe_baseline)
+                        state_dict = self._normalize_state_dict(updated_state, named_params)
+                        stage_delta, missing = _state_delta(state_dict, baseline)
                         missing_names.update(missing)
                         peak_delta = max(peak_delta, stage_delta)
-                    timing.set_details(f"delta={stage_delta:.3e}")
-            elif stage == "fast":
-                with log_timing(logger, "Optimizer validation (fast diff)", log_on_start=True) as timing:
-                    named_params = list(model.named_parameters())
-                    baseline = _capture_baseline(named_params)
-                    metrics = task.evaluate_metrics(model, task.train_data)
-                    if torch.isfinite(metrics).all():
-                        prev = torch.zeros_like(metrics)
-                        updated_state = _run_optimizer_once(named_params, metrics, prev)
-                        if updated_state is not None:
-                            saw_state = True
-                            state_dict = self._normalize_state_dict(updated_state, named_params)
-                            stage_delta, missing = _state_delta(state_dict, baseline)
-                            missing_names.update(missing)
-                            peak_delta = max(peak_delta, stage_delta)
-                    timing.set_details(f"delta={stage_delta:.3e}")
             elif stage == "slow":
                 with log_timing(logger, "Optimizer validation (slow fallback)", log_on_start=True) as timing:
                     named_params = list(model.named_parameters())

@@ -36,6 +36,7 @@ from loop_blocks import prime_registry
 from main import create_initial_genome
 from metrics import AreaUnderTaskMetrics, MemoryCost, TimeCost
 from models import ManyLossMinimaModel
+from novelty import NoveltyMetric
 from population import (
     BLOCK_PAYLOAD_ATTR_PREFIX,
     BLOCK_REF_ATTR_PREFIX,
@@ -112,6 +113,14 @@ class EmptyStateOptimizer:
 
     def __init__(self):
         self.state = {}
+
+
+def test_novelty_metric_excluded_from_trainer_metrics():
+    config = make_neat_config()
+    pop = GuidedPopulation(config)
+    assert NoveltyMetric in pop.metric_keys
+    assert NoveltyMetric not in pop.trainer_metric_keys
+    assert pop.guide.fitness_predictor.output_dim == len(pop.trainer_metric_keys)
 
 
 class _DummyFitnessHead(torch.nn.Module):
