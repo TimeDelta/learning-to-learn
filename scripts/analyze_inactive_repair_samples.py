@@ -187,20 +187,6 @@ def _generation_summary(counts: Counter) -> Dict[str, int]:
     return {str(gen): count for gen, count in items}
 
 
-def _counterfactual_repair(population: GuidedPopulation, graph_dict: dict, runs: int) -> float:
-    successes = 0
-    for attempt in range(runs):
-        probe = population._clone_graph_dict(graph_dict, include_history=False)
-        if probe is None:
-            continue
-        population._prepare_decoded_graph_dict(probe)
-        population._repair_graph_dict(probe)
-        optimizer = rebuild_and_script(probe, population.config.genome_config, key=attempt)
-        if optimizer and population._optimizer_updates_parameters(optimizer, check_steps=2):
-            successes += 1
-    return successes / max(1, runs)
-
-
 def analyze_samples(
     population: GuidedPopulation,
     samples_dir: Path,
@@ -209,7 +195,6 @@ def analyze_samples(
     delete_after: bool,
     latent_components: int,
     latent_csv: Optional[Path],
-    counterfactual_runs: int,
     wl_iterations: int,
 ):
     paths = sorted(samples_dir.glob("*.pt"), key=lambda p: p.stat().st_mtime)
@@ -220,7 +205,6 @@ def analyze_samples(
     records: List[Dict] = []
     wl_records: List[tuple[bool, Dict[str, float]]] = []
     generation_counts: Counter = Counter()
-    counterfactual_scores: List[float] = []
 
     for idx, path in enumerate(paths):
         graph_dict, metadata, latent_vector = _load_graph_payload(path)
@@ -245,10 +229,6 @@ def analyze_samples(
             prefix = f"gen{generation}_child{metadata.get('child_index')}" if generation is not None else path.name
             status = "inactive" if would_be_inactive else "ok"
             print(f"[{prefix}] {status}")
-        if counterfactual_runs > 0 and would_be_inactive:
-            score = _counterfactual_repair(population, graph_dict, counterfactual_runs)
-            counterfactual_scores.append(score)
-            entry["counterfactual_success_rate"] = score
         if delete_after:
             try:
                 path.unlink()
@@ -257,15 +237,6 @@ def analyze_samples(
 
     latent_summary = _summarize_latents(records, latent_components, latent_csv) if records else None
     wl_summary = _aggregate_wl(wl_records) if wl_records else None
-    counterfactual_summary = None
-    if counterfactual_scores:
-        counterfactual_summary = {
-            "samples": len(counterfactual_scores),
-            "mean_success": float(sum(counterfactual_scores) / len(counterfactual_scores)),
-            "max_success": float(max(counterfactual_scores)),
-            "min_success": float(min(counterfactual_scores)),
-        }
-
     summary = {
         "samples_dir": str(samples_dir),
         "processed": processed,
@@ -275,18 +246,17 @@ def analyze_samples(
         "generation_histogram": _generation_summary(generation_counts),
         "latent_analysis": latent_summary,
         "wl_analysis": wl_summary,
-        "counterfactual": counterfactual_summary,
     }
     return summary, records
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Analyze buffered pre-repair optimizer graphs.")
+    parser = argparse.ArgumentParser(description="Analyze buffered guided-offspring graphs.")
     parser.add_argument(
         "--samples-dir",
         type=Path,
         default=Path("debug_guided_offspring") / "pre_repair_samples",
-        help="Directory containing pre-repair graph samples (default: debug_guided_offspring/pre_repair_samples)",
+        help="Directory containing buffered graph samples (default: debug_guided_offspring/pre_repair_samples)",
     )
     parser.add_argument(
         "--config-file",
@@ -323,13 +293,6 @@ def main():
         help="Optional path to export PCA coordinates (CSV).",
     )
     parser.add_argument(
-        "--counterfactual-repair",
-        type=int,
-        default=0,
-        metavar="N",
-        help="If >0, re-run the repair hook N times for each inactive sample to estimate salvage probability.",
-    )
-    parser.add_argument(
         "--wl-iterations",
         type=int,
         default=2,
@@ -356,13 +319,12 @@ def main():
         args.delete,
         args.latent_components,
         args.latent_csv,
-        args.counterfactual_repair,
         args.wl_iterations,
     )
 
     print(
         f"Analyzed {summary['processed']} samples from {samples_dir}: "
-        f"{summary['inactive']} would have been inactive pre-repair."
+        f"{summary['inactive']} samples decoded as inactive."
     )
     latent_analysis = summary.get("latent_analysis")
     if latent_analysis:
@@ -375,15 +337,6 @@ def main():
         active_entropy = wl_analysis.get("active", {}).get("entropy")
         if inactive_entropy is not None and active_entropy is not None:
             print(f"WL entropy inactive/active: {inactive_entropy:.3f}/{active_entropy:.3f}")
-    counter_summary = summary.get("counterfactual")
-    if counter_summary:
-        print(
-            "Counterfactual repair success rate (mean/min/max): "
-            f"{counter_summary['mean_success']:.3f}/"
-            f"{counter_summary['min_success']:.3f}/"
-            f"{counter_summary['max_success']:.3f}"
-        )
-
     if args.summary_json:
         payload = dict(summary)
         if not args.verbose:

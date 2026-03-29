@@ -63,8 +63,6 @@ GUIDED_POPULATION_FIELDS = {
     "wl_kernel_iterations": int,
     "trainer_freeze_cycle": str,
     "trainer_freeze_verbose": _parse_bool,
-    "repair_randomize_connections": _parse_bool,
-    "repair_random_seed": int,
 }
 
 
@@ -1058,8 +1056,6 @@ if __name__ == "__main__":
                         "guided_children_requested": stats.get("requested"),
                         "guided_children_created": stats.get("accepted"),
                         "guided_children_invalid_total": stats.get("invalid_total"),
-                        "guided_children_repair_salvaged": stats.get("repair_salvaged"),
-                        "guided_children_repair_salvaged_total": stats.get("repair_salvaged_total"),
                         "guided_latent_structure_penalty_last": stats.get("structure_penalty_last"),
                         "guided_latent_structure_penalty_mean": stats.get("structure_penalty_mean"),
                         "guided_latent_structure_penalty_samples": stats.get("structure_penalty_samples"),
@@ -1068,8 +1064,6 @@ if __name__ == "__main__":
                         "guided_decoder_max_edges_hits": stats.get("decoder_max_edges_hits"),
                         "guided_decoder_max_edges_invalid": stats.get("decoder_max_edges_invalid"),
                         "guided_inactive_details_total": stats.get("inactive_details_total"),
-                        "guided_inactive_repair_salvaged": stats.get("inactive_repair_salvaged"),
-                        "guided_inactive_repair_salvaged_total": stats.get("inactive_repair_salvaged_total"),
                     }
                     confusion = stats.get("validator_confusion") or {}
                     for label, count in confusion.items():
@@ -1084,8 +1078,7 @@ if __name__ == "__main__":
                     parts = ", ".join(f"{reason}={count}" for reason, count in sorted(invalid_by_reason.items()))
                     summary = (
                         f"Guided offspring gen {generation}: requested={stats.get('requested', 0)}, "
-                        f"created={stats.get('accepted', 0)}, invalid_total={stats.get('invalid_total', 0)}, "
-                        f"repair_salvaged={stats.get('repair_salvaged', 0)}"
+                        f"created={stats.get('accepted', 0)}, invalid_total={stats.get('invalid_total', 0)}"
                     )
                     if stats.get("decoder_max_nodes_hits"):
                         summary += f", max_nodes_hits={stats.get('decoder_max_nodes_hits')}"
@@ -1093,8 +1086,6 @@ if __name__ == "__main__":
                         summary += f", max_edges_hits={stats.get('decoder_max_edges_hits')}"
                     if stats.get("inactive_details_total"):
                         summary += f", inactive_cases={stats.get('inactive_details_total')}"
-                    if stats.get("inactive_repair_salvaged"):
-                        summary += f", inactive_repair_salvaged={stats.get('inactive_repair_salvaged')}"
                     if stats.get("structure_penalty_samples"):
                         summary += (
                             f", structure_penalty_mean={stats.get('structure_penalty_mean', 0):.6f}"
@@ -1302,8 +1293,6 @@ if __name__ == "__main__":
                     "guided_children_requested": stats.get("requested"),
                     "guided_children_created": stats.get("accepted"),
                     "guided_children_invalid_total": stats.get("invalid_total"),
-                    "guided_children_repair_salvaged": stats.get("repair_salvaged"),
-                    "guided_children_repair_salvaged_total": stats.get("repair_salvaged_total"),
                     "guided_latent_structure_penalty_last": stats.get("structure_penalty_last"),
                     "guided_latent_structure_penalty_mean": stats.get("structure_penalty_mean"),
                     "guided_latent_structure_penalty_samples": stats.get("structure_penalty_samples"),
@@ -1312,8 +1301,6 @@ if __name__ == "__main__":
                     "guided_decoder_max_edges_hits": stats.get("decoder_max_edges_hits"),
                     "guided_decoder_max_edges_invalid": stats.get("decoder_max_edges_invalid"),
                     "guided_inactive_details_total": stats.get("inactive_details_total"),
-                    "guided_inactive_repair_salvaged": stats.get("inactive_repair_salvaged"),
-                    "guided_inactive_repair_salvaged_total": stats.get("inactive_repair_salvaged_total"),
                 }
                 confusion = stats.get("validator_confusion") or {}
                 for label, count in confusion.items():
@@ -1328,8 +1315,7 @@ if __name__ == "__main__":
                 parts = ", ".join(f"{reason}={count}" for reason, count in sorted(invalid_by_reason.items()))
                 summary = (
                     f"Guided offspring gen {generation}: requested={stats.get('requested', 0)}, "
-                    f"created={stats.get('accepted', 0)}, invalid_total={stats.get('invalid_total', 0)}, "
-                    f"repair_salvaged={stats.get('repair_salvaged', 0)}"
+                    f"created={stats.get('accepted', 0)}, invalid_total={stats.get('invalid_total', 0)}"
                 )
                 if stats.get("decoder_max_nodes_hits"):
                     summary += f", max_nodes_hits={stats.get('decoder_max_nodes_hits')}"
@@ -1337,8 +1323,6 @@ if __name__ == "__main__":
                     summary += f", max_edges_hits={stats.get('decoder_max_edges_hits')}"
                 if stats.get("inactive_details_total"):
                     summary += f", inactive_cases={stats.get('inactive_details_total')}"
-                if stats.get("inactive_repair_salvaged"):
-                    summary += f", inactive_repair_salvaged={stats.get('inactive_repair_salvaged')}"
                 if stats.get("structure_penalty_samples"):
                     summary += (
                         f", structure_penalty_mean={stats.get('structure_penalty_mean', 0):.6f}"

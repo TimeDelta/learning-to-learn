@@ -178,10 +178,6 @@ class GuidedChildRecord:
     prepared_node_count: int | None = None
     prepared_edge_count: int | None = None
     hit_decoder_cap: bool = False
-    repair_applied: bool = False
-    repair_added_edges: int | None = None
-    repair_added_nodes: int | None = None
-    repair_reason: str | None = None
     slot_coverage_passed: bool | None = None
     slot_missing: int | None = None
     graph_signature: str | None = None
@@ -189,11 +185,8 @@ class GuidedChildRecord:
     validator_max_delta: float | None = None
     validator_stage_deltas: Dict[str, float] = field(default_factory=dict)
     failure_reason: str | None = None
-    pre_repair_outcome: ValidatorOutcome | None = None
-    post_repair_outcome: ValidatorOutcome | None = None
     attr_summary_decoded: Dict[str, Any] = field(default_factory=dict)
     attr_summary_prepared: Dict[str, Any] = field(default_factory=dict)
-    attr_drift_summary: Dict[str, Any] = field(default_factory=dict)
 
     def as_row(self) -> Dict[str, Any]:
         row = {
@@ -207,10 +200,6 @@ class GuidedChildRecord:
             "prepared_node_count": self.prepared_node_count,
             "prepared_edge_count": self.prepared_edge_count,
             "hit_decoder_cap": self.hit_decoder_cap,
-            "repair_applied": self.repair_applied,
-            "repair_added_edges": self.repair_added_edges,
-            "repair_added_nodes": self.repair_added_nodes,
-            "repair_reason": self.repair_reason,
             "slot_coverage_passed": self.slot_coverage_passed,
             "slot_missing": self.slot_missing,
             "graph_signature": self.graph_signature,
@@ -220,16 +209,11 @@ class GuidedChildRecord:
             if self.validator_stage_deltas
             else None,
             "failure_reason": self.failure_reason,
-            "pre_repair_outcome": self.pre_repair_outcome.value if self.pre_repair_outcome else None,
-            "post_repair_outcome": self.post_repair_outcome.value if self.post_repair_outcome else None,
             "attr_summary_decoded": json.dumps(self.attr_summary_decoded, sort_keys=True)
             if self.attr_summary_decoded
             else None,
             "attr_summary_prepared": json.dumps(self.attr_summary_prepared, sort_keys=True)
             if self.attr_summary_prepared
-            else None,
-            "attr_drift_summary": json.dumps(self.attr_drift_summary, sort_keys=True)
-            if self.attr_drift_summary
             else None,
         }
         return row
@@ -691,15 +675,6 @@ class GuidedPopulation(Population):
         self.guided_pareto_enabled = bool(getattr(config, "guided_pareto_enabled", True))
         self.guided_pareto_epsilon = max(0.0, float(getattr(config, "guided_pareto_epsilon", 0.05)))
         self.guided_pareto_constraint_weight = max(0.0, float(getattr(config, "guided_pareto_constraint_weight", 0.6)))
-        raw_repair_seed = getattr(config, "repair_random_seed", None)
-        try:
-            repair_seed = int(raw_repair_seed) if raw_repair_seed is not None else None
-        except (TypeError, ValueError):
-            repair_seed = None
-        self._repair_rng = random.Random()
-        if repair_seed is not None:
-            self._repair_rng.seed(repair_seed)
-        self.repair_randomize_connections = bool(getattr(config, "repair_randomize_connections", False))
         self.trainer.configure_module_freeze_cycle(getattr(config, "trainer_freeze_cycle", None))
         self.trainer.module_freeze_verbose = bool(getattr(config, "trainer_freeze_verbose", False))
         beta_schedule = StagedBetaSchedule(
@@ -726,8 +701,6 @@ class GuidedPopulation(Population):
         self.neat_invalid_stats_callback = None
         self._guided_offspring_stats = None
         self._prev_guided_offspring_stats = None
-        self._total_repair_salvaged = 0
-        self._total_inactive_repair_salvaged = 0
         self._inactive_detail_history: List[dict] = []
         self.dataset_stats_callback = None
         max_evaluation_steps = getattr(config, "max_evaluation_steps", None)
@@ -740,7 +713,6 @@ class GuidedPopulation(Population):
             max_evaluation_steps = None
         self.max_evaluation_steps = max_evaluation_steps
         self._last_optimizer_delta = 0.0
-        self._last_repair_salvaged = 0
         self.guided_invalid_viz_enabled = bool(getattr(config, "guided_invalid_viz_enabled", True))
         raw_viz_dir = getattr(config, "guided_invalid_viz_dir", None)
         if raw_viz_dir:
@@ -806,9 +778,6 @@ class GuidedPopulation(Population):
         )
         self.decoder_relax_edge_weight = max(0.0, float(getattr(config, "guided_decoder_relax_edge_weight", 1.0)))
         self._decoder_relax_stats: dict | None = None
-        self.repair_activity_probe_fraction = float(getattr(config, "repair_activity_probe_fraction", 0.0))
-        self.repair_activity_probe_max = max(0, int(getattr(config, "repair_activity_probe_max", 8)))
-        self._repair_activity_probes_used = 0
         self.trainer_batch_size = self._sanitize_positive_int(getattr(config, "trainer_batch_size", None))
         raw_max_batch = self._sanitize_positive_int(getattr(config, "trainer_max_batch_size", None))
         if raw_max_batch is None:
@@ -851,8 +820,6 @@ class GuidedPopulation(Population):
             "accepted": 0,
             "invalid_total": 0,
             "invalid_by_reason": Counter(),
-            "repair_salvaged": 0,
-            "repair_salvaged_total": self._total_repair_salvaged,
             "structure_penalty_last": None,
             "structure_penalty_mean": None,
             "structure_penalty_samples": 0,
@@ -862,11 +829,8 @@ class GuidedPopulation(Population):
             "decoder_max_edges_invalid": 0,
             "inactive_details_total": 0,
             "inactive_details": [],
-            "inactive_repair_salvaged": 0,
-            "inactive_repair_salvaged_total": self._total_inactive_repair_salvaged,
             "validator_failures": 0,
         }
-        self._repair_activity_probes_used = 0
 
     def _begin_guided_child_record(
         self,
@@ -900,36 +864,6 @@ class GuidedPopulation(Population):
             for record in self._guided_child_records:
                 writer.writerow(record.as_row())
 
-    def _should_probe_repair_activity(self) -> bool:
-        if self.repair_activity_probe_fraction <= 0 or self.repair_activity_probe_max <= 0:
-            return False
-        if random.random() >= self.repair_activity_probe_fraction:
-            return False
-        return self._reserve_repair_activity_probe()
-
-    def _reserve_repair_activity_probe(self) -> bool:
-        used = getattr(self, "_repair_activity_probes_used", 0)
-        if used >= self.repair_activity_probe_max:
-            return False
-        self._repair_activity_probes_used = used + 1
-        return True
-
-    def _probe_graph_activity(self, graph_dict: dict | None, *, child_index: int) -> OptimizerValidationResult | None:
-        genome_config = getattr(self.config, "genome_config", None)
-        if not graph_dict or genome_config is None:
-            return None
-        clone = self._clone_graph_dict(graph_dict, include_history=False)
-        if clone is None:
-            return None
-        try:
-            genome = genome_from_graph_dict(clone, genome_config, key=child_index)
-        except Exception:
-            return None
-        optimizer = rebuild_and_script(clone, genome_config, key=child_index, genome=genome)
-        if optimizer is None:
-            return None
-        return self._optimizer_updates_parameters(optimizer, check_steps=1, task=self.validator_task)
-
     def _summarize_inactive_details(self, stats: dict | None) -> dict | None:
         if not stats:
             return None
@@ -937,9 +871,7 @@ class GuidedPopulation(Population):
         inactive_invalid = int(invalid_by_reason.get("inactive_optimizer", 0) or 0)
         inactive_details_total = int(stats.get("inactive_details_total", 0) or 0)
         inactive_details = stats.get("inactive_details") or []
-        inactive_repair_salvaged = int(stats.get("inactive_repair_salvaged", 0) or 0)
-        inactive_repair_total = int(stats.get("inactive_repair_salvaged_total", 0) or 0)
-        if not inactive_invalid and not inactive_details_total and not inactive_repair_salvaged:
+        if not inactive_invalid and not inactive_details_total:
             return None
         record = {
             "generation": int(stats.get("generation", getattr(self, "generation", -1)) or 0),
@@ -948,8 +880,6 @@ class GuidedPopulation(Population):
             "invalid_total": int(stats.get("invalid_total", 0) or 0),
             "inactive_invalid": inactive_invalid,
             "inactive_details_total": inactive_details_total,
-            "inactive_repair_salvaged": inactive_repair_salvaged,
-            "inactive_repair_salvaged_total": inactive_repair_total,
             "decoder_max_nodes_hits": int(stats.get("decoder_max_nodes_hits", 0) or 0),
             "decoder_max_nodes_invalid": int(stats.get("decoder_max_nodes_invalid", 0) or 0),
             "decoder_max_edges_hits": int(stats.get("decoder_max_edges_hits", 0) or 0),
@@ -999,7 +929,6 @@ class GuidedPopulation(Population):
         accepted: int,
         invalid_counts: Counter,
         *,
-        repair_salvaged: int = 0,
         structure_penalty_last: float | None = None,
         structure_penalty_sum: float | None = None,
         structure_penalty_steps: int = 0,
@@ -1011,7 +940,6 @@ class GuidedPopulation(Population):
         decoder_max_edges_hits: int = 0,
         decoder_max_edges_invalid: int = 0,
         inactive_details: Sequence[dict] | None = None,
-        inactive_repair_salvaged: int = 0,
         validator_failures: int = 0,
     ):
         stats = self._guided_offspring_stats
@@ -1023,9 +951,6 @@ class GuidedPopulation(Population):
             total_invalid = int(sum(invalid_counts.values()))
             stats["invalid_total"] += total_invalid
             stats["invalid_by_reason"].update(invalid_counts)
-        if repair_salvaged:
-            stats["repair_salvaged"] += int(repair_salvaged)
-        stats["repair_salvaged_total"] = self._total_repair_salvaged
         if structure_penalty_last is not None:
             stats["structure_penalty_last"] = float(structure_penalty_last)
         if structure_penalty_steps and structure_penalty_sum is not None:
@@ -1055,9 +980,6 @@ class GuidedPopulation(Population):
                 available = max(0, limit - len(recorded))
                 if available > 0:
                     recorded.extend(inactive_details[:available])
-        if inactive_repair_salvaged:
-            stats["inactive_repair_salvaged"] += int(inactive_repair_salvaged)
-        stats["inactive_repair_salvaged_total"] = self._total_inactive_repair_salvaged
         if validator_failures:
             stats["validator_failures"] += int(validator_failures)
 
@@ -1071,8 +993,6 @@ class GuidedPopulation(Population):
             "accepted": stats.get("accepted", 0),
             "invalid_total": stats.get("invalid_total", 0),
             "invalid_by_reason": dict(stats.get("invalid_by_reason", {})),
-            "repair_salvaged": stats.get("repair_salvaged", 0),
-            "repair_salvaged_total": self._total_repair_salvaged,
             "structure_penalty_last": stats.get("structure_penalty_last"),
             "structure_penalty_mean": stats.get("structure_penalty_mean"),
             "structure_penalty_samples": stats.get("structure_penalty_samples", 0),
@@ -1081,8 +1001,6 @@ class GuidedPopulation(Population):
             "decoder_max_edges_hits": stats.get("decoder_max_edges_hits", 0),
             "decoder_max_edges_invalid": stats.get("decoder_max_edges_invalid", 0),
             "inactive_details_total": stats.get("inactive_details_total", 0),
-            "inactive_repair_salvaged": stats.get("inactive_repair_salvaged", 0),
-            "inactive_repair_salvaged_total": stats.get("inactive_repair_salvaged_total", 0),
             "validator_failures": stats.get("validator_failures", 0),
         }
         confusion = self._validator_confusion_summary()
@@ -1097,9 +1015,7 @@ class GuidedPopulation(Population):
         self._record_inactive_detail_history(summary)
         if summary["invalid_total"]:
             parts = ", ".join(f"{reason}={count}" for reason, count in sorted(summary["invalid_by_reason"].items()))
-            self.reporters.info(
-                f"Post-repair guided offspring invalid counts: total={summary['invalid_total']} :: {parts}"
-            )
+            self.reporters.info(f"Guided offspring invalid counts: total={summary['invalid_total']} :: {parts}")
         self._guided_offspring_stats = summary
 
     def _guided_validator_fail_ratio(self) -> float:
@@ -2422,14 +2338,11 @@ class GuidedPopulation(Population):
         rebuild_failures = 0
         inactive_optimizer_count = 0
         missing_slot_rejections = 0
-        repair_failures = 0
-        repair_salvaged = 0
         decoder_max_nodes_hits = 0
         decoder_max_nodes_invalid = 0
         decoder_max_edges_hits = 0
         decoder_max_edges_invalid = 0
         inactive_detail_samples: List[dict] = []
-        inactive_repair_salvaged = 0
         generation_idx = getattr(self, "generation", -1)
         seen_graph_signatures: Set[str] = set()
         total_requested = z_g.size(0)
@@ -2632,78 +2545,13 @@ class GuidedPopulation(Population):
             if child_record:
                 child_record.attr_summary_decoded = decoded_attr_summary or {}
                 child_record.attr_summary_prepared = prepared_attr_summary or {}
-                child_record.attr_drift_summary = {}
-            pre_repair_graph_dict = None
-            pending_pre_repair_sample: dict | None = None
-            probe_pre = child_record is not None and self._should_probe_repair_activity()
-            pre_probe_result = None
-            if probe_pre:
-                pre_probe_result = self._probe_graph_activity(graph_dict, child_index=i)
-                if child_record and pre_probe_result is not None:
-                    child_record.pre_repair_outcome = pre_probe_result.outcome
-            pre_repair_nodes, pre_repair_edges = _graph_node_edge_counts(graph_dict)
-            self._repair_graph_dict(graph_dict)
-            repair_applied_flag = bool(graph_dict.get("_repair_applied"))
-            if child_record and repair_applied_flag:
-                post_repair_nodes, post_repair_edges = _graph_node_edge_counts(graph_dict)
-                child_record.repair_applied = True
-                child_record.repair_added_nodes = post_repair_nodes - pre_repair_nodes
-                child_record.repair_added_edges = post_repair_edges - pre_repair_edges
             stats = self._guided_offspring_stats
-            post_probe_result = None
-            probe_post = child_record is not None and self._should_probe_repair_activity()
-            if probe_post:
-                post_probe_result = self._probe_graph_activity(graph_dict, child_index=i)
-                if child_record and post_probe_result is not None:
-                    child_record.post_repair_outcome = post_probe_result.outcome
-            pre_repair_inactive = pre_probe_result is not None and not bool(pre_probe_result)
-            repair_reason = graph_dict.get("_repair_failure_reason")
-            repair_details = graph_dict.get("_repair_failure_details")
-            if repair_reason:
-                repair_failures += 1
-                if child_record:
-                    child_record.repair_reason = repair_reason
-                    child_record.failure_reason = repair_reason
             genome = genome_from_graph_dict(graph_dict, self.config.genome_config, key=i)
             num_edges = len(genome.connections)
             num_params = len(genome.connections)
             graph_signature = graph_signature_from_dict(graph_dict)
             if child_record and graph_signature:
                 child_record.graph_signature = graph_signature
-            if repair_reason:
-                self._maybe_visualize_guided_invalid_graph(
-                    genome,
-                    graph_dict,
-                    reason=repair_reason,
-                    child_index=i,
-                    num_edges=num_edges,
-                )
-                self._maybe_dump_guided_debug_graph(
-                    graph_dict,
-                    reason=repair_reason,
-                    generation=generation_idx,
-                    child_index=i,
-                    num_edges=num_edges,
-                )
-                genome.graph_dict = graph_dict
-                penalty_details = repair_details or {}
-                self._assign_penalty(
-                    genome,
-                    reason=repair_reason,
-                    skip_evaluation=True,
-                    penalty_details=penalty_details,
-                    graph_dict=graph_dict,
-                    record_decoder_failure=True,
-                )
-                self._buffer_decoder_replay_dict(graph_dict)
-                if last_valid_graph_dict is not None:
-                    self._buffer_decoder_replay_dict(last_valid_graph_dict)
-                invalid_reason_counts[repair_reason] += 1
-                if graph_signature:
-                    seen_graph_signatures.add(graph_signature)
-                new_genomes.append(genome)
-                continue
-
             if num_edges == 0:
                 empty_graph_count += 1
                 if child_record:
@@ -2878,14 +2726,8 @@ class GuidedPopulation(Population):
                     new_genomes.append(genome)
                     continue
 
-                repair_applied = bool(graph_dict.pop("_repair_applied", False))
                 if track_latents:
-                    latent_valid_flags[i] = not repair_applied
-                if repair_applied:
-                    repair_salvaged += 1
-                if pre_repair_inactive and repair_applied:
-                    inactive_repair_salvaged += 1
-                    self._total_inactive_repair_salvaged += 1
+                    latent_valid_flags[i] = True
                 genome.optimizer = optimizer
                 genome.graph_dict = graph_dict
                 last_valid_graph_dict = self._clone_graph_dict(graph_dict)
@@ -2946,19 +2788,11 @@ class GuidedPopulation(Population):
             warn(f"Guided offspring decoder graphs missing optimizer output coverage: {missing_slot_rejections}")
         if inactive_optimizer_count:
             warn(f"Guided offspring optimizers with no parameter updates: {inactive_optimizer_count}")
-        if repair_failures:
-            warn(f"Guided offspring repair hook could not rescue {repair_failures} decoded graphs.")
-
         if child_graph_stats:
             sample = ", ".join(
                 f"child {idx}: edges={edges}, params={params}" for idx, edges, params in child_graph_stats[:10]
             )
             self.reporters.info(f"Guided offspring graph stats (first 10): {sample}")
-
-        if repair_salvaged:
-            self.reporters.info(f"Graph repair salvaged {repair_salvaged} decoded offspring before evaluation.")
-        self._total_repair_salvaged += repair_salvaged
-        self._last_repair_salvaged = repair_salvaged
 
         if total_requested:
             self.reporters.info(
@@ -2989,7 +2823,6 @@ class GuidedPopulation(Population):
             total_requested,
             len(deduped_genomes),
             effective_invalid_counts,
-            repair_salvaged=repair_salvaged,
             structure_penalty_last=structure_penalty_last,
             structure_penalty_sum=structure_penalty_sum if structure_penalty_steps else None,
             structure_penalty_steps=structure_penalty_steps,
@@ -3001,7 +2834,6 @@ class GuidedPopulation(Population):
             decoder_max_edges_hits=decoder_max_edges_hits,
             decoder_max_edges_invalid=decoder_max_edges_invalid,
             inactive_details=inactive_detail_samples,
-            inactive_repair_salvaged=inactive_repair_salvaged,
             validator_failures=inactive_optimizer_count,
         )
         self._flush_guided_child_records(generation_idx)
@@ -3164,441 +2996,6 @@ class GuidedPopulation(Population):
                     best_role = candidate
             return best_role
         return None
-
-    def _repair_graph_dict(self, graph_dict) -> bool:
-        graph_dict.pop("_repair_failure_reason", None)
-        graph_dict.pop("_repair_failure_details", None)
-
-        def _record_repaired_graph_snapshot() -> None:
-            cloned = self._clone_graph_dict(graph_dict, include_history=False)
-            if cloned is not None:
-                graph_dict[REPAIRED_GRAPH_DICT_KEY] = cloned
-
-        def _registry_ids(registry: Any) -> set[int]:
-            ids: set[int] = set()
-            if isinstance(registry, dict):
-                for key in registry.keys():
-                    try:
-                        ids.add(int(key))
-                    except (TypeError, ValueError):
-                        continue
-            return ids
-
-        def _block_ref_count(attrs_list: Any) -> int:
-            if not isinstance(attrs_list, list):
-                return 0
-            count = 0
-            for attrs in attrs_list:
-                if not isinstance(attrs, dict):
-                    continue
-                for key in attrs.keys():
-                    if attribute_key_to_name(key).startswith(BLOCK_REF_ATTR_PREFIX):
-                        count += 1
-            return count
-
-        def _recover_block_registry_from_payloads() -> bool:
-            recovered: Dict[int, Dict[str, Any]] = {}
-            attrs_list = graph_dict.get("node_attributes") or []
-            if not isinstance(attrs_list, list):
-                return False
-            for attrs in attrs_list:
-                if not isinstance(attrs, dict):
-                    continue
-                for key, value in list(attrs.items()):
-                    attr_name = attribute_key_to_name(key)
-                    if not attr_name.startswith(BLOCK_PAYLOAD_ATTR_PREFIX):
-                        continue
-                    try:
-                        block_id, payload = register_block_payload_tensor(value)
-                    except ValueError as exc:
-                        graph_dict.setdefault("_repair_failure_details", {})[attr_name] = str(exc)
-                        continue
-                    recovered[block_id] = payload
-                    suffix = attr_name[len(BLOCK_PAYLOAD_ATTR_PREFIX) :]
-                    ref_name = f"{BLOCK_REF_ATTR_PREFIX}{suffix}"
-                    if ref_name not in attrs:
-                        attrs[ref_name] = torch.tensor([float(block_id)], dtype=torch.float32)
-            combined = {}
-            had_registry = bool(graph_dict.get("block_registry"))
-            combined.update(graph_dict.get("block_registry") or {})
-            if not recovered and not had_registry:
-                return False
-            combined.update(recovered)
-            graph_dict["block_registry"] = copy.deepcopy(combined)
-            return bool(recovered)
-
-        had_block_registry = bool(graph_dict.get("block_registry"))
-        recovered_blocks = False
-        if not had_block_registry:
-            recovered_blocks = _recover_block_registry_from_payloads()
-        before_registry_ids = _registry_ids(graph_dict.get("block_registry"))
-        before_ref_count = _block_ref_count(graph_dict.get("node_attributes"))
-        node_count, edges = self._prepare_decoded_graph_dict(graph_dict)
-        if not graph_dict.get("block_registry"):
-            recovered_blocks = _recover_block_registry_from_payloads() or recovered_blocks
-        after_registry_ids = _registry_ids(graph_dict.get("block_registry"))
-        after_ref_count = _block_ref_count(graph_dict.get("node_attributes"))
-        has_block_registry_now = bool(graph_dict.get("block_registry"))
-        repaired_metadata = recovered_blocks or (has_block_registry_now and not had_block_registry)
-        if not repaired_metadata:
-            repaired_metadata = bool(after_registry_ids - before_registry_ids)
-        if not repaired_metadata:
-            repaired_metadata = after_ref_count > before_ref_count
-        initial_node_count = node_count
-        original_attrs = graph_dict.get("node_attributes")
-        decoded_role_hints: List[str | None] = []
-        if node_count > 0:
-            for idx in range(node_count):
-                role_hint = None
-                if isinstance(original_attrs, list) and idx < len(original_attrs):
-                    raw_attrs = original_attrs[idx] or {}
-                    if isinstance(raw_attrs, dict):
-                        role_hint = _normalize_pin_role(raw_attrs.get("pin_role"))
-                        if role_hint is None:
-                            role_hint = _normalize_pin_role(raw_attrs.get("node_type"))
-                decoded_role_hints.append(role_hint)
-        decoded_input_nodes = [
-            idx for idx, role in enumerate(decoded_role_hints[: max(0, node_count)]) if role == PIN_ROLE_INPUT
-        ]
-        decoded_output_nodes = [
-            idx for idx, role in enumerate(decoded_role_hints[: max(0, node_count)]) if role == PIN_ROLE_OUTPUT
-        ]
-        has_pin_metadata = any(role in {PIN_ROLE_INPUT, PIN_ROLE_OUTPUT} for role in decoded_role_hints)
-        min_required_nodes = self._minimum_required_node_count()
-        if node_count <= 0:
-            graph_dict["_repair_failure_reason"] = "empty_graph"
-            graph_dict.setdefault("_repair_failure_details", {})["node_count"] = int(node_count)
-            _record_repaired_graph_snapshot()
-            return False
-        if node_count < min_required_nodes and not has_pin_metadata and edges:
-            # Decoder predicted edges for visualization but did not emit pin metadata.
-            # Leave the graph untouched so callers can inspect the raw prediction.
-            _record_repaired_graph_snapshot()
-            return False
-        edge_set = set(edges)
-        adjacency_out = {idx: [] for idx in range(node_count)}
-        adjacency_in = {idx: [] for idx in range(node_count)}
-        for src, dst in edges:
-            if 0 <= src < node_count and 0 <= dst < node_count:
-                adjacency_out[src].append(dst)
-                adjacency_in[dst].append(src)
-
-        normalized_attrs = self._normalize_node_attributes(graph_dict.get("node_attributes"), node_count)
-        repaired_edges = 0
-
-        def _candidate_order(indices: Sequence[int], *, key=None, reverse: bool = False) -> List[int]:
-            seq = list(indices)
-            if self.repair_randomize_connections and len(seq) > 1:
-                self._repair_rng.shuffle(seq)
-                return seq
-            if key is not None:
-                seq.sort(key=key, reverse=reverse)
-            else:
-                seq.sort(reverse=reverse)
-            return seq
-
-        def _maybe_shuffle(values: Sequence[int]) -> List[int]:
-            seq = list(values)
-            if self.repair_randomize_connections and len(seq) > 1:
-                self._repair_rng.shuffle(seq)
-            return seq
-
-        def _flag_enabled(value: Any) -> bool:
-            """Interpret decoder-emitted attributes that may be tensors or scalars."""
-            if value is None:
-                return False
-            if isinstance(value, bool):
-                return value
-            if torch.is_tensor(value):
-                if value.numel() == 0:
-                    return False
-                try:
-                    scalar = value.detach().cpu().view(-1)[0].item()
-                except Exception:
-                    return False
-                return bool(scalar)
-            if isinstance(value, (int, float)):
-                return bool(value)
-            if isinstance(value, str):
-                lowered = value.strip().lower()
-                if lowered in {"false", "0", "no", "off"}:
-                    return False
-                if lowered in {"true", "1", "yes", "on"}:
-                    return True
-            return bool(value)
-
-        def _node_pin_role(idx: int) -> str | None:
-            if idx < 0 or idx >= len(normalized_attrs):
-                return None
-            attrs = normalized_attrs[idx] or {}
-            role = self._decode_pin_role_value(attrs.get("pin_role"))
-            if role is None:
-                node_type = attrs.get("node_type")
-                if isinstance(node_type, str):
-                    role = _normalize_pin_role(node_type)
-            if role is not None:
-                return role
-            raw_role = attrs.get("pin_role")
-            if raw_role is not None and isinstance(raw_role, str):
-                warn(f"Unknown node pin role: {raw_role}")
-            return None
-
-        def _node_pin_slot(idx: int) -> int | None:
-            if idx < 0 or idx >= len(normalized_attrs):
-                return None
-            attrs = normalized_attrs[idx] or {}
-            raw = attrs.get("pin_slot_index")
-            if raw is None:
-                return None
-            if torch.is_tensor(raw):
-                if raw.numel() == 0:
-                    return None
-                try:
-                    value = float(raw.detach().cpu().view(-1)[0].item())
-                except Exception:
-                    return None
-            else:
-                try:
-                    value = float(raw)
-                except (TypeError, ValueError):
-                    return None
-            slot = int(round(value))
-            if slot < 0:
-                return None
-            return slot
-
-        def _recompute_pin_nodes() -> Tuple[List[int], List[int]]:
-            inputs = [idx for idx in range(len(normalized_attrs)) if _node_pin_role(idx) == PIN_ROLE_INPUT]
-            outputs = [idx for idx in range(len(normalized_attrs)) if _node_pin_role(idx) == PIN_ROLE_OUTPUT]
-            inputs.sort(key=lambda idx: (_node_pin_slot(idx) is None, _node_pin_slot(idx) or 0, idx))
-            outputs.sort(key=lambda idx: (_node_pin_slot(idx) is None, _node_pin_slot(idx) or 0, idx))
-            return inputs, outputs
-
-        input_nodes, output_nodes = _recompute_pin_nodes()
-        if not input_nodes:
-            input_nodes = [idx for idx in decoded_input_nodes if idx < node_count]
-        if not input_nodes:
-            input_nodes = list(range(min(2, node_count))) or [0]
-        if not output_nodes:
-            output_nodes = [idx for idx in decoded_output_nodes if idx < node_count]
-        if not output_nodes:
-            output_nodes = [node_count - 1] if node_count > 0 else [0]
-
-        hidden_nodes = [idx for idx in range(node_count) if idx not in input_nodes and idx not in output_nodes]
-        output_set = set(output_nodes)
-
-        def add_edge(src: int, dst: int) -> bool:
-            nonlocal repaired_edges
-            if src == dst or src < 0 or dst < 0 or src >= node_count or dst >= node_count:
-                return False
-            key = (int(src), int(dst))
-            if key in edge_set:
-                return False
-            edge_set.add(key)
-            edges.append(key)
-            adjacency_out[src].append(dst)
-            adjacency_in[dst].append(src)
-            repaired_edges += 1
-            return True
-
-        target_pool = hidden_nodes or [node for node in range(node_count) if node not in input_nodes]
-        target_pool = _maybe_shuffle(target_pool)
-        if not target_pool:
-            target_pool = output_nodes
-
-        for idx, node in enumerate(input_nodes):
-            if adjacency_out[node]:
-                continue
-            cycle = target_pool if target_pool else [node]
-            candidate = cycle[idx % len(cycle)]
-            if candidate == node and node_count > 1:
-                candidate = (node + 1) % node_count
-            add_edge(node, candidate)
-
-        for idx, node in enumerate(output_nodes):
-            if adjacency_in[node]:
-                continue
-            sources = _maybe_shuffle(input_nodes + hidden_nodes)
-            if not sources:
-                sources = [node]
-            candidate = sources[idx % len(sources)]
-            if candidate == node and node_count > 1:
-                candidate = (node - 1) % node_count
-            add_edge(candidate, node)
-
-        def input_reaches_output(src: int) -> bool:
-            if src not in adjacency_out:
-                return False
-            visited: Set[int] = {src}
-            queue = deque([src])
-            while queue:
-                current = queue.popleft()
-                if current in output_set:
-                    return True
-                for dst in adjacency_out.get(current, []):
-                    if dst not in visited:
-                        visited.add(dst)
-                        queue.append(dst)
-            return False
-
-        for idx, inp in enumerate(input_nodes):
-            if not output_nodes:
-                break
-            if input_reaches_output(inp):
-                continue
-            candidate_cycle = _maybe_shuffle(output_nodes)
-            candidate = candidate_cycle[idx % len(candidate_cycle)]
-            if candidate == inp and node_count > 1:
-                candidate = (candidate + 1) % node_count
-            added = add_edge(inp, candidate)
-            if not added and hidden_nodes:
-                hub_cycle = _maybe_shuffle(hidden_nodes)
-                hub = hub_cycle[idx % len(hub_cycle)]
-                add_edge(inp, hub)
-                add_edge(hub, candidate)
-
-        def reachable_nodes() -> Set[int]:
-            reachable: Set[int] = set(input_nodes)
-            queue = deque(input_nodes)
-            while queue:
-                current = queue.popleft()
-                for dst in adjacency_out.get(current, []):
-                    if dst not in reachable:
-                        reachable.add(dst)
-                        queue.append(dst)
-            return reachable
-
-        reachable = reachable_nodes()
-        for node in output_nodes:
-            if node in reachable:
-                continue
-            sources = [src for src in reachable if src != node]
-            if not sources:
-                sources = input_nodes
-            if not sources:
-                break
-            ordered_sources = _candidate_order(sources, key=lambda idx: (len(adjacency_out[idx]), idx))
-            add_edge(ordered_sources[0], node)
-            reachable = reachable_nodes()
-
-        def nodes_reaching_outputs() -> Set[int]:
-            reachable_outputs: Set[int] = set(output_nodes)
-            queue = deque(output_nodes)
-            while queue:
-                current = queue.popleft()
-                for src in adjacency_in.get(current, []):
-                    if src not in reachable_outputs:
-                        reachable_outputs.add(src)
-                        queue.append(src)
-            return reachable_outputs
-
-        if hidden_nodes:
-            fallback_sources = input_nodes or list(range(node_count))
-            if not fallback_sources:
-                fallback_sources = [0]
-            for hidden in hidden_nodes:
-                if hidden in reachable:
-                    continue
-                sources = [src for src in reachable if src != hidden]
-                if not sources:
-                    sources = fallback_sources
-                ordered_sources = _candidate_order(sources, key=lambda idx: (len(adjacency_out[idx]), idx))
-                for src in ordered_sources:
-                    if src == hidden:
-                        continue
-                    if add_edge(src, hidden):
-                        reachable = reachable_nodes()
-                        break
-
-            reverse_reachable = nodes_reaching_outputs()
-            fallback_targets = output_nodes or list(range(node_count)) or [0]
-            for hidden in hidden_nodes:
-                if hidden in reverse_reachable:
-                    continue
-                targets = [dst for dst in reverse_reachable if dst != hidden]
-                if not targets:
-                    targets = fallback_targets
-                ordered_targets = _candidate_order(targets, key=lambda idx: (len(adjacency_in[idx]), idx))
-                for dst in ordered_targets:
-                    if dst == hidden:
-                        continue
-                    if add_edge(hidden, dst):
-                        reverse_reachable = nodes_reaching_outputs()
-                        break
-
-        # Preserve decoder-emitted intent so tests can assert connections between the original
-        # input/output pins even if repair reshapes the graph.
-        decoded_input_nodes = [
-            idx for idx, role in enumerate(decoded_role_hints[:node_count]) if role == PIN_ROLE_INPUT
-        ]
-        decoded_output_nodes = [
-            idx for idx, role in enumerate(decoded_role_hints[:node_count]) if role == PIN_ROLE_OUTPUT
-        ]
-
-        def _reaches_targets(src: int, targets: Set[int]) -> bool:
-            if src not in adjacency_out or not targets:
-                return False
-            visited: Set[int] = {src}
-            queue = deque([src])
-            while queue:
-                current = queue.popleft()
-                if current in targets:
-                    return True
-                for dst in adjacency_out.get(current, []):
-                    if dst not in visited:
-                        visited.add(dst)
-                        queue.append(dst)
-            return False
-
-        if decoded_input_nodes and decoded_output_nodes:
-            decoded_output_set = set(decoded_output_nodes)
-            for idx, decoded_input in enumerate(decoded_input_nodes):
-                if decoded_input >= node_count:
-                    continue
-                if _reaches_targets(decoded_input, decoded_output_set):
-                    continue
-                candidate_cycle = _maybe_shuffle(decoded_output_nodes)
-                candidate = candidate_cycle[idx % len(candidate_cycle)]
-                if candidate == decoded_input and node_count > 1:
-                    candidate = (candidate + 1) % node_count
-                added = add_edge(decoded_input, candidate)
-                if not added and hidden_nodes:
-                    hub_cycle = _maybe_shuffle(hidden_nodes)
-                    hub = hub_cycle[idx % len(hub_cycle)]
-                    if add_edge(decoded_input, hub):
-                        for target in _candidate_order(decoded_output_nodes, key=lambda nid: len(adjacency_in[nid])):
-                            if target == hub:
-                                continue
-                            if add_edge(hub, target):
-                                break
-                if not _reaches_targets(decoded_input, decoded_output_set):
-                    for target in decoded_output_nodes:
-                        if target == decoded_input:
-                            continue
-                        if add_edge(decoded_input, target):
-                            break
-
-        graph_dict["node_attributes"] = normalized_attrs
-
-        if not edges:
-            default_src = input_nodes[0] if input_nodes else 0
-            default_dst = output_nodes[0] if output_nodes else (0 if node_count == 1 else 1)
-            if default_src == default_dst and node_count > 1:
-                default_dst = (default_dst + 1) % node_count
-            add_edge(default_src, default_dst)
-
-        if edges:
-            tensor = torch.as_tensor(edges, dtype=torch.long).t().contiguous()
-        else:
-            tensor = torch.empty((2, 0), dtype=torch.long)
-        graph_dict["edge_index"] = tensor
-        _record_repaired_graph_snapshot()
-        repaired = bool(repaired_edges or repaired_metadata)
-        if repaired:
-            graph_dict["_repair_applied"] = True
-        else:
-            graph_dict.pop("_repair_applied", None)
-        return repaired
 
     def _optimizer_updates_parameters(self, optimizer, check_steps=2, delta_eps=1e-12, task=None):
         """Run a short dry-run to ensure the optimizer changes model weights."""

@@ -97,21 +97,14 @@ This subsampling keeps the decoder from collapsing onto invalid DAGs while still
 
 Whenever a guided graph fails these validity filters you can optionally snapshot the offending graph under `debug_guided_offspring/`. Enable this by setting `[GuidedPopulation] guided_debug_dump_enabled = true` in `neat-config`; override the saved-sample budget via `guided_debug_dump_limit` (defaults to 5). Dumps capture the raw Torch tensors that drove each rebuild so you can replay them locally. Separately, the Mermaid `.mmd` visualizations stay controlled by `guided_invalid_viz_enabled`, `guided_invalid_viz_dir`, `guided_invalid_viz_limit`, and `guided_invalid_viz_rankdir` $\element {"LR","RL","TB","BT"}$ (the format is always Mermaid). Use `guided_invalid_viz_limit` to cap how many `.mmd` diagrams are rendered per generation, while `guided_debug_dump_limit` caps how many raw tensor snapshots are serialized overall—the former keeps human-readable diagrams manageable, the latter bounds binary replay artifacts.
 
-Inspired by the targeted feasibility restorations used in CTFGNAS [57], the post-decoding phase is treated as a constrained graph-repair problem: every decoded adjacency is first passed through an analytical repair operator (`GuidedPopulation._repair_graph_dict`).
-The operator only executes when every required input and output node is present in the decoded graph; otherwise the sample is rejected immediately and a graph containing all required input and output nodes such that each input has a path to at least one output and each output has a path from some input.
-It reconstructs role labels for nodes using decoded attributes plus the configured IO slot set, runs forward/backward reachability to detect outputs lacking an ancestral input, and injects the minimal set of additional edges required so that **each input has a path to at least one output and each output has a path from some input**, all while leaving previously enabled connections intact.
-Otherwise, the repaired graph replaces the original latent sample for evaluation.
+Guided offspring previously routed every decoded graph through a heavy repair operator; that entire stage has been removed. Now, if the decoder violates pin quotas, emits empty graphs, or produces duplicate adjacencies, the sample is rejected immediately and logged with a penalty. This keeps guided generation transparent—what you see in the debug dumps or Mermaid visualizations is exactly what the decoder produced—and shaves minutes off each generation because we no longer rebuild block registries or run validator probes twice per child.
 
-#### Tracking inactive repair salvage
+The lifecycle table still records per-child latents, node/edge counts, and validator classifications so you can triage invalid bursts, but there is no longer a pre/post repair comparison or salvage accounting.
 
-`GuidedPopulation` captures per-child repair activity via the lifecycle CSV emitted to `debug_guided_offspring/lifecycles/`. Set `[GuidedPopulation] repair_activity_probe_fraction`/`repair_activity_probe_max` to bound the number of inline pre/post repair probes each generation.
-The old pre-repair sample buffering path has been removed to cut down on object cloning and filesystem churn—the single lifecycle table now carries latent stats, graph size deltas, repair outcome, and validator classifications for every child.
-
-For deeper diagnostics, the analyzer now records each sample’s latent vector and basic WL-subtree fingerprints, enabling richer post-hoc stats:
+For deeper diagnostics, the analyzer records each sample’s latent vector and WL-subtree fingerprints:
 
 - Pass `--latent-components k` (with an optional `--latent-csv path/to/coords.csv`) to compute a PCA projection of the buffered latents so you can spot whether the “almost inactive” offspring cluster in a specific region of the latent manifold.
-- Structural drift is summarized through WL entropy/unique-color counts (`--wl-iterations` controls the histogram depth) so you can see if repair-salvaged children share a narrow motif family.
-- Use `--counterfactual-repair N` to rerun the repair hook `N` times per inactive sample and estimate how often alternative random seeds would have yielded an optimizer that updates parameters.
+- Structural drift is summarized through WL entropy/unique-color counts (`--wl-iterations` controls the histogram depth) so you can see if invalid children share a narrow motif family.
 
 ### Stabilizing Graph Decoding
 
