@@ -677,11 +677,6 @@ class GuidedPopulation(Population):
         self.guided_replay_min_graphs = max(0, int(getattr(config, "guided_replay_min_graphs", 4)))
         self.guided_replay_noise_scale = max(0.0, float(getattr(config, "guided_replay_noise_scale", 0.2)))
         self.guided_replay_max_latents = max(0, int(getattr(config, "guided_replay_max_latents", 64)))
-        self.guided_seed_fraction = min(1.0, max(0.0, float(getattr(config, "guided_seed_fraction", 0.25))))
-        raw_seed_fail_threshold = getattr(config, "guided_seed_fail_threshold", None)
-        if raw_seed_fail_threshold is None:
-            raw_seed_fail_threshold = getattr(config, "guided_seed_inactive_threshold", 0.3)
-        self.guided_seed_fail_threshold = min(1.0, max(0.0, float(raw_seed_fail_threshold)))
         self.seeded_replay_enabled = bool(getattr(config, "seeded_replay_enabled", True))
         self._seeded_replay_entries: List[dict] = []
         self._seeded_replay_signatures: Set[str | None] = set()
@@ -1495,32 +1490,21 @@ class GuidedPopulation(Population):
         return payload
 
     def _sample_decoder_replay_graphs(self, count: int) -> List[dict]:
-        if count <= 0:
-            return []
-        if not self._decoder_replay_reservoir and not self._seeded_replay_entries:
-            return []
         graphs: List[dict] = []
-        fail_ratio = self._guided_validator_fail_ratio()
-        need_seed_support = (
-            self.guided_seed_fraction > 0.0
-            and self.guided_seed_fail_threshold > 0.0
-            and fail_ratio >= self.guided_seed_fail_threshold
-        )
-        if need_seed_support and self._seeded_replay_entries:
-            seed_quota = min(count, max(1, int(round(count * self.guided_seed_fraction))))
+        include_seed_graphs = self.seeded_replay_enabled and self._seeded_replay_entries
+        if include_seed_graphs:
+            seed_quota = len(self._seeded_replay_entries)
             seed_graphs = self._sample_seeded_replay_graphs(seed_quota)
             graphs.extend(seed_graphs)
-        remaining = count - len(graphs)
-        if remaining <= 0:
+        if count <= 0:
             return graphs
-        entries = list(self._decoder_replay_reservoir)
-        if not entries:
+        if not self._decoder_replay_reservoir:
             return graphs
         picks: List[tuple[str | None, dict]]
-        if remaining >= len(entries):
-            picks = random.choices(entries, k=remaining)
+        if count >= len(self._decoder_replay_reservoir):
+            picks = random.choices(list(self._decoder_replay_reservoir), k=count)
         else:
-            picks = random.sample(entries, remaining)
+            picks = random.sample(list(self._decoder_replay_reservoir), count)
         for _, graph_dict in picks:
             cloned = self._clone_graph_dict(graph_dict, include_history=False)
             if cloned is not None:
@@ -2297,8 +2281,8 @@ class GuidedPopulation(Population):
         if top_data_list:
             encoded_latent_chunks.append(self._encode_graph_batch(top_data_list))
 
-        if replay_latent_quota > 0:
-            replay_graphs = self._sample_decoder_replay_graphs(replay_latent_quota)
+        replay_graphs = self._sample_decoder_replay_graphs(replay_latent_quota)
+        if replay_graphs:
             replay_data_list: List[Data] = []
             for graph_dict in replay_graphs:
                 data = self._graph_dict_to_data(graph_dict)

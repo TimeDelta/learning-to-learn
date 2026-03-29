@@ -485,7 +485,6 @@ def test_generate_guided_offspring_penalizes_max_edges(monkeypatch):
 def test_generate_guided_offspring_records_inactive_details(monkeypatch):
     config = make_neat_config()
     config.guided_replay_fraction = 0.0
-    config.guided_seed_fraction = 0.0
     config.guided_inactive_detail_limit = 1
     pop = GuidedPopulation(config)
     pop.guide = StubGuide([make_graph_factory(0.1)])
@@ -644,7 +643,6 @@ def test_generate_guided_offspring_records_latent_labels(monkeypatch):
     config.guided_structure_buffer = 4
     config.guided_structure_weight = 0.0
     config.guided_replay_fraction = 0.0
-    config.guided_seed_fraction = 0.0
     pop = GuidedPopulation(config)
     pop.guide = StubGuide([make_invalid_graph_factory(), make_graph_factory(0.3)])
     pop._optimizer_updates_parameters = lambda *args, **kwargs: True
@@ -696,7 +694,6 @@ def test_seed_latent_structure_from_population(monkeypatch):
 def test_generate_guided_offspring_tracks_structure_penalty(monkeypatch):
     config = make_neat_config()
     config.guided_replay_fraction = 0.0
-    config.guided_seed_fraction = 0.0
     config.guided_structure_buffer = 4
     config.guided_structure_weight = 1.0
     pop = GuidedPopulation(config)
@@ -759,11 +756,9 @@ def test_latent_decoder_relax_penalty_tracks_stats():
     assert "expected_edges" in stats
 
 
-def test_decoder_replay_seed_support_follows_validator_fail_ratio():
+def test_decoder_replay_seed_support_always_includes_seed_graphs():
     config = make_neat_config()
     config.guided_replay_fraction = 0.0
-    config.guided_seed_fraction = 0.5
-    config.guided_seed_fail_threshold = 0.25
     pop = GuidedPopulation(config)
 
     seed_graph = make_graph_factory(0.1)()
@@ -775,20 +770,13 @@ def test_decoder_replay_seed_support_follows_validator_fail_ratio():
     pop._decoder_replay_reservoir.clear()
     pop._decoder_replay_reservoir.extend([(None, reservoir_graph)])
 
-    pop._reset_guided_offspring_stats()
-    pop._guided_offspring_stats["requested"] = 4
-    pop._guided_offspring_stats["validator_failures"] = 2
+    zero_budget = pop._sample_decoder_replay_graphs(0)
+    assert any(attr.get("tag") == "seed" for g in zero_budget for attr in g.get("node_attributes", []))
+    assert all(attr.get("tag") != "reservoir" for g in zero_budget for attr in g.get("node_attributes", []))
 
-    seeded_draw = pop._sample_decoder_replay_graphs(1)
-    assert any(attr.get("tag") == "seed" for g in seeded_draw for attr in g.get("node_attributes", []))
-
-    pop._reset_guided_offspring_stats()
-    pop._guided_offspring_stats["requested"] = 4
-    pop._guided_offspring_stats["validator_failures"] = 0
-    pop._prev_guided_offspring_stats = None
-
-    regular_draw = pop._sample_decoder_replay_graphs(1)
-    assert all(attr.get("tag") != "seed" for g in regular_draw for attr in g.get("node_attributes", []))
+    seeded_and_reservoir = pop._sample_decoder_replay_graphs(1)
+    assert any(attr.get("tag") == "seed" for g in seeded_and_reservoir for attr in g.get("node_attributes", []))
+    assert any(attr.get("tag") == "reservoir" for g in seeded_and_reservoir for attr in g.get("node_attributes", []))
 
 
 def test_latent_structure_penalty_uses_cached_centers():
@@ -810,7 +798,6 @@ def test_latent_structure_penalty_uses_cached_centers():
 def test_generate_guided_offspring_tracks_repair_salvage(monkeypatch):
     config = make_neat_config()
     config.guided_replay_fraction = 0.0
-    config.guided_seed_fraction = 0.0
     pop = GuidedPopulation(config)
     pop.guide = StubGuide([make_invalid_graph_factory(), make_graph_factory(0.2)])
     pop._optimizer_updates_parameters = lambda *args, **kwargs: True
