@@ -53,7 +53,7 @@ class OptimizerGenomeConfig(object):
 
         for p in self._params:
             value = p.interpret(params)
-            print(f"setting {p.name} to {value}")
+            logger.info("setting %s to %s", p.name, value)
             setattr(self, p.name, value)
 
         # By convention, input pins have negative keys, and the output
@@ -483,7 +483,7 @@ class OptimizerGenome(object):
 
     def add_node(self, node_type: str, activation, aggregation) -> NodeGene:
         if activation is None and aggregation is None:
-            print("WARNING: node added without any operation")
+            logger.warning("node added without any operation")
         node = NodeGene(self.next_node_id, node_type, activation, aggregation)
         self.nodes[self.next_node_id] = node
         self.next_node_id += 1

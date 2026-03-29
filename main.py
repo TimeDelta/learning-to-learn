@@ -356,7 +356,7 @@ def create_initial_genome(config, optimizer):
                 innovation += 1
                 connections[key] = conn
             elif producer not in graph_inputs or producer.kind() != "prim::Param":
-                print(f"WARNING: missing mapping for input node [{producer}]")
+                logger.warning("Missing mapping for input node [%s]", producer)
 
     genome.connections = connections
     genome.optimizer = optimizer
@@ -1158,7 +1158,7 @@ if __name__ == "__main__":
             with log_timing(logger, f"Evolution loop ({args.num_generations} generations)") as timing:
                 winner = population.run(args.num_generations)
                 timing.set_details(f"completed_generations={population.generation}")
-            print("\nBest genome:\n{!s}".format(winner))
+            logger.info("Best genome:\n%s", winner)
 
             snapshot_path = None
             try:
@@ -1171,10 +1171,10 @@ if __name__ == "__main__":
                     snapshot_path = final_dir / filename
                     torch.save(population_snapshot, snapshot_path)
                     timing.set_details(f"path={snapshot_path}")
-                    print(f"Final population snapshot saved to {snapshot_path}")
+                    logger.info("Final population snapshot saved to %s", snapshot_path)
             except Exception as exc:
                 snapshot_path = None
-                print(f"WARNING: Failed to save final population snapshot: {exc}")
+                logger.warning("Failed to save final population snapshot: %s", exc)
 
             if mlflow_run:
                 num_nodes, num_connections = _genome_complexity(winner)
@@ -1431,7 +1431,7 @@ if __name__ == "__main__":
         with log_timing(logger, f"Evolution loop ({args.num_generations} generations)") as timing:
             winner = population.run(args.num_generations)
             timing.set_details(f"completed_generations={population.generation}")
-        print("\nBest genome:\n{!s}".format(winner))
+        logger.info("Best genome:\n%s", winner)
 
         snapshot_path = None
         try:
@@ -1444,10 +1444,10 @@ if __name__ == "__main__":
                 snapshot_path = final_dir / filename
                 torch.save(population_snapshot, snapshot_path)
                 timing.set_details(f"path={snapshot_path}")
-                print(f"Final population snapshot saved to {snapshot_path}")
+                logger.info("Final population snapshot saved to %s", snapshot_path)
         except Exception as exc:
             snapshot_path = None
-            print(f"WARNING: Failed to save final population snapshot: {exc}")
+            logger.warning("Failed to save final population snapshot: %s", exc)
 
         if mlflow_run:
             num_nodes, num_connections = _genome_complexity(winner)

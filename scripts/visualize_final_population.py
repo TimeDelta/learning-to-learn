@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-import sys
+import logging
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -17,6 +17,8 @@ from population_visualizer import (
     save_summary,
     select_snapshot_entries,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -123,7 +125,7 @@ def main() -> int:
     try:
         snapshot_path = _resolve_snapshot(args)
     except FileNotFoundError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        logger.error("%s", exc)
         return 1
 
     snapshot = load_population_snapshot(snapshot_path)
@@ -135,7 +137,7 @@ def main() -> int:
         sort_by=args.sort_by,
     )
     if not entries:
-        print("No entries matched the provided filters.", file=sys.stderr)
+        logger.error("No entries matched the provided filters.")
         return 1
 
     output_dir = args.output_dir
@@ -185,7 +187,7 @@ def main() -> int:
             }
         )
         printable = ", ".join(mermaid_files)
-        print(f"Rendered genome {entry.get('genome_id')} to {printable}")
+        logger.info("Rendered genome %s to %s", entry.get("genome_id"), printable)
 
     if not args.no_summary:
         summary_path = output_dir / args.summary_name
@@ -200,11 +202,12 @@ def main() -> int:
                 "artifacts": render_records,
             },
         )
-        print(f"Wrote summary manifest to {summary_path}")
+        logger.info("Wrote summary manifest to %s", summary_path)
 
-    print(f"Done. Artifacts stored in {output_dir}")
+    logger.info("Done. Artifacts stored in %s", output_dir)
     return 0
 
 
 if __name__ == "__main__":  # pragma: no cover
+    logging.basicConfig(level=logging.INFO)
     raise SystemExit(main())

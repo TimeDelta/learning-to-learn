@@ -402,11 +402,11 @@ def _attribute_drift_summary(graph_dict: dict | None, top_k: int = 6) -> Dict[st
 
 def _dump_invalid_reason_summary():
     if not _INVALID_REASON_COUNTER:
-        print("[invalid-offspring] No penalized guided offspring recorded.")
+        logger.info("[invalid-offspring] No penalized guided offspring recorded.")
         return
     total = sum(_INVALID_REASON_COUNTER.values())
     parts = ", ".join(f"{reason}={count}" for reason, count in sorted(_INVALID_REASON_COUNTER.items()))
-    print(f"[invalid-offspring] total={total} :: {parts}")
+    logger.info("[invalid-offspring] total=%s :: %s", total, parts)
 
 
 def _register_invalid_reason_reporter():
@@ -3832,7 +3832,7 @@ class GuidedPopulation(Population):
             # Evaluate real fitness. Using too few update steps makes every optimizer look identical,
             # so clamp to a minimum to expose behavioral differences early in the run.
             eval_steps = self._generation_eval_steps()
-            print(f"Evaluating genomes on {self.task.name()} for {eval_steps} steps")
+            logger.info("Evaluating genomes on %s for %d steps", self.task.name(), eval_steps)
             with log_timing(
                 logger,
                 f"Generation {self.generation} genome evaluation",
@@ -3990,7 +3990,7 @@ class GuidedPopulation(Population):
                 continue
             model_copy = type(model)(self.task.train_data.num_input_features)
             model_copy.load_state_dict(model.state_dict())
-            print(f"  Evaluating {genome_id} ({genome.optimizer_path})")
+            logger.info("  Evaluating %s (%s)", genome_id, genome.optimizer_path)
             result = self.evaluate_optimizer(genome.optimizer, model_copy, steps=steps)
             if result is None:
                 penalty_metrics = self._assign_penalty(genome_map[genome_id])
@@ -4001,11 +4001,12 @@ class GuidedPopulation(Population):
             setattr(genome_map[genome_id], "invalid_graph", False)
             area_under_metrics, validation_metrics, time_cost, mem_cost = result
             validation_metrics_str = "{" + ";".join([f"{m.name}: {v}" for m, v in validation_metrics.items()]) + "}"
-            print(
-                f"    Area Under Task Metrics: {area_under_metrics}",
-                f"    Validation Metrics: {validation_metrics_str}",
-                f"    Time Cost: {time_cost}",
-                f"    Memory Cost: {mem_cost}",
+            logger.info(
+                "    Area Under Task Metrics: %s | Validation Metrics: %s | Time Cost: %s | Memory Cost: %s",
+                area_under_metrics,
+                validation_metrics_str,
+                time_cost,
+                mem_cost,
             )
             validation_metrics[AreaUnderTaskMetrics] = area_under_metrics
             validation_metrics[TimeCost] = time_cost
@@ -4068,7 +4069,7 @@ class GuidedPopulation(Population):
                 self.novelty_archive.update(evaluated_descriptors, novelty_scores, valid_ids)
 
         # 3. Pareto front ranking (exclude penalized metrics from dominance calc)
-        print("  Calculating Pareto Fronts")
+        logger.info("  Calculating Pareto Fronts")
         pareto_metrics: Dict[int, Dict[Metric, float]] = {}
         penalized_for_front: List[int] = []
         for gid, metrics in raw_metrics.items():
@@ -4117,7 +4118,7 @@ class GuidedPopulation(Population):
                 composite = sum(scores) / len(scores) if scores else 0.0
                 # Fitness: higher for earlier fronts, break ties by composite
                 genome_map[genome_id].fitness = (len(fronts) - front_idx + 1) + composite
-                print(f"    {genome_id}: {genome_map[genome_id].fitness}")
+                logger.info("    %s: %s", genome_id, genome_map[genome_id].fitness)
                 genome_map[genome_id].fitnesses = raw_metrics[genome_id]
         effective_invalid_counts = invalid_reason_counts
         stats_source = None

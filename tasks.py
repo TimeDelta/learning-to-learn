@@ -1,3 +1,4 @@
+import logging
 import random
 from typing import Dict, List
 from warnings import warn
@@ -12,6 +13,8 @@ from torch.utils.data import DataLoader, Dataset
 from complexity import SERIES_STATS
 from data import generate_complex_regression_data, generate_fbm_sequence
 from metrics import *
+
+logger = logging.getLogger(__name__)
 
 
 class TaskDataset(Dataset):
@@ -64,19 +67,19 @@ class Task:
         self.feature_functions.append(lambda _: self.train_data.num_output_features)
         # TODO: include metrics in task feature_functions for the task embedding to have access
         if not silent:
-            print("  Calculating Task Features")
+            logger.info("  Calculating Task Features")
         self.features = []
         if not silent:
-            print("    Training Data Inputs")
+            logger.info("    Training Data Inputs")
         self.features.append([np.mean(func(self.train_data.inputs)) for func in self.feature_functions])
         if not silent:
-            print("    Training Data Outputs")
+            logger.info("    Training Data Outputs")
         self.features.append([np.mean(func(self.train_data.outputs)) for func in self.feature_functions])
         if not silent:
-            print("    Validation Data Inputs")
+            logger.info("    Validation Data Inputs")
         self.features.append([np.mean(func(self.valid_data.inputs)) for func in self.feature_functions])
         if not silent:
-            print("    Validation Data Outputs")
+            logger.info("    Validation Data Outputs")
         self.features.append([np.mean(func(self.valid_data.outputs)) for func in self.feature_functions])
         self.check_partition_similarity()
 

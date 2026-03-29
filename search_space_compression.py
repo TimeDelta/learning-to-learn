@@ -1331,7 +1331,7 @@ class GraphDecoder(nn.Module):
                             node_loop_iters += 1
                             if t > self.max_nodes:
                                 hit_max_nodes_cap = True
-                                print("max nodes reached")
+                                logger.warning("max nodes reached")
                                 if DEBUG_DECODER and decode_stats is not None:
                                     decode_stats["node_loop_exit"] = decode_stats["node_loop_exit"] or "max_nodes_pre"
                                 break
@@ -1376,7 +1376,7 @@ class GraphDecoder(nn.Module):
                                         break
                             if t > self.max_nodes:
                                 hit_max_nodes_cap = True
-                                print("max nodes reached")
+                                logger.warning("max nodes reached")
                                 if DEBUG_DECODER and decode_stats is not None:
                                     decode_stats["node_loop_exit"] = decode_stats["node_loop_exit"] or "max_nodes_post"
                                 break
@@ -2132,7 +2132,7 @@ class SelfCompressingFitnessRegularizedDAGVAE(nn.Module):
             dims_to_prune = [d for d in dims_to_prune.tolist() if precisions[d] > 1]
             latent_mask[dims_to_prune] = 0.0
             if len(dims_to_prune) > 0:
-                print(f"Pruned {desc} latent dims: {dims_to_prune}")
+                logger.info("Pruned %s latent dims: %s", desc, dims_to_prune)
             return torch.tensor(latent_mask)
 
         self.graph_latent_mask.copy_(prune(self.graph_latent_mask, self.log_alpha_g, "graph"))
@@ -2145,14 +2145,14 @@ class SelfCompressingFitnessRegularizedDAGVAE(nn.Module):
         old_graph_dim = self.graph_latent_mask.numel()
         new_graph_dim = graph_kept_idx.numel()
         if new_graph_dim == old_graph_dim:
-            print("No graph latent dims to permanently prune.")
+            logger.info("No graph latent dims to permanently prune.")
             return
         self.graph_encoder.prune_latent_dims(graph_kept_idx)
         self.decoder.prune_latent_dims(graph_kept_idx)
         self.fitness_predictor.prune_latent_dims(graph_kept_idx)
         self.log_alpha_g = nn.Parameter(self.log_alpha_g.data[graph_kept_idx].clone())
         self.register_buffer("graph_latent_mask", torch.ones(graph_kept_idx.numel()))
-        print(f"Permanently resizing graph bottleneck: {old_graph_dim} → {new_graph_dim}")
+        logger.info("Permanently resizing graph bottleneck: %s -> %s", old_graph_dim, new_graph_dim)
 
 
 @dataclass
@@ -2350,7 +2350,7 @@ class OnlineTrainer:
         if self.module_freeze_verbose:
             label = "train " + "+".join(self._current_active_modules)
             if changed or reason != self._last_freeze_reason:
-                print(f"Trainer module freeze phase -> {label} (reason={reason or 'epoch'})")
+                logger.info("Trainer module freeze phase -> %s (reason=%s)", label, reason or "epoch")
         self._last_freeze_reason = reason
 
     def _clip_gradients(self):
@@ -2878,9 +2878,20 @@ class OnlineTrainer:
                 )
                 label_str = f"{label_str}, kl_beta={current_kl_weight:.4g}, active={active_label}"
                 if not epochs:
-                    print(f"Epoch {epoch}, Loss terms per batch: [{label_str}] (total={total_loss:.4f})")
+                    logger.info(
+                        "Epoch %d, Loss terms per batch: [%s] (total=%.4f)",
+                        epoch,
+                        label_str,
+                        total_loss,
+                    )
                 else:
-                    print(f"Epoch {epoch}/{epochs}, Loss terms per batch: [{label_str}] (total={total_loss:.4f})")
+                    logger.info(
+                        "Epoch %d/%d, Loss terms per batch: [%s] (total=%.4f)",
+                        epoch,
+                        epochs,
+                        label_str,
+                        total_loss,
+                    )
             if DEBUG_TRAINER and epoch_timer is not None:
                 logger.info(
                     "Trainer epoch %d complete | duration=%.3fs loss=%.4f",
@@ -2965,7 +2976,12 @@ class OnlineTrainer:
         loader = DataLoader(refresh_samples, batch_size=batch_size, shuffle=True)
         self._apply_module_freeze(self._module_order, reason="teacher_force")
         if verbose:
-            print(f"Teacher-forcing pass: epochs={epochs} batch_size={batch_size} weight={teacher_force_weight}")
+            logger.info(
+                "Teacher-forcing pass: epochs=%d batch_size=%d weight=%s",
+                epochs,
+                batch_size,
+                teacher_force_weight,
+            )
         for epoch in range(1, epochs + 1):
             self.model.train()
             epoch_adj = 0.0
@@ -3019,7 +3035,13 @@ class OnlineTrainer:
             avg_adj = epoch_adj / max(1, batches)
             avg_feat = epoch_feat / max(1, batches)
             if verbose:
-                print(f"Teacher force epoch {epoch}/{epochs}: adj_loss={avg_adj:.4f} attr_loss={avg_feat:.4f}")
+                logger.info(
+                    "Teacher force epoch %d/%d: adj_loss=%.4f attr_loss=%.4f",
+                    epoch,
+                    epochs,
+                    avg_adj,
+                    avg_feat,
+                )
             if self.progress_callback is not None:
                 self.progress_callback(
                     generation=generation,
@@ -3037,10 +3059,11 @@ class OnlineTrainer:
         # reinit optimizer so it only holds new params
         lr = self.optimizer.defaults.get("lr", 1e-3)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
-        print("Optimizer Reinitialized")
+        logger.info("Optimizer reinitialized")
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     from attributes import *
 
     num_node_types = 3
@@ -3095,7 +3118,7 @@ if __name__ == "__main__":
             self.name = name
             self.objective = objective
 
-    print("Generating random training data")
+    logger.info("Generating random training data")
 
     def generate_data(num_samples):
         graphs, fitnesses = [], []
@@ -3117,12 +3140,12 @@ if __name__ == "__main__":
         reset_state=True,
     )
     trainer.add_data(graphs, fitnesses)
-    print("Training")
+    logger.info("Training")
     trainer.train(epochs=None, batch_size=8, kl_weight=0.1, warmup_epochs=10, stop_epsilon=1)
     trainer.resize_bottleneck()
 
     # Continue training with new data
     graphs_new, fitnesses_new, *_ = generate_data(10)
     trainer.add_data(graphs_new, fitnesses_new)
-    print("Continuing training")
+    logger.info("Continuing training")
     trainer.train(epochs=3, batch_size=8, kl_weight=0.1)
