@@ -804,13 +804,10 @@ class GuidedPopulation(Population):
         default_edge_weight = float(getattr(config, "guided_decoder_relax_edge_weight", 2.0))
         self.decoder_relax_edge_weight = max(0.0, default_edge_weight)
         self._decoder_relax_stats: dict | None = None
-        self.trainer_batch_size = self._sanitize_positive_int(getattr(config, "trainer_batch_size", None))
         raw_max_batch = self._sanitize_positive_int(getattr(config, "trainer_max_batch_size", None))
         if raw_max_batch is None:
             # Keep decoder pressure low by defaulting to a small batch cap.
             raw_max_batch = 4
-        if self.trainer_batch_size is not None:
-            raw_max_batch = max(raw_max_batch or self.trainer_batch_size, self.trainer_batch_size)
         self.trainer_max_batch_size = raw_max_batch
         self._log_memory("guided_population_initialized")
 
@@ -831,8 +828,6 @@ class GuidedPopulation(Population):
         if count <= 0:
             return 1
         resolved = count
-        if self.trainer_batch_size is not None:
-            resolved = min(resolved, self.trainer_batch_size)
         if self.trainer_max_batch_size is not None:
             resolved = min(resolved, self.trainer_max_batch_size)
         return max(1, resolved)

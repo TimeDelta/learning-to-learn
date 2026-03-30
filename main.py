@@ -872,16 +872,10 @@ if __name__ == "__main__":
             ),
         )
         parser.add_argument(
-            "--trainer-batch-size",
-            type=int,
-            default=None,
-            help="Optional hard cap on OnlineTrainer batch size (overrides config value).",
-        )
-        parser.add_argument(
             "--trainer-max-batch-size",
             type=int,
-            default=None,
-            help="Upper bound for OnlineTrainer batch size; defaults to 4 when not specified.",
+            default=256,
+            help="Upper bound for OnlineTrainer batch size.",
         )
         parser.add_argument(
             "--memory-debug",
@@ -893,10 +887,7 @@ if __name__ == "__main__":
     def _parse_args():
         parser = _build_arg_parser()
         args = parser.parse_args()
-        try:
-            args.mlflow_tags = _parse_mlflow_tags(args.mlflow_tags)
-        except ValueError as exc:  # pragma: no cover - argparse passthrough
-            parser.error(str(exc))
+        args.mlflow_tags = _parse_mlflow_tags(args.mlflow_tags)
         return args
 
     args = _parse_args()
@@ -930,9 +921,6 @@ if __name__ == "__main__":
             details.append("test_mode=1")
         if max_eval_epochs is not None:
             details.append(f"max_eval_steps={max_eval_epochs}")
-        if args.trainer_batch_size is not None:
-            setattr(config, "trainer_batch_size", max(1, int(args.trainer_batch_size)))
-            details.append(f"trainer_batch={args.trainer_batch_size}")
         if args.trainer_max_batch_size is not None:
             setattr(config, "trainer_max_batch_size", max(1, int(args.trainer_max_batch_size)))
             details.append(f"trainer_batch_cap={args.trainer_max_batch_size}")

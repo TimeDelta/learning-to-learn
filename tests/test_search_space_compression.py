@@ -403,6 +403,75 @@ def test_reconstruction_loss_handles_none_attribute_values():
     assert loss_feat.item() > 0.0
 
 
+def test_reconstruction_loss_skips_type_mismatched_nodes():
+    model = MinimalGuide()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    trainer = OnlineTrainer(model, optimizer, metric_keys=[AreaUnderTaskMetrics])
+    graph = _make_graph(1, [])
+    batch = Batch.from_data_list([graph])
+    decoded_common = {
+        "edge_index": torch.empty((2, 0), dtype=torch.long),
+        "node_attributes": [{"foo": torch.tensor([0.0])}],
+    }
+    target_graph_attrs = [[{"foo": torch.tensor([1.0])}]]
+    teacher_node_types = [torch.tensor([0], dtype=torch.long)]
+
+    decoded_match = [{**decoded_common, "node_types": torch.tensor([0], dtype=torch.long)}]
+    _loss_adj, loss_feat_match = trainer._compute_reconstruction_losses(
+        batch=batch,
+        decoded_graphs=decoded_match,
+        decoder_aux=None,
+        target_graph_attrs=target_graph_attrs,
+        teacher_node_types=teacher_node_types,
+    )
+    assert loss_feat_match.item() > 0.0
+
+    decoded_mismatch = [{**decoded_common, "node_types": torch.tensor([1], dtype=torch.long)}]
+    _loss_adj, loss_feat_skip = trainer._compute_reconstruction_losses(
+        batch=batch,
+        decoded_graphs=decoded_mismatch,
+        decoder_aux=None,
+        target_graph_attrs=target_graph_attrs,
+        teacher_node_types=teacher_node_types,
+    )
+    assert loss_feat_skip.item() == pytest.approx(0.0)
+
+
+def test_reconstruction_loss_only_skips_mismatched_nodes():
+    model = MinimalGuide()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    trainer = OnlineTrainer(model, optimizer, metric_keys=[AreaUnderTaskMetrics])
+    graph = _make_graph(2, [])
+    batch = Batch.from_data_list([graph])
+    decoded_graphs = [
+        {
+            "edge_index": torch.empty((2, 0), dtype=torch.long),
+            "node_attributes": [
+                {"foo": torch.tensor([0.0])},
+                {"foo": torch.tensor([0.0])},
+            ],
+            "node_types": torch.tensor([1, 0], dtype=torch.long),
+        }
+    ]
+    target_graph_attrs = [
+        [
+            {"foo": torch.tensor([1.0])},
+            {"foo": torch.tensor([1.0])},
+        ]
+    ]
+    teacher_node_types = [torch.tensor([0, 0], dtype=torch.long)]
+
+    _loss_adj, loss_feat = trainer._compute_reconstruction_losses(
+        batch=batch,
+        decoded_graphs=decoded_graphs,
+        decoder_aux=None,
+        target_graph_attrs=target_graph_attrs,
+        teacher_node_types=teacher_node_types,
+    )
+
+    assert loss_feat.item() == pytest.approx(1.0)
+
+
 def test_graph_decoder_respects_node_budget(monkeypatch):
     vocab = SharedAttributeVocab([], embedding_dim=4)
     decoder = GraphDecoder(num_node_types=3, latent_dim=8, shared_attr_vocab=vocab, hidden_dim=4)

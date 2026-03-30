@@ -571,6 +571,38 @@ def group_node_attributes(node_attrs: Sequence[Any], batch_vec: Optional[torch.T
     return node_attrs
 
 
+def group_node_types(
+    node_types: torch.Tensor | Sequence[Any] | None,
+    batch_vec: Optional[torch.Tensor],
+    num_graphs: Optional[int] = None,
+) -> List[Any]:
+    if node_types is None:
+        return []
+    if batch_vec is None:
+        return [node_types]
+    if not torch.is_tensor(batch_vec):
+        return [node_types]
+    if batch_vec.numel() == 0:
+        return [node_types]
+    flat_batch = batch_vec.view(-1).to(dtype=torch.long)
+    observed = int(flat_batch.max().item()) + 1 if flat_batch.numel() else 0
+    graph_count = max(int(num_graphs or 0), observed)
+    if graph_count <= 0:
+        return [node_types]
+    counts = torch.bincount(flat_batch, minlength=graph_count).tolist()
+    result: List[Any] = []
+    cursor = 0
+    total = len(node_types)
+    for count in counts:
+        step = int(count)
+        end = min(total, cursor + step)
+        result.append(node_types[cursor:end])
+        cursor = end
+    if cursor < total:
+        result.append(node_types[cursor:])
+    return result
+
+
 def _sorted_attribute_items(attr_dict: dict | None) -> List[tuple[str, Any]]:
     if not attr_dict:
         return []
@@ -1420,12 +1452,16 @@ class GraphDecoder(nn.Module):
         teacher_attr_targets: Optional[List[List[List[int]]]] = None,
         teacher_adj_targets: Optional[List[Optional[torch.Tensor]]] = None,
         teacher_attr_value_targets: Optional[List[List[List[torch.Tensor]]]] = None,
+        teacher_node_types: Optional[List[Any]] = None,
     ):
         """
         (num_graphs, latent_dim)
         returns: list of graphs, each {'node_types': LongTensor[1, N],
                                        'node_attributes': List[{name: attribute_value} x N],
                                        'edge_index': LongTensor[2, E]}
+        teacher_node_types: per-graph sequences of ground-truth node type indices used to
+                            optionally disable attribute supervision when the predicted type
+                            does not match the teacher type.
         """
         _forward_prof = torch.autograd.profiler.record_function("GraphDecoder.forward")
         _forward_prof.__enter__()
@@ -1442,6 +1478,7 @@ class GraphDecoder(nn.Module):
             node_teacher_tokens = 0
             edge_teacher_loss = latent.new_tensor(0.0)
             edge_teacher_tokens = 0
+            attr_type_mismatch_skips = 0
             required_input_slots = self._resolved_required_input_slots()
             if teacher_attr_targets is not None:
                 # ensure caps accommodate teacher supervision
@@ -1485,6 +1522,9 @@ class GraphDecoder(nn.Module):
                             graph_adj_target = graph_adj_target.to(device)
                             if target_node_count is None:
                                 target_node_count = int(graph_adj_target.size(0))
+                    graph_node_type_targets = None
+                    if teacher_node_types is not None and l < len(teacher_node_types):
+                        graph_node_type_targets = teacher_node_types[l]
                     if target_node_count is not None:
                         target_node_count = max(1, int(target_node_count))
                     try:
@@ -1823,6 +1863,17 @@ class GraphDecoder(nn.Module):
                 if graph_value_targets is not None and node_idx < len(graph_value_targets):
                     node_value_targets = graph_value_targets[node_idx] or None
                 node_type_idx = self._node_type_index_for(node_types, node_idx)
+                teacher_type_idx = None
+                if graph_node_type_targets is not None:
+                    teacher_type_idx = self._node_type_index_for(graph_node_type_targets, node_idx)
+                if (
+                    teacher_type_idx is not None
+                    and node_teacher_targets
+                    and (node_type_idx is None or teacher_type_idx != node_type_idx)
+                ):
+                    node_teacher_targets = None
+                    node_value_targets = None
+                    attr_type_mismatch_skips += 1
 
                 def project_name_logits(name_out: torch.Tensor) -> torch.Tensor:
                     return self.attr_name_head(name_out).reshape(-1)
@@ -2123,6 +2174,8 @@ class GraphDecoder(nn.Module):
             if edge_teacher_tokens:
                 decoder_aux["edge_loss"] = edge_teacher_loss
                 decoder_aux["edge_tokens"] = edge_teacher_tokens
+            if attr_type_mismatch_skips:
+                decoder_aux["attr_type_mismatch_skips"] = attr_type_mismatch_skips
             if decoder_aux:
                 return all_graphs, decoder_aux
             return all_graphs
@@ -2304,12 +2357,14 @@ class SelfCompressingFitnessRegularizedDAGVAE(nn.Module):
         teacher_attr_targets: Optional[List[List[List[int]]]] = None,
         teacher_adj_targets: Optional[List[Optional[torch.Tensor]]] = None,
         teacher_attr_value_targets: Optional[List[List[List[torch.Tensor]]]] = None,
+        teacher_node_types: Optional[List[Any]] = None,
     ):
         return self.decoder(
             z,
             teacher_attr_targets=teacher_attr_targets,
             teacher_adj_targets=teacher_adj_targets,
             teacher_attr_value_targets=teacher_attr_value_targets,
+            teacher_node_types=teacher_node_types,
         )
 
     def forward(
@@ -2321,6 +2376,7 @@ class SelfCompressingFitnessRegularizedDAGVAE(nn.Module):
         teacher_attr_targets: Optional[List[List[List[int]]]] = None,
         teacher_adj_targets: Optional[List[Optional[torch.Tensor]]] = None,
         teacher_attr_value_targets: Optional[List[List[List[torch.Tensor]]]] = None,
+        teacher_node_types: Optional[List[Any]] = None,
         num_graphs: Optional[int] = None,
     ):
         mu_g, lv_g = self.encode(
@@ -2336,6 +2392,7 @@ class SelfCompressingFitnessRegularizedDAGVAE(nn.Module):
             teacher_attr_targets=teacher_attr_targets,
             teacher_adj_targets=teacher_adj_targets,
             teacher_attr_value_targets=teacher_attr_value_targets,
+            teacher_node_types=teacher_node_types,
         )
         if isinstance(decoded, tuple):
             decoded_graphs, decoder_aux = decoded
@@ -2651,6 +2708,8 @@ class OnlineTrainer:
         decoded_graphs,
         decoder_aux,
         target_graph_attrs,
+        *,
+        teacher_node_types: Optional[Sequence[Any]] = None,
         teacher_force_weight: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         dense_adj = to_dense_adj(batch.edge_index, batch.batch, max_num_nodes=None)
@@ -2665,11 +2724,40 @@ class OnlineTrainer:
         excess_node_penalty = float(getattr(self, "decoder_excess_node_penalty", 0.0) or 0.0)
         empty_hits = 0
 
+        def _resolve_node_type(seq: Any, index: int) -> Optional[int]:
+            if seq is None:
+                return None
+            try:
+                if torch.is_tensor(seq):
+                    if seq.numel() == 0:
+                        return None
+                    flat = seq.view(-1)
+                    if index >= flat.numel():
+                        return None
+                    return int(flat[index].item())
+                if isinstance(seq, (list, tuple)):
+                    if index >= len(seq):
+                        return None
+                    value = seq[index]
+                    if torch.is_tensor(value):
+                        value = value.view(-1)
+                        if value.numel() == 0:
+                            return None
+                        return int(value[0].item())
+                    return int(value)
+            except Exception:
+                return None
+            return None
+
         for i in range(graphs_to_compare):
             dg = decoded_graphs[i]
             pred_edges = dg["edge_index"]
             pred_attrs = dg["node_attributes"]
+            pred_node_types = dg.get("node_types")
             target_attrs = target_graph_attrs[i] if i < len(target_graph_attrs) else []
+            target_type_seq = None
+            if teacher_node_types is not None and i < len(teacher_node_types):
+                target_type_seq = teacher_node_types[i]
             num_target_nodes = len(target_attrs)
             num_pred_nodes = len(pred_attrs)
             num_nodes = min(num_pred_nodes, num_target_nodes)
@@ -2737,6 +2825,11 @@ class OnlineTrainer:
                 return loss, cells
 
             for node_idx in range(num_nodes):
+                teacher_type = _resolve_node_type(target_type_seq, node_idx)
+                pred_type = _resolve_node_type(pred_node_types, node_idx)
+                if teacher_type is not None and pred_type is not None and teacher_type != pred_type:
+                    # Attribute supervision is meaningless if the node operator mismatches.
+                    continue
                 all_attr_names = set(pred_attrs[node_idx].keys()) | set(target_attrs[node_idx].keys())
                 for attr_name in all_attr_names:
                     pred_value = pred_attrs[node_idx].get(attr_name)
@@ -3120,6 +3213,7 @@ class OnlineTrainer:
                 self.optimizer.zero_grad()
                 target_graph_attrs = group_node_attributes(batch.node_attributes, batch.batch)
                 per_graph_node_counts = [len(attrs) for attrs in target_graph_attrs]
+                teacher_node_types = group_node_types(batch.node_types, batch.batch, batch.num_graphs)
                 teacher_attr_targets = build_teacher_attr_targets(
                     target_graph_attrs, None, self.model.shared_attr_vocab
                 )
@@ -3155,6 +3249,7 @@ class OnlineTrainer:
                     teacher_attr_targets=teacher_attr_targets,
                     teacher_attr_value_targets=teacher_attr_value_targets,
                     teacher_adj_targets=teacher_adj_targets,
+                    teacher_node_types=teacher_node_types,
                     num_graphs=batch.num_graphs,
                 )
                 target_y = batch.y
@@ -3165,6 +3260,7 @@ class OnlineTrainer:
                     decoded_graphs,
                     decoder_aux,
                     target_graph_attrs,
+                    teacher_node_types=teacher_node_types,
                     teacher_force_weight=1.0,
                 )
 
@@ -3408,6 +3504,7 @@ class OnlineTrainer:
                 batch = batch.to(self.device)
                 self.optimizer.zero_grad()
                 target_graph_attrs = group_node_attributes(batch.node_attributes, batch.batch)
+                teacher_node_types = group_node_types(batch.node_types, batch.batch, batch.num_graphs)
                 teacher_attr_targets = build_teacher_attr_targets(
                     target_graph_attrs, None, self.model.shared_attr_vocab
                 )
@@ -3432,6 +3529,7 @@ class OnlineTrainer:
                     batch.batch,
                     teacher_attr_targets=teacher_attr_targets,
                     teacher_attr_value_targets=teacher_attr_value_targets,
+                    teacher_node_types=teacher_node_types,
                     num_graphs=batch.num_graphs,
                 )
                 loss_adj, loss_feat = self._compute_reconstruction_losses(
@@ -3439,6 +3537,7 @@ class OnlineTrainer:
                     decoded_graphs,
                     decoder_aux,
                     target_graph_attrs,
+                    teacher_node_types=teacher_node_types,
                     teacher_force_weight=teacher_force_weight,
                 )
                 loss = loss_adj + loss_feat
