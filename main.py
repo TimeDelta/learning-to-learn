@@ -704,6 +704,8 @@ def _log_trainer_history_artifacts(run_manager, history):
     loss_names = sorted({name for entry in history for name in entry.get("loss_terms", {}).keys()})
     metric_loss_names = sorted({name for entry in history for name in entry.get("per_metric_losses", {}).keys()})
     include_attr_mismatch = any(entry.get("attr_type_mismatch_skips") is not None for entry in history)
+    include_node_type_loss = any(entry.get("node_type_loss") is not None for entry in history)
+    include_node_type_tokens = any(entry.get("node_type_tokens") is not None for entry in history)
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_path = Path(tmpdir)
         csv_path = tmp_path / "trainer_losses.csv"
@@ -712,6 +714,10 @@ def _log_trainer_history_artifacts(run_manager, history):
         header.extend([f"metric_loss_{name}" for name in metric_loss_names])
         if include_attr_mismatch:
             header.append("attr_type_mismatch_skips")
+        if include_node_type_loss:
+            header.append("node_type_loss")
+        if include_node_type_tokens:
+            header.append("node_type_tokens")
         with open(csv_path, "w", newline="", encoding="utf-8") as csv_file:
             writer = csv.writer(csv_file)
             writer.writerow(header)
@@ -728,6 +734,10 @@ def _log_trainer_history_artifacts(run_manager, history):
                     row.append(entry.get("per_metric_losses", {}).get(name))
                 if include_attr_mismatch:
                     row.append(entry.get("attr_type_mismatch_skips"))
+                if include_node_type_loss:
+                    row.append(entry.get("node_type_loss"))
+                if include_node_type_tokens:
+                    row.append(entry.get("node_type_tokens"))
                 writer.writerow(row)
         run_manager.log_artifact(str(csv_path))
 
@@ -998,6 +1008,8 @@ if __name__ == "__main__":
                     step = next(trainer_step_counter)
                     trainer_last_step["value"] = step
                     attr_mismatch = kwargs.get("attr_type_mismatch_skips")
+                    node_type_loss = kwargs.get("node_type_loss")
+                    node_type_tokens = kwargs.get("node_type_tokens")
                     metrics = {
                         "trainer_generation": generation,
                         "trainer_epoch": epoch,
@@ -1011,6 +1023,10 @@ if __name__ == "__main__":
                         metrics[f"trainer_module_active_{name}"] = 1 if name in active_modules else 0
                     if attr_mismatch is not None:
                         metrics["trainer_attr_type_mismatch_skips"] = attr_mismatch
+                    if node_type_loss is not None:
+                        metrics["trainer_node_type_loss"] = node_type_loss
+                    if node_type_tokens is not None:
+                        metrics["trainer_node_type_tokens"] = node_type_tokens
                     clean_metrics = {k: v for k, v in metrics.items() if v is not None}
                     if clean_metrics:
                         mlflow_run.log_metrics(clean_metrics, step=step)
@@ -1031,6 +1047,9 @@ if __name__ == "__main__":
                         log_line += f" | active_modules={','.join(active_modules)}"
                     if attr_mismatch is not None:
                         log_line += f" | attr_type_mismatch_skips={attr_mismatch}"
+                    if node_type_loss is not None:
+                        token_suffix = f" (tokens={node_type_tokens})" if node_type_tokens else ""
+                        log_line += f" | node_type_ce={node_type_loss:.4f}{token_suffix}"
                     mlflow_run.append_log_line(log_line)
                     mlflow_run.flush_log()
 
@@ -1207,28 +1226,31 @@ if __name__ == "__main__":
                 trainer_last_step = {"value": 0}
                 trainer_metrics_history: list[dict[str, object]] = []
 
-            def _log_trainer_progress(**kwargs):
-                generation = kwargs.get("generation", 0) or 0
-                epoch = kwargs.get("epoch", 0) or 0
-                total_epochs = kwargs.get("total_epochs")
-                total_loss = kwargs.get("total_loss")
-                loss_terms = kwargs.get("loss_terms", {})
-                kl_beta = kwargs.get("kl_beta")
-                per_metric_losses = kwargs.get("per_metric_losses") or {}
-                active_modules = tuple(kwargs.get("active_modules") or ())
-                available_modules = tuple(
-                    kwargs.get("available_modules")
-                    or getattr(trainer, "module_names_for_logging", ("encoder", "decoder", "predictor"))
-                )
-                active_label = kwargs.get("active_modules_label")
-                step = next(trainer_step_counter)
-                trainer_last_step["value"] = step
-                attr_mismatch = kwargs.get("attr_type_mismatch_skips")
-                metrics = {
-                    "trainer_total_loss": total_loss,
-                    "trainer_epoch": epoch,
-                    "trainer_generation": generation,
-                }
+                def _log_trainer_progress(**kwargs):
+                    generation = kwargs.get("generation", 0) or 0
+                    epoch = kwargs.get("epoch", 0) or 0
+                    total_epochs = kwargs.get("total_epochs")
+                    total_loss = kwargs.get("total_loss")
+                    loss_terms = kwargs.get("loss_terms", {})
+                    kl_beta = kwargs.get("kl_beta")
+                    per_metric_losses = kwargs.get("per_metric_losses") or {}
+                    active_modules = tuple(kwargs.get("active_modules") or ())
+                    available_modules = tuple(
+                        kwargs.get("available_modules")
+                        or getattr(trainer, "module_names_for_logging", ("encoder", "decoder", "predictor"))
+                    )
+                    active_label = kwargs.get("active_modules_label")
+                    step = next(trainer_step_counter)
+                    trainer_last_step["value"] = step
+                    attr_mismatch = kwargs.get("attr_type_mismatch_skips")
+                    node_type_loss = kwargs.get("node_type_loss")
+                    node_type_tokens = kwargs.get("node_type_tokens")
+                    metrics = {
+                        "trainer_total_loss": total_loss,
+                        "trainer_epoch": epoch,
+                        "trainer_generation": generation,
+                    }
+
                 if kl_beta is not None:
                     metrics["trainer_kl_beta"] = kl_beta
                 if available_modules:
@@ -1237,6 +1259,10 @@ if __name__ == "__main__":
                 metrics.update({f"trainer_{name}": value for name, value in loss_terms.items()})
                 if attr_mismatch is not None:
                     metrics["trainer_attr_type_mismatch_skips"] = attr_mismatch
+                if node_type_loss is not None:
+                    metrics["trainer_node_type_loss"] = node_type_loss
+                if node_type_tokens is not None:
+                    metrics["trainer_node_type_tokens"] = node_type_tokens
                 filtered_metrics = {k: v for k, v in metrics.items() if v is not None}
                 if filtered_metrics:
                     mlflow_run.log_metrics(filtered_metrics, step=step)
@@ -1257,6 +1283,9 @@ if __name__ == "__main__":
                     log_line += f" | active_modules={active_label}"
                 if attr_mismatch is not None:
                     log_line += f" | attr_type_mismatch_skips={attr_mismatch}"
+                if node_type_loss is not None:
+                    token_suffix = f" (tokens={node_type_tokens})" if node_type_tokens else ""
+                    log_line += f" | node_type_ce={node_type_loss:.4f}{token_suffix}"
                 mlflow_run.append_log_line(log_line)
                 mlflow_run.flush_log()
                 trainer_metrics_history.append(
@@ -1268,6 +1297,8 @@ if __name__ == "__main__":
                         "loss_terms": loss_terms,
                         "per_metric_losses": per_metric_losses,
                         "attr_type_mismatch_skips": attr_mismatch,
+                        "node_type_loss": node_type_loss,
+                        "node_type_tokens": node_type_tokens,
                     }
                 )
 

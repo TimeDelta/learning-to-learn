@@ -3223,6 +3223,9 @@ class OnlineTrainer:
             total_loss_terms = torch.zeros(num_loss_terms)
             per_metric_error_sum = None
             per_metric_weight_sum = None
+            attr_type_mismatch_total = 0.0
+            node_type_loss_total = 0.0
+            node_type_tokens_total = 0.0
             self.model.train()
             active_modules = self._modules_for_epoch()
             active_label = "+".join(active_modules)
@@ -3284,6 +3287,14 @@ class OnlineTrainer:
                     teacher_node_types=teacher_node_types,
                     teacher_force_weight=1.0,
                 )
+
+                if decoder_aux is not None:
+                    mismatch = float(decoder_aux.get("attr_type_mismatch_skips", 0) or 0)
+                    attr_type_mismatch_total += mismatch
+                    node_type_tokens = float(decoder_aux.get("node_type_tokens", 0) or 0)
+                    if node_type_tokens > 0:
+                        node_type_tokens_total += node_type_tokens
+                        node_type_loss_total += float(decoder_aux.get("node_type_loss", 0.0))
 
                 # --- 3) ARD-KL losses ---
                 def calc_kl_div_per_dim(log_alpha, logvar, mu):
@@ -3385,6 +3396,12 @@ class OnlineTrainer:
             if self.progress_callback is not None:
                 loss_metrics = {name: float(value) for name, value in zip(loss_term_labels, avg_loss_terms.tolist())}
                 loss_metrics["kl_beta"] = float(current_kl_weight)
+                attr_skip_value = int(attr_type_mismatch_total) if attr_type_mismatch_total > 0 else None
+                node_type_loss_value = None
+                node_type_tokens_value = None
+                if node_type_tokens_total > 0:
+                    node_type_loss_value = node_type_loss_total / node_type_tokens_total
+                    node_type_tokens_value = int(node_type_tokens_total)
                 self.progress_callback(
                     generation=generation,
                     epoch=epoch,
@@ -3396,6 +3413,9 @@ class OnlineTrainer:
                     active_modules=tuple(active_modules),
                     active_modules_label=active_label,
                     available_modules=self._module_order,
+                    attr_type_mismatch_skips=attr_skip_value,
+                    node_type_loss=node_type_loss_value,
+                    node_type_tokens=node_type_tokens_value,
                 )
 
             if verbose:
@@ -3403,6 +3423,11 @@ class OnlineTrainer:
                     f"{name}={value:.4g}" for name, value in zip(loss_term_labels, avg_loss_terms.tolist())
                 )
                 label_str = f"{label_str}, kl_beta={current_kl_weight:.4g}, active={active_label}"
+                if attr_skip_value is not None:
+                    label_str += f", attr_type_mismatch_skips={attr_skip_value}"
+                if node_type_loss_value is not None:
+                    token_suffix = f" (tokens={node_type_tokens_value})" if node_type_tokens_value else ""
+                    label_str += f", node_type_ce={node_type_loss_value:.4g}{token_suffix}"
                 if not epochs:
                     logger.info(
                         "Epoch %d, Loss terms per batch: [%s] (total=%.4f)",
@@ -3521,6 +3546,9 @@ class OnlineTrainer:
             epoch_adj = 0.0
             epoch_feat = 0.0
             batches = 0
+            attr_type_mismatch_total = 0.0
+            node_type_loss_total = 0.0
+            node_type_tokens_total = 0.0
             for batch in loader:
                 batch = batch.to(self.device)
                 self.optimizer.zero_grad()
@@ -3561,6 +3589,13 @@ class OnlineTrainer:
                     teacher_node_types=teacher_node_types,
                     teacher_force_weight=teacher_force_weight,
                 )
+                if decoder_aux is not None:
+                    mismatch = float(decoder_aux.get("attr_type_mismatch_skips", 0) or 0)
+                    attr_type_mismatch_total += mismatch
+                    node_type_tokens = float(decoder_aux.get("node_type_tokens", 0) or 0)
+                    if node_type_tokens > 0:
+                        node_type_tokens_total += node_type_tokens
+                        node_type_loss_total += float(decoder_aux.get("node_type_loss", 0.0))
                 loss = loss_adj + loss_feat
                 loss.backward()
                 self._clip_gradients()
@@ -3580,6 +3615,12 @@ class OnlineTrainer:
                     avg_feat,
                 )
             if self.progress_callback is not None:
+                attr_skip_value = int(attr_type_mismatch_total) if attr_type_mismatch_total > 0 else None
+                node_type_loss_value = None
+                node_type_tokens_value = None
+                if node_type_tokens_total > 0:
+                    node_type_loss_value = node_type_loss_total / node_type_tokens_total
+                    node_type_tokens_value = int(node_type_tokens_total)
                 self.progress_callback(
                     generation=generation,
                     epoch=epoch,
@@ -3588,6 +3629,9 @@ class OnlineTrainer:
                     loss_terms={"decoder_adj": avg_adj, "decoder_attr": avg_feat},
                     per_metric_losses={},
                     kl_beta=0.0,
+                    attr_type_mismatch_skips=attr_skip_value,
+                    node_type_loss=node_type_loss_value,
+                    node_type_tokens=node_type_tokens_value,
                 )
             loader = None
 
