@@ -606,6 +606,39 @@ def test_graph_decoder_reserves_slot_for_outputs_when_inputs_disabled():
     assert outputs[0]["pin_slot_index"] == 0
 
 
+def test_graph_decoder_attaches_fallback_edge_when_output_unreferenced():
+    vocab = SharedAttributeVocab([], embedding_dim=4)
+    decoder = GraphDecoder(
+        num_node_types=3,
+        latent_dim=8,
+        shared_attr_vocab=vocab,
+        hidden_dim=4,
+        min_pin_nodes=2,
+        required_input_count=1,
+        required_output_slots=[0],
+    )
+    decoder.train()
+
+    with torch.no_grad():
+        decoder.stop_head.weight.zero_()
+        decoder.stop_head.bias.fill_(20.0)
+        decoder.edge_head.weight.zero_()
+        decoder.edge_head.bias.fill_(-20.0)
+
+    teacher_nodes = decoder._resolved_required_input_slots() + len(decoder.required_output_slots)
+    eos = decoder.attr_eos_index
+    teacher_attr_targets = [[[eos] for _ in range(teacher_nodes)]]
+
+    graphs, _ = decoder(torch.zeros(1, decoder.latent_dim), teacher_attr_targets=teacher_attr_targets)
+    graph = graphs[0]
+    edge_index = graph["edge_index"]
+    assert edge_index.numel() > 0
+    outputs = [idx for idx, attr in enumerate(graph["node_attributes"]) if attr.get("pin_role") == "output"]
+    referenced = set(edge_index[1].tolist())
+    for node_idx in outputs:
+        assert node_idx in referenced
+
+
 def test_graph_decoder_teacher_forcing_extends_minimum_nodes():
     vocab = SharedAttributeVocab([], embedding_dim=4)
     decoder = GraphDecoder(

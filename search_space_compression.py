@@ -1412,6 +1412,34 @@ class GraphDecoder(nn.Module):
                         required_input_slots + len(self.required_output_slots),
                         1,
                     )
+
+                    def ensure_output_reachable(node_idx: int, forced_role: str | None, node_edge_budget: int) -> int:
+                        nonlocal edges, hit_max_edges_cap
+                        if forced_role != PIN_ROLE_OUTPUT or node_edge_budget > 0:
+                            return node_edge_budget
+                        if node_edge_budget >= self.max_edges_per_node:
+                            return node_edge_budget
+                        if len(edges) >= max_edges_per_graph:
+                            hit_max_edges_cap = True
+                            return node_edge_budget
+                        fallback_src: int | None = None
+                        # Prefer the most recently emitted non-output node.
+                        previous_limit = min(len(forced_pin_roles), node_idx)
+                        for prev_idx in range(previous_limit - 1, -1, -1):
+                            if forced_pin_roles[prev_idx] != PIN_ROLE_OUTPUT:
+                                fallback_src = prev_idx
+                                break
+                        if fallback_src is None and required_input_slots > 0:
+                            candidate = required_input_slots - 1
+                            if candidate >= 0 and candidate != node_idx:
+                                fallback_src = candidate
+                        if fallback_src is None and node_idx > 0:
+                            fallback_src = node_idx - 1
+                        if fallback_src is None or fallback_src == node_idx:
+                            return node_edge_budget
+                        edges.append([fallback_src, node_idx])
+                        return node_edge_budget + 1
+
                     stop_target_node_count = target_node_count
                     if teacher_force_nodes and stop_target_node_count is not None:
                         if stop_target_node_count < minimum_required_nodes:
@@ -1531,6 +1559,8 @@ class GraphDecoder(nn.Module):
                                     total_edge_budget += 1
                                 edge_in = p_edge.unsqueeze(0)
 
+                            node_edge_budget = ensure_output_reachable(node_index, forced_role, node_edge_budget)
+
                             t = node_index + 1
                             if DEBUG_DECODER and t % 50 == 0:
                                 elapsed = time.perf_counter() - node_loop_timer
@@ -1603,6 +1633,8 @@ class GraphDecoder(nn.Module):
                         node_edge_budget += 1
                         total_edge_budget += 1
                     edge_in = p_edge.unsqueeze(0)
+
+                node_edge_budget = ensure_output_reachable(node_index, forced_role, node_edge_budget)
 
             if len(node_embeddings) < minimum_required_nodes:
                 logger.warning(
@@ -2345,6 +2377,7 @@ class OnlineTrainer:
         self._graph_signatures: Set[str] = set()
         self.loss_history = []
         self.initial_loss = None
+        self._baseline_loss_buffer: list[float] = []
         self.last_prune_epoch = 0
         self.kl_scheduler: Optional[StagedBetaSchedule] = None
         self._kl_global_epoch = 0
@@ -2731,6 +2764,14 @@ class OnlineTrainer:
             return float(static_weight)
         return float(self.kl_scheduler.value(self._kl_global_epoch))
 
+    def _reset_initial_loss(self, seed_value: Optional[float] = None):
+        """Clear the adaptive pruning baseline and optionally seed it with the latest loss."""
+
+        self.initial_loss = None
+        self._baseline_loss_buffer.clear()
+        if seed_value is not None:
+            self._baseline_loss_buffer.append(float(seed_value))
+
     def add_data(self, graphs, fitnesses, invalid_flags=None, *, mark_seed: bool = False):
         if invalid_flags is None:
             invalid_flags = [False] * len(graphs)
@@ -2910,16 +2951,21 @@ class OnlineTrainer:
         baseline_window = max(1, int(baseline_window))
         recent_loss_window = deque(maxlen=baseline_window)
 
-        train_samples = self._build_training_samples(generation=generation)
-        if not train_samples:
+        def build_epoch_loader() -> tuple[DataLoader, int] | tuple[None, int]:
+            samples = self._build_training_samples(generation=generation)
+            if not samples:
+                return None, 0
+            loader = DataLoader(samples, batch_size=batch_size, shuffle=True)
+            return loader, len(samples)
+
+        epoch_loader, dataset_size = build_epoch_loader()
+        if epoch_loader is None:
             return
-        loader = DataLoader(train_samples, batch_size=batch_size, shuffle=True)
-        dataset_size = len(train_samples)
-        total_batches = len(loader)
+        total_batches = len(epoch_loader)
         train_start = time.perf_counter()
         if DEBUG_TRAINER:
             logger.info(
-                "OnlineTrainer.train start | samples=%d batch_size=%d epochs=%s",
+                "OnlineTrainer.train start | samples=%d batch_size=%d epochs=%s (resample_per_epoch=True)",
                 dataset_size,
                 batch_size,
                 epochs,
@@ -2937,12 +2983,26 @@ class OnlineTrainer:
         avg_loss_terms = torch.zeros(num_loss_terms)
         last_loss_term_change = float("inf")
 
+        baseline_required = baseline_window
+
         def stop():
             if epochs is not None:
                 return epoch > epochs
             return epoch > 1 and last_loss_term_change < stop_epsilon
 
+        pending_loader = epoch_loader
+        pending_dataset_size = dataset_size
+
         while not stop():
+            if pending_loader is None:
+                pending_loader, pending_dataset_size = build_epoch_loader()
+                if pending_loader is None:
+                    break
+            loader = pending_loader
+            dataset_size = pending_dataset_size
+            pending_loader = None
+            pending_dataset_size = 0
+            total_batches = len(loader)
             epoch_timer = time.perf_counter() if DEBUG_TRAINER else None
             prev_loss_terms = avg_loss_terms.clone()
             total_loss_terms = torch.zeros(num_loss_terms)
@@ -3076,6 +3136,15 @@ class OnlineTrainer:
             recent_loss_window.append(total_loss)
             smoothed_loss = sum(recent_loss_window) / len(recent_loss_window)
 
+            if self.initial_loss is None:
+                if epoch < warmup_epochs:
+                    self._baseline_loss_buffer.clear()
+                else:
+                    self._baseline_loss_buffer.append(smoothed_loss)
+                    if len(self._baseline_loss_buffer) >= baseline_required:
+                        self.initial_loss = sum(self._baseline_loss_buffer) / len(self._baseline_loss_buffer)
+                        self._baseline_loss_buffer.clear()
+
             wl_idx = loss_term_labels.index("wl_structural")
             wl_value = float(avg_loss_terms[wl_idx].item())
             non_wl_total = float((avg_loss_terms.sum() - avg_loss_terms[wl_idx]).item())
@@ -3141,9 +3210,6 @@ class OnlineTrainer:
 
             # Track convergence of reconstruction terms for adaptive pruning.
             last_loss_term_change = (avg_loss_terms - prev_loss_terms).abs().max().item()
-            if self.initial_loss is None and epoch >= warmup_epochs:
-                self.initial_loss = smoothed_loss
-
             if (
                 self.initial_loss is not None
                 and total_loss <= loss_threshold * self.initial_loss
@@ -3179,7 +3245,7 @@ class OnlineTrainer:
                         except Exception:  # pragma: no cover - defensive logging
                             logger.exception("Latent prune callback failed")
                     self.last_prune_epoch = epoch
-                    self.initial_loss = smoothed_loss  # reset baseline with smoothed value
+                    self._reset_initial_loss(seed_value=smoothed_loss)
 
             self._kl_global_epoch += 1
             epoch += 1
@@ -3204,15 +3270,22 @@ class OnlineTrainer:
         if epochs == 0:
             return
         batch_size = max(1, int(batch_size))
-        refresh_samples = self._build_training_samples(generation=generation)
-        if extra_graphs:
-            for graph_dict in extra_graphs:
-                data = self._graph_dict_to_data(graph_dict)
-                if data is not None:
-                    refresh_samples.append(data)
-        if not refresh_samples:
+
+        def build_refresh_loader() -> tuple[DataLoader, int] | tuple[None, int]:
+            refresh_samples = self._build_training_samples(generation=generation)
+            if extra_graphs:
+                for graph_dict in extra_graphs:
+                    data = self._graph_dict_to_data(graph_dict)
+                    if data is not None:
+                        refresh_samples.append(data)
+            if not refresh_samples:
+                return None, 0
+            loader = DataLoader(refresh_samples, batch_size=batch_size, shuffle=True)
+            return loader, len(refresh_samples)
+
+        loader, dataset_size = build_refresh_loader()
+        if loader is None:
             return
-        loader = DataLoader(refresh_samples, batch_size=batch_size, shuffle=True)
         self._apply_module_freeze(self._module_order, reason="teacher_force")
         if verbose:
             logger.info(
@@ -3222,6 +3295,10 @@ class OnlineTrainer:
                 teacher_force_weight,
             )
         for epoch in range(1, epochs + 1):
+            if loader is None:
+                loader, dataset_size = build_refresh_loader()
+                if loader is None:
+                    break
             self.model.train()
             epoch_adj = 0.0
             epoch_feat = 0.0
@@ -3291,6 +3368,7 @@ class OnlineTrainer:
                     per_metric_losses={},
                     kl_beta=0.0,
                 )
+            loader = None
 
     def resize_bottleneck(self):
         """Rebuild all modules to permanently prune inactive dims."""

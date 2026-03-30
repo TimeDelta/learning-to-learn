@@ -2011,6 +2011,54 @@ class GuidedPopulation(Population):
             entry["pin_slot_index"] = slot
             entry.setdefault("node_type", PIN_ROLE_OUTPUT)
         graph_dict["node_attributes"] = node_attrs
+        self._ensure_output_references(graph_dict, required_inputs, required_outputs)
+
+    def _ensure_output_references(
+        self, graph_dict: dict | None, required_inputs: int, required_outputs: Sequence[int]
+    ) -> None:
+        if not graph_dict or not required_outputs:
+            return
+        node_attrs = graph_dict.get("node_attributes") or []
+        node_count = len(node_attrs)
+        if node_count <= 0:
+            return
+        edges = self._edge_list_from_index(graph_dict.get("edge_index"), node_count)
+        referenced = {dst for _, dst in edges}
+        added = False
+
+        def fallback_source(node_idx: int) -> int | None:
+            for prev_idx in range(node_idx - 1, -1, -1):
+                attrs = node_attrs[prev_idx] if prev_idx < len(node_attrs) else {}
+                if (attrs or {}).get("pin_role") != PIN_ROLE_OUTPUT:
+                    return prev_idx
+            candidate = required_inputs - 1
+            if 0 <= candidate < node_count and candidate != node_idx:
+                return candidate
+            if node_idx > 0:
+                return node_idx - 1
+            if node_count > 1:
+                other = 1 if node_idx == 0 else 0
+                return other
+            return None
+
+        for offset, _slot in enumerate(required_outputs):
+            node_idx = required_inputs + offset
+            if node_idx >= node_count:
+                break
+            if node_idx in referenced:
+                continue
+            src = fallback_source(node_idx)
+            if src is None or src == node_idx:
+                continue
+            edges.append((src, node_idx))
+            referenced.add(node_idx)
+            added = True
+        if added:
+            if edges:
+                tensor = torch.as_tensor(edges, dtype=torch.long).t().contiguous()
+            else:
+                tensor = torch.empty((2, 0), dtype=torch.long)
+            graph_dict["edge_index"] = tensor
 
     def _prepare_decoded_graph_dict(self, graph_dict: dict | None) -> Tuple[int, List[Tuple[int, int]]]:
         if not graph_dict:

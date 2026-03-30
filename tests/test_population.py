@@ -123,6 +123,24 @@ def test_novelty_metric_excluded_from_trainer_metrics():
     assert pop.guide.fitness_predictor.output_dim == len(pop.trainer_metric_keys)
 
 
+def test_population_replay_helper_adds_edges_for_missing_outputs(monkeypatch):
+    config = make_neat_config()
+    pop = GuidedPopulation(config)
+
+    def fake_requirements():
+        return 1, [0], 2
+
+    monkeypatch.setattr(pop, "_decoder_pin_requirements", fake_requirements)
+    graph_dict = {"node_attributes": [{}, {}], "edge_index": torch.empty((2, 0), dtype=torch.long)}
+
+    pop._ensure_replay_pin_metadata(graph_dict)
+
+    edge_index = graph_dict["edge_index"]
+    assert edge_index.numel() > 0
+    referenced = set(edge_index[1].tolist())
+    assert 1 in referenced
+
+
 class _DummyFitnessHead(torch.nn.Module):
     def __init__(self):
         super().__init__()
