@@ -3181,7 +3181,6 @@ class OnlineTrainer:
                     self.last_prune_epoch = epoch
                     self.initial_loss = smoothed_loss  # reset baseline with smoothed value
 
-            self._train_epochs_completed += 1
             self._kl_global_epoch += 1
             epoch += 1
         if DEBUG_TRAINER:
