@@ -199,6 +199,8 @@ def test_decoder_skips_attr_loss_on_type_mismatch():
             teacher_node_types=match_types,
         )
         assert "loss" in aux_match
+        assert "node_type_loss" in aux_match
+        assert aux_match.get("node_type_tokens") == 1
         _, aux_mismatch = decoder(
             latent,
             teacher_attr_targets=teacher_attr_targets,
@@ -207,6 +209,9 @@ def test_decoder_skips_attr_loss_on_type_mismatch():
         )
         assert "loss" not in aux_mismatch
         assert aux_mismatch.get("attr_type_mismatch_skips") == 1
+        assert "node_type_loss" in aux_mismatch
+        assert aux_mismatch.get("node_type_tokens") == 1
+        assert aux_mismatch["node_type_loss"].item() > aux_match["node_type_loss"].item()
 
 
 def test_graph_decoder_materializes_scalar_attribute_values():
@@ -470,6 +475,37 @@ def test_reconstruction_loss_only_skips_mismatched_nodes():
     )
 
     assert loss_feat.item() == pytest.approx(1.0)
+
+
+def test_reconstruction_loss_includes_node_type_term():
+    model = MinimalGuide()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    trainer = OnlineTrainer(model, optimizer, metric_keys=[AreaUnderTaskMetrics])
+    graph = _make_graph(1, [])
+    batch = Batch.from_data_list([graph])
+    decoded_graphs = [
+        {
+            "edge_index": torch.empty((2, 0), dtype=torch.long),
+            "node_attributes": [{"foo": torch.tensor([0.0])}],
+            "node_types": torch.tensor([0], dtype=torch.long),
+        }
+    ]
+    target_graph_attrs = [[{"foo": torch.tensor([0.0])}]]
+    decoder_aux = {
+        "node_type_loss": torch.tensor(2.0),
+        "node_type_tokens": 4,
+    }
+    teacher_node_types = [torch.tensor([0], dtype=torch.long)]
+
+    _loss_adj, loss_feat = trainer._compute_reconstruction_losses(
+        batch=batch,
+        decoded_graphs=decoded_graphs,
+        decoder_aux=decoder_aux,
+        target_graph_attrs=target_graph_attrs,
+        teacher_node_types=teacher_node_types,
+    )
+
+    assert loss_feat.item() == pytest.approx(0.5)
 
 
 def test_graph_decoder_respects_node_budget(monkeypatch):

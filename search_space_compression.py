@@ -1476,6 +1476,8 @@ class GraphDecoder(nn.Module):
             attr_dim_teacher_tokens = 0
             node_teacher_loss = latent.new_tensor(0.0)
             node_teacher_tokens = 0
+            node_type_teacher_loss = latent.new_tensor(0.0)
+            node_type_teacher_tokens = 0
             edge_teacher_loss = latent.new_tensor(0.0)
             edge_teacher_tokens = 0
             attr_type_mismatch_skips = 0
@@ -1649,8 +1651,19 @@ class GraphDecoder(nn.Module):
                                     decode_stats["node_loop_exit"] = decode_stats["node_loop_exit"] or "max_nodes_post"
                                 break
                             new_node = self.node_head(hidden_node).squeeze(0)
+                            node_index = t
                             node_embeddings.append(new_node)
-                            node_types.append(self.type_head(new_node).argmax(dim=-1).cpu().tolist())
+                            node_type_logits = self.type_head(new_node).view(1, -1)
+                            node_type_pred = int(node_type_logits.argmax(dim=-1).item())
+                            node_types.append(node_type_pred)
+                            if graph_node_type_targets is not None:
+                                teacher_type_idx = self._node_type_index_for(graph_node_type_targets, node_index)
+                                if teacher_type_idx is not None and 0 <= teacher_type_idx < node_type_logits.size(-1):
+                                    target_tensor = torch.tensor([teacher_type_idx], dtype=torch.long, device=device)
+                                    node_type_teacher_loss = node_type_teacher_loss + F.cross_entropy(
+                                        node_type_logits, target_tensor
+                                    )
+                                    node_type_teacher_tokens += 1
 
                             node_index = t
                             forced_role = None
@@ -1736,7 +1749,8 @@ class GraphDecoder(nn.Module):
                     decode_stats["node_stop_samples"].append(float(continue_prob.item()))
                 new_node = self.node_head(hidden_node).squeeze(0)
                 node_embeddings.append(new_node)
-                node_types.append(self.type_head(new_node).argmax(dim=-1).cpu().tolist())
+                node_type_pred = int(self.type_head(new_node).argmax(dim=-1).item())
+                node_types.append(node_type_pred)
                 node_index = len(node_embeddings) - 1
                 forced_role = None
                 forced_slot = None
@@ -2171,6 +2185,9 @@ class GraphDecoder(nn.Module):
             if node_teacher_tokens:
                 decoder_aux["node_loss"] = node_teacher_loss
                 decoder_aux["node_tokens"] = node_teacher_tokens
+            if node_type_teacher_tokens:
+                decoder_aux["node_type_loss"] = node_type_teacher_loss
+                decoder_aux["node_type_tokens"] = node_type_teacher_tokens
             if edge_teacher_tokens:
                 decoder_aux["edge_loss"] = edge_teacher_loss
                 decoder_aux["edge_tokens"] = edge_teacher_tokens
@@ -2871,6 +2888,10 @@ class OnlineTrainer:
             if edge_tokens > 0:
                 edge_loss = decoder_aux["edge_loss"] / edge_tokens
                 extra_adj_loss = extra_adj_loss + edge_loss.to(self.device)
+            node_type_tokens = float(decoder_aux.get("node_type_tokens", 0) or 0)
+            if node_type_tokens > 0:
+                type_loss = decoder_aux["node_type_loss"] / node_type_tokens
+                extra_attr_loss = extra_attr_loss + float(teacher_force_weight) * type_loss.to(self.device)
 
         denom = max(1, int(batch.num_graphs))
         if empty_penalty > 0 and empty_hits:
