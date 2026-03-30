@@ -765,18 +765,24 @@ class GuidedPopulation(Population):
         self.validator_check_steps = max(1, int(getattr(config, "validator_check_steps", 2)))
         self._validator_confusion: Counter = Counter()
         self.structure_penalty_enabled = bool(getattr(config, "structure_penalty_enabled", True))
-        self.decoder_relax_weight = max(0.0, float(getattr(config, "guided_decoder_relax_weight", 0.1)))
+        self.decoder_relax_weight = max(0.0, float(getattr(config, "guided_decoder_relax_weight", 0.3)))
         self.decoder_relax_steps = max(1, int(getattr(config, "guided_decoder_relax_steps", 24)))
         self.decoder_relax_edge_depth = max(1, int(getattr(config, "guided_decoder_relax_edge_depth", 12)))
         self.decoder_relax_min_continue = min(
             0.999,
             max(0.0, float(getattr(config, "guided_decoder_relax_min_continue", 0.65))),
         )
-        default_edge_target = float(len(getattr(self.guide.decoder, "required_output_slots", []) or [0]) or 1)
-        self.decoder_relax_edge_target = max(
-            0.0, float(getattr(config, "guided_decoder_relax_edge_target", max(1.0, default_edge_target)))
-        )
-        self.decoder_relax_edge_weight = max(0.0, float(getattr(config, "guided_decoder_relax_edge_weight", 1.0)))
+        decoder_edge_floor = float(getattr(config, "guided_decoder_relax_edge_target", None) or 0)
+        if decoder_edge_floor <= 0:
+            decoder_pin_budget = getattr(self.guide.decoder, "_base_required_node_count", 0) or 0
+            decoder_edge_floor = max(
+                1.0,
+                float(decoder_pin_budget),
+                float(self._minimum_required_node_count()),
+            )
+        self.decoder_relax_edge_target = max(0.0, float(decoder_edge_floor))
+        default_edge_weight = float(getattr(config, "guided_decoder_relax_edge_weight", 2.0))
+        self.decoder_relax_edge_weight = max(0.0, default_edge_weight)
         self._decoder_relax_stats: dict | None = None
         self.trainer_batch_size = self._sanitize_positive_int(getattr(config, "trainer_batch_size", None))
         raw_max_batch = self._sanitize_positive_int(getattr(config, "trainer_max_batch_size", None))
@@ -2152,9 +2158,11 @@ class GuidedPopulation(Population):
         convert those DAGs into new NEAT genomes.
         """
         empty_feedback = self._guided_empty_ratio()
-        latent_steps = max(5, int(latent_steps * (1.0 - 0.5 * empty_feedback)))
-        latent_lr = float(latent_lr) * (0.5 + 0.5 * (1.0 - empty_feedback))
-        latent_tether_init = float(latent_tether_init) * (1.0 + empty_feedback)
+        step_scale = 1.0 + 0.5 * empty_feedback
+        lr_scale = 1.0 + 0.5 * empty_feedback
+        latent_steps = max(5, int(latent_steps * step_scale))
+        latent_lr = float(latent_lr) * lr_scale
+        latent_tether_init = float(latent_tether_init) * (1.0 + 0.25 * empty_feedback)
 
         metric_keys = self.metric_keys
         metric_best_values = self.metric_best_values
