@@ -131,9 +131,11 @@ def _weisfeiler_lehman_histograms(
     edge_index: torch.Tensor,
     batch: torch.Tensor,
     num_graphs: int,
+    *,
+    node_attributes: Optional[Sequence[Any]] = None,
     iterations: int = 2,
 ) -> Optional[torch.Tensor]:
-    """Compute WL subtree histogram per graph (NASGEM-style topology regularizer [58])."""
+    """Compute WL subtree histogram per graph, mixing node types and attributes."""
 
     if num_graphs <= 1 or node_types.numel() == 0:
         return None
@@ -142,11 +144,36 @@ def _weisfeiler_lehman_histograms(
     edge_index_cpu = edge_index.detach().cpu()
     batch_cpu = batch.detach().cpu().view(-1)
     num_nodes = node_types_cpu.numel()
+    attr_sequence: List[Any] = []
+    if node_attributes is None:
+        attr_sequence = []
+    elif isinstance(node_attributes, (list, tuple)):
+        attr_sequence = list(node_attributes)
+    elif torch.is_tensor(node_attributes):
+        attr_sequence = node_attributes.detach().cpu().view(-1).tolist()
+    else:
+        try:
+            attr_sequence = list(node_attributes)
+        except TypeError:
+            attr_sequence = []
     adjacency: List[List[int]] = [[] for _ in range(num_nodes)]
     for src, dst in edge_index_cpu.t().tolist():
         adjacency[src].append(dst)
 
-    colors = [f"t{int(label)}" for label in node_types_cpu.tolist()]
+    attr_tokens: List[str] = []
+    for idx in range(num_nodes):
+        if idx < len(attr_sequence):
+            attr_tokens.append(_wl_attribute_fingerprint(attr_sequence[idx]))
+        else:
+            attr_tokens.append("")
+    colors: List[str] = []
+    for idx, label in enumerate(node_types_cpu.tolist()):
+        base = f"t{int(label)}"
+        attr_sig = attr_tokens[idx]
+        if attr_sig:
+            attr_hash = hashlib.sha256(attr_sig.encode("utf-8")).hexdigest()[:16]
+            base = f"{base}|a{attr_hash}"
+        colors.append(base)
     for _ in range(max(1, iterations)):
         new_colors = []
         for idx in range(num_nodes):
@@ -555,6 +582,75 @@ def _sorted_attribute_items(attr_dict: dict | None) -> List[tuple[str, Any]]:
         items.append((name, value))
     items.sort(key=lambda item: item[0])
     return items
+
+
+def _wl_attribute_value_token(value: Any, depth: int = 0) -> str:
+    """Convert heterogeneous attribute values into compact, comparable tokens."""
+
+    max_depth = 2
+    seq_preview = 8
+    str_preview = 32
+    if depth > max_depth:
+        return "..."
+    if value is None:
+        return "none"
+    if isinstance(value, bool) or isinstance(value, np.bool_):
+        return "true" if bool(value) else "false"
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return f"{float(value):.4g}"
+    if torch.is_tensor(value):
+        if value.numel() == 0:
+            return "[]"
+        flat = value.detach().cpu().view(-1).tolist()
+        return _wl_attribute_value_token(flat, depth)
+    if isinstance(value, np.ndarray):
+        if value.size == 0:
+            return "[]"
+        return _wl_attribute_value_token(value.reshape(-1).tolist(), depth)
+    if isinstance(value, (list, tuple)):
+        tokens = [_wl_attribute_value_token(v, depth + 1) for v in list(value)[:seq_preview]]
+        if len(value) > seq_preview:
+            tokens.append(f"+{len(value) - seq_preview}")
+        return "[" + ",".join(tokens) + "]"
+    if isinstance(value, dict):
+        parts = []
+        for key in sorted(value.keys(), key=str):
+            parts.append(f"{key}:{_wl_attribute_value_token(value[key], depth + 1)}")
+        return "{" + ",".join(parts) + "}"
+    if isinstance(value, str):
+        trimmed = value.strip()
+        if len(trimmed) > str_preview:
+            trimmed = trimmed[:str_preview]
+        return trimmed
+    return str(value)
+
+
+def _wl_attribute_fingerprint(attrs: Any) -> str:
+    """Stable string fingerprint for a node's attribute dictionary."""
+
+    if attrs is None:
+        return ""
+    if isinstance(attrs, dict):
+        combined: List[tuple[str, Any]] = list(_sorted_attribute_items(attrs))
+        for meta_name in ("pin_role", "pin_slot_index"):
+            if meta_name in attrs:
+                combined.append((meta_name, attrs[meta_name]))
+        combined.sort(key=lambda item: attribute_key_to_name(item[0]))
+        parts: List[str] = []
+        seen: Set[str] = set()
+        for key, value in combined:
+            name = attribute_key_to_name(key)
+            if name in seen:
+                continue
+            seen.add(name)
+            if name.startswith("__"):
+                continue
+            parts.append(f"{name}={_wl_attribute_value_token(value)}")
+        return ";".join(parts)
+    if isinstance(attrs, (list, tuple)):
+        tokens = [_wl_attribute_value_token(value) for value in list(attrs)]
+        return "[" + ",".join(tokens) + "]"
+    return _wl_attribute_value_token(attrs)
 
 
 def build_teacher_attr_targets(
@@ -1304,6 +1400,9 @@ class GraphDecoder(nn.Module):
                     node_loop_iters = 0
                     hit_max_nodes_cap = False
                     hit_max_edges_cap = False
+                    max_edges_per_graph = max(0, int(self.max_edges_per_graph))
+                    if max_edges_per_graph == 0:
+                        hit_max_edges_cap = True
                     teacher_force_nodes = self.training and (target_node_count is not None)
                     forced_pin_roles: List[str | None] = []
                     forced_pin_slots: List[int | None] = []
@@ -1403,7 +1502,7 @@ class GraphDecoder(nn.Module):
                             for i in range(node_index):
                                 if node_edge_budget >= self.max_edges_per_node:
                                     break
-                                if total_edge_budget >= self.max_edges_per_graph:
+                                if total_edge_budget >= max_edges_per_graph:
                                     hit_max_edges_cap = True
                                     break
                                 hidden_edge = self.edge_rnn(edge_in, hidden_edge)
@@ -1486,7 +1585,7 @@ class GraphDecoder(nn.Module):
                 for i in range(node_index):
                     if node_edge_budget >= self.max_edges_per_node:
                         break
-                    if total_edge_budget >= self.max_edges_per_graph:
+                    if total_edge_budget >= max_edges_per_graph:
                         hit_max_edges_cap = True
                         break
                     hidden_edge = self.edge_rnn(edge_in, hidden_edge)
@@ -2567,6 +2666,7 @@ class OnlineTrainer:
             batch.edge_index,
             batch.batch,
             batch.num_graphs,
+            node_attributes=getattr(batch, "node_attributes", None),
             iterations=max(1, int(getattr(self, "wl_kernel_iterations", 2) or 1)),
         )
         if hist is None or hist.numel() == 0:

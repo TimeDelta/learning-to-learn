@@ -135,6 +135,41 @@ def test_shared_attribute_vocab_tracks_allowed_set_updates():
     assert vocab.ensure_index("alpha") == vocab.name_to_index["alpha"]
 
 
+def test_wl_histograms_reflect_attribute_differences():
+    node_types = torch.tensor([0, 0], dtype=torch.long)
+    edge_index = torch.empty((2, 0), dtype=torch.long)
+    batch_vec = torch.tensor([0, 1], dtype=torch.long)
+    attrs = [{"alpha": 1.0}, {"alpha": 2.0}]
+    hist = _weisfeiler_lehman_histograms(
+        node_types,
+        edge_index,
+        batch_vec,
+        num_graphs=2,
+        node_attributes=attrs,
+        iterations=1,
+    )
+    assert hist is not None
+    assert hist.size(0) == 2
+    assert not torch.allclose(hist[0], hist[1])
+
+
+def test_wl_histograms_match_when_attributes_match():
+    node_types = torch.tensor([1, 1], dtype=torch.long)
+    edge_index = torch.empty((2, 0), dtype=torch.long)
+    batch_vec = torch.tensor([0, 1], dtype=torch.long)
+    attrs = [{"beta": [0.5, 1.5]}, {"beta": torch.tensor([0.5, 1.5])}]
+    hist = _weisfeiler_lehman_histograms(
+        node_types,
+        edge_index,
+        batch_vec,
+        num_graphs=2,
+        node_attributes=attrs,
+        iterations=1,
+    )
+    assert hist is not None
+    assert torch.allclose(hist[0], hist[1])
+
+
 def test_decoder_skips_attr_loss_on_type_mismatch():
     vocab = SharedAttributeVocab([], embedding_dim=4)
     with _AttrRegistryGuard():
