@@ -1052,6 +1052,9 @@ class GraphDecoder(nn.Module):
         self._attr_name_vocab_size = self.shared_attr_vocab.embedding.num_embeddings
         self._attr_name_allowed_cache: Dict[int, Set[int]] = {}
         self._attr_name_invalid_cache: Dict[int, Tuple[int, ...]] = {}
+        self._value_literal_cache_version = -1
+        self._value_literal_indices: List[int] = []
+        self._value_literal_tokens: List[str] = []
 
         # — GraphDeconvNet stack (learned spectral decoders)
         self.gdns = nn.ModuleList([GraphDeconvNet(hidden_dim, hidden_dim) for _ in range(gdn_layers)])
@@ -1258,6 +1261,104 @@ class GraphDecoder(nn.Module):
         masked = logits.clone()
         masked.index_fill_(0, invalid_idx, mask_value)
         return masked
+
+    def _refresh_value_literal_cache(self) -> None:
+        vocab_size = self.shared_attr_vocab.embedding.num_embeddings
+        if self._value_literal_cache_version == vocab_size:
+            return
+        prefix = self.shared_attr_vocab.VALUE_LITERAL_PREFIX
+        indices: List[int] = []
+        tokens: List[str] = []
+        for name, idx in self.shared_attr_vocab.name_to_index.items():
+            if name.startswith(prefix):
+                indices.append(idx)
+                tokens.append(name)
+        self._value_literal_indices = indices
+        self._value_literal_tokens = tokens
+        self._value_literal_cache_version = vocab_size
+
+    def _materialize_string_literal(self, value_tensor: torch.Tensor) -> Optional[str]:
+        self._refresh_value_literal_cache()
+        if not self._value_literal_indices:
+            return None
+        embeddings = self.shared_attr_vocab.embedding.weight.detach().cpu()
+        literal_vectors = embeddings[self._value_literal_indices]
+        if literal_vectors.numel() == 0:
+            return None
+        dim = literal_vectors.size(1)
+        target = value_tensor.detach().cpu().view(-1)
+        if dim <= 0:
+            return None
+        if target.numel() < dim:
+            pad = torch.zeros(dim - target.numel())
+            target = torch.cat([target, pad])
+        elif target.numel() > dim:
+            target = target[:dim]
+        diffs = literal_vectors - target.unsqueeze(0)
+        distances = torch.sum(diffs * diffs, dim=1)
+        best = int(torch.argmin(distances).item())
+        token = self._value_literal_tokens[best]
+        prefix = self.shared_attr_vocab.VALUE_LITERAL_PREFIX
+        if token.startswith(prefix):
+            return token[len(prefix) :]
+        return token
+
+    def _flatten_attr_value_cells(self, value_cells: Any) -> torch.Tensor:
+        if value_cells is None:
+            return torch.zeros(0, dtype=torch.float32)
+        if torch.is_tensor(value_cells):
+            tensor = value_cells.detach()
+            if not torch.is_floating_point(tensor):
+                tensor = tensor.to(dtype=torch.float32)
+            else:
+                tensor = tensor.float()
+            return tensor.view(-1).cpu()
+        if isinstance(value_cells, np.ndarray):
+            if value_cells.size == 0:
+                return torch.zeros(0, dtype=torch.float32)
+            return torch.from_numpy(value_cells).view(-1).float()
+        if isinstance(value_cells, (bool, int, float)):
+            return torch.tensor([float(value_cells)], dtype=torch.float32)
+        if isinstance(value_cells, (list, tuple)):
+            flattened: List[torch.Tensor] = []
+            for cell in value_cells:
+                tensor = self._flatten_attr_value_cells(cell)
+                if tensor.numel() > 0:
+                    flattened.append(tensor)
+            if flattened:
+                return torch.cat(flattened)
+            return torch.zeros(0, dtype=torch.float32)
+        return torch.zeros(0, dtype=torch.float32)
+
+    def _materialize_attribute_value(self, value_cells: Any, value_kind: Optional[str]) -> Any:
+        flat = self._flatten_attr_value_cells(value_cells)
+        if flat.numel() == 0:
+            return None
+        kind = (value_kind or "").strip().lower()
+        if kind.startswith("list"):
+            inner_kind = None
+            if kind.startswith("list[") and kind.endswith("]"):
+                inner_kind = kind[5:-1].strip() or None
+            values: List[Any] = []
+            for scalar in flat.view(-1):
+                values.append(self._materialize_attribute_value(scalar.view(1), inner_kind))
+            return values
+        scalar = float(flat.view(-1)[0].item())
+        if kind == "bool":
+            return bool(scalar >= 0.5)
+        if kind == "int":
+            return int(round(scalar))
+        if kind in {"float", "scalar", "number"}:
+            return float(scalar)
+        if kind == "string":
+            literal = self._materialize_string_literal(flat)
+            if literal is not None:
+                return literal
+        if kind == "tensor":
+            return flat.clone()
+        if flat.numel() == 1:
+            return float(scalar)
+        return flat.clone()
 
     def _enforce_required_pin_metadata(self, node_attributes: List[Dict[str, Any]]):
         if not node_attributes:

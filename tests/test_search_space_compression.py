@@ -1,3 +1,4 @@
+import numpy as np
 import pytest
 import torch
 from torch_geometric.data import Batch, Data
@@ -215,6 +216,15 @@ def test_graph_decoder_materializes_scalar_attribute_values():
     assert decoder._materialize_attribute_value([torch.tensor([2.4])], "int") == 2
     list_vals = decoder._materialize_attribute_value([torch.tensor([1.2]), torch.tensor([3.8])], "list[int]")
     assert list_vals == [1, 4]
+    assert decoder._materialize_attribute_value(np.array([0.125], dtype=np.float32), "float") == pytest.approx(0.125)
+    literal_idx = vocab.ensure_value_literal("spam")
+    literal_vec = decoder.shared_attr_vocab.embedding.weight[literal_idx].detach().clone()
+    assert decoder._materialize_attribute_value([literal_vec], "string") == "spam"
+    tensor_vals = decoder._materialize_attribute_value(torch.tensor([1.0, 2.0]), "tensor")
+    assert torch.allclose(tensor_vals, torch.tensor([1.0, 2.0]))
+    fallback_tensor = decoder._materialize_attribute_value(torch.tensor([5.0, 6.0]), None)
+    assert torch.allclose(fallback_tensor, torch.tensor([5.0, 6.0]))
+    assert decoder._materialize_attribute_value([], "int") is None
 
 
 def test_graph_decoder_masks_noncanonical_names_per_type():
