@@ -61,3 +61,6 @@ teacher_force_epochs_max = 15
 teacher_force_weight = 2.0
 teacher_force_weight_max = 4.0
 teacher_force_verbose = True
+trainer_dataset_max_samples = 256        # 0 disables subsampling
+trainer_dataset_valid_ratio = 0.75       # only used when max_samples > 0
+trainer_seed_generations = 20            # number of early generations that must keep seed graphs

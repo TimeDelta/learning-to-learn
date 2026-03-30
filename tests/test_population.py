@@ -393,6 +393,56 @@ def test_online_trainer_deduplicates_graphs():
     assert len(trainer.invalid_dataset) == 1
 
 
+def _make_linear_graph(value: float) -> Data:
+    node_attrs = [{"alpha": torch.tensor([value])}]
+    edge_index = torch.zeros((2, 0), dtype=torch.long)
+    return Data(node_types=torch.tensor([0], dtype=torch.long), edge_index=edge_index, node_attributes=node_attrs)
+
+
+def test_online_trainer_sampling_respects_max_and_ratio():
+    model = DummyGuideModel()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    trainer = OnlineTrainer(model, optimizer, metric_keys=[AreaUnderTaskMetrics])
+    trainer.configure_dataset_sampling(max_samples=4, valid_ratio=0.5, seed_generations=0)
+
+    valid_graphs = [_make_linear_graph(float(idx)) for idx in range(6)]
+    trainer.add_data(valid_graphs, [{AreaUnderTaskMetrics: float(idx)} for idx in range(6)])
+
+    invalid_graphs = [_make_linear_graph(float(idx) + 100.0) for idx in range(6)]
+    trainer.add_data(
+        invalid_graphs,
+        [{AreaUnderTaskMetrics: float(idx)} for idx in range(6)],
+        invalid_flags=[True] * len(invalid_graphs),
+    )
+
+    sampled = trainer._build_training_samples(generation=5)
+    assert len(sampled) == 4
+    valid_count = sum(1 for sample in sampled if not getattr(sample, "_trainer_invalid", False))
+    invalid_count = sum(1 for sample in sampled if getattr(sample, "_trainer_invalid", False))
+    assert valid_count == 2
+    assert invalid_count == 2
+
+
+def test_online_trainer_seed_lock_keeps_seed_graphs_temporarily():
+    model = DummyGuideModel()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    trainer = OnlineTrainer(model, optimizer, metric_keys=[AreaUnderTaskMetrics])
+    trainer.configure_dataset_sampling(max_samples=1, valid_ratio=1.0, seed_generations=2)
+
+    seed_graphs = [_make_linear_graph(float(idx)) for idx in range(2)]
+    trainer.add_data(seed_graphs, [{AreaUnderTaskMetrics: 0.0} for _ in seed_graphs], mark_seed=True)
+
+    extra_graphs = [_make_linear_graph(float(idx) + 10.0) for idx in range(3)]
+    trainer.add_data(extra_graphs, [{AreaUnderTaskMetrics: 1.0} for _ in extra_graphs])
+
+    with_seed_lock = trainer._build_training_samples(generation=0)
+    seed_samples = [sample for sample in with_seed_lock if getattr(sample, "_trainer_seed", False)]
+    assert len(seed_samples) == len(seed_graphs)
+
+    without_seed_lock = trainer._build_training_samples(generation=2)
+    assert len(without_seed_lock) == 1
+
+
 def test_generate_guided_offspring_skips_exact_duplicates(monkeypatch):
     pop, config = configure_stub_population(
         [make_graph_factory(0.1), make_graph_factory(0.1), make_graph_factory(0.2)],

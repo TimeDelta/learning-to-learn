@@ -2249,6 +2249,9 @@ class OnlineTrainer:
         self.last_prune_epoch = 0
         self.kl_scheduler: Optional[StagedBetaSchedule] = None
         self._kl_global_epoch = 0
+        self.dataset_max_samples: int | None = None
+        self.dataset_valid_ratio: float | None = None
+        self.seed_lock_generations: int = 0
         if metric_keys is None:
             if task is None:
                 raise ValueError("OnlineTrainer requires either `task` or `metric_keys`.")
@@ -2628,7 +2631,7 @@ class OnlineTrainer:
             return float(static_weight)
         return float(self.kl_scheduler.value(self._kl_global_epoch))
 
-    def add_data(self, graphs, fitnesses, invalid_flags=None):
+    def add_data(self, graphs, fitnesses, invalid_flags=None, *, mark_seed: bool = False):
         if invalid_flags is None:
             invalid_flags = [False] * len(graphs)
         skipped = 0
@@ -2641,10 +2644,149 @@ class OnlineTrainer:
             data = graph.clone()
             fitness = [float(fitness_dict[metric]) for metric in self.sorted_metrics]
             data.y = torch.as_tensor(fitness, dtype=torch.float)
+            seed_flag = bool(mark_seed or getattr(graph, "_trainer_seed", False))
+            data._trainer_signature = signature
+            data._trainer_seed = seed_flag
+            data._trainer_invalid = bool(is_invalid)
             target_list = self.invalid_dataset if is_invalid else self.dataset
             target_list.append(data)
         if skipped and DEBUG_TRAINER:
             logger.info("OnlineTrainer.add_data skipped %d duplicate graphs", skipped)
+
+    def configure_dataset_sampling(
+        self,
+        *,
+        max_samples: int | None = None,
+        valid_ratio: float | None = None,
+        seed_generations: int = 0,
+    ) -> None:
+        """Configure how many samples the trainer keeps per epoch."""
+
+        if max_samples is not None:
+            try:
+                resolved = int(max_samples)
+            except (TypeError, ValueError):
+                resolved = None
+            else:
+                if resolved <= 0:
+                    resolved = None
+            max_samples = resolved
+        self.dataset_max_samples = max_samples
+        if valid_ratio is None:
+            self.dataset_valid_ratio = None
+        else:
+            try:
+                ratio_value = float(valid_ratio)
+            except (TypeError, ValueError):
+                ratio_value = None
+            if ratio_value is not None:
+                ratio_value = max(0.0, min(1.0, ratio_value))
+            self.dataset_valid_ratio = ratio_value
+        try:
+            seed_generations_value = int(seed_generations)
+        except (TypeError, ValueError):
+            seed_generations_value = 0
+        self.seed_lock_generations = max(0, seed_generations_value)
+
+    @staticmethod
+    def _partition_seed_samples(pool: List[Data]) -> tuple[list[Data], list[Data]]:
+        seeds: list[Data] = []
+        non_seeds: list[Data] = []
+        for item in pool:
+            if getattr(item, "_trainer_seed", False):
+                seeds.append(item)
+            else:
+                non_seeds.append(item)
+        return seeds, non_seeds
+
+    @staticmethod
+    def _random_subset(pool: List[Data], count: int) -> list[Data]:
+        if count <= 0 or not pool:
+            return []
+        if count >= len(pool):
+            return list(pool)
+        return random.sample(pool, count)
+
+    def _seed_lock_active(self, generation: int | None) -> bool:
+        return self.seed_lock_generations > 0 and generation is not None and generation < self.seed_lock_generations
+
+    def _build_training_samples(
+        self,
+        *,
+        include_invalid: bool = True,
+        generation: int | None = None,
+    ) -> list[Data]:
+        valid_pool = list(self.dataset)
+        invalid_pool = list(self.invalid_dataset) if include_invalid else []
+        total_available = len(valid_pool) + len(invalid_pool)
+        if total_available == 0:
+            return []
+
+        seed_lock = self._seed_lock_active(generation)
+        max_samples = self.dataset_max_samples
+        if (not seed_lock) and (max_samples is None or max_samples <= 0 or total_available <= max_samples):
+            combined = valid_pool + invalid_pool
+            random.shuffle(combined)
+            return combined
+
+        if max_samples is None or max_samples <= 0:
+            max_samples = total_available
+
+        if seed_lock:
+            seed_valid, remaining_valid = self._partition_seed_samples(valid_pool)
+            seed_invalid, remaining_invalid = self._partition_seed_samples(invalid_pool)
+        else:
+            seed_valid = []
+            seed_invalid = []
+            remaining_valid = valid_pool
+            remaining_invalid = invalid_pool
+
+        forced_total = len(seed_valid) + len(seed_invalid)
+        capacity = max(max_samples - forced_total, 0)
+
+        if capacity == 0 and forced_total == 0:
+            # No room requested but we also have no seeds, so keep earliest samples.
+            combined = valid_pool + invalid_pool
+            random.shuffle(combined)
+            return combined
+
+        pool_total = len(remaining_valid) + len(remaining_invalid)
+        if pool_total <= 0:
+            selected = seed_valid + seed_invalid
+            random.shuffle(selected)
+            return selected
+
+        if self.dataset_valid_ratio is None:
+            default_ratio = len(valid_pool) / max(1, len(valid_pool) + len(invalid_pool))
+        else:
+            default_ratio = self.dataset_valid_ratio
+        default_ratio = max(0.0, min(1.0, default_ratio))
+
+        valid_target = int(round(capacity * default_ratio))
+        valid_extra = min(len(remaining_valid), valid_target)
+        invalid_extra = min(len(remaining_invalid), capacity - valid_extra)
+        remainder = capacity - (valid_extra + invalid_extra)
+        if remainder > 0:
+            valid_room = len(remaining_valid) - valid_extra
+            take = min(valid_room, remainder)
+            valid_extra += take
+            remainder -= take
+        if remainder > 0:
+            invalid_room = len(remaining_invalid) - invalid_extra
+            take = min(invalid_room, remainder)
+            invalid_extra += take
+            remainder -= take
+
+        selected_valid = list(seed_valid)
+        selected_valid.extend(self._random_subset(remaining_valid, valid_extra))
+        selected_invalid = list(seed_invalid)
+        selected_invalid.extend(self._random_subset(remaining_invalid, invalid_extra))
+
+        combined = selected_valid + selected_invalid
+        if not combined:
+            combined = valid_pool + invalid_pool
+        random.shuffle(combined)
+        return combined
 
     def train(
         self,
@@ -2668,12 +2810,9 @@ class OnlineTrainer:
         baseline_window = max(1, int(baseline_window))
         recent_loss_window = deque(maxlen=baseline_window)
 
-        train_samples = list(self.dataset)
-        if self.invalid_dataset:
-            if train_samples:
-                train_samples.extend(self.invalid_dataset)
-            else:
-                train_samples = list(self.invalid_dataset)
+        train_samples = self._build_training_samples(generation=generation)
+        if not train_samples:
+            return
         loader = DataLoader(train_samples, batch_size=batch_size, shuffle=True)
         dataset_size = len(train_samples)
         total_batches = len(loader)
@@ -2942,6 +3081,7 @@ class OnlineTrainer:
                     self.last_prune_epoch = epoch
                     self.initial_loss = smoothed_loss  # reset baseline with smoothed value
 
+            self._train_epochs_completed += 1
             self._kl_global_epoch += 1
             epoch += 1
         if DEBUG_TRAINER:
@@ -2965,7 +3105,7 @@ class OnlineTrainer:
         if epochs == 0:
             return
         batch_size = max(1, int(batch_size))
-        refresh_samples = list(self.dataset)
+        refresh_samples = self._build_training_samples(generation=generation)
         if extra_graphs:
             for graph_dict in extra_graphs:
                 data = self._graph_dict_to_data(graph_dict)

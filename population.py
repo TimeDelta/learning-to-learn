@@ -584,6 +584,26 @@ class GuidedPopulation(Population):
             decoder_stop_loss_weight=self.decoder_stop_loss_weight,
             memory_tracker=memory_tracker,
         )
+        dataset_max_samples = self._sanitize_positive_int(getattr(config, "trainer_dataset_max_samples", None))
+        ratio_value = getattr(config, "trainer_dataset_valid_ratio", None)
+        if ratio_value is not None:
+            try:
+                ratio_value = float(ratio_value)
+            except (TypeError, ValueError):
+                ratio_value = None
+            else:
+                ratio_value = max(0.0, min(1.0, ratio_value))
+        raw_seed_lock_generations = getattr(config, "trainer_seed_generations", 0)
+        try:
+            seed_lock_generations = int(raw_seed_lock_generations)
+        except (TypeError, ValueError):
+            seed_lock_generations = 0
+        seed_lock_generations = max(0, seed_lock_generations)
+        self.trainer.configure_dataset_sampling(
+            max_samples=dataset_max_samples,
+            valid_ratio=ratio_value,
+            seed_generations=seed_lock_generations,
+        )
         slice_ratio = getattr(config, "kl_partial_slice_ratio", None)
         if slice_ratio is None and hasattr(config, "reproduction_config"):
             slice_ratio = getattr(config.reproduction_config, "kl_partial_slice_ratio", None)
@@ -1067,6 +1087,10 @@ class GuidedPopulation(Population):
             return 0.0
         return max(0.0, min(1.0, empties / requested))
 
+    def _should_mark_seed_graphs(self) -> bool:
+        current_generation = getattr(self, "generation", 0)
+        return current_generation == 0
+
     def _teacher_force_schedule(self) -> tuple[int, float]:
         if not self.teacher_force_enabled:
             return 0, 0.0
@@ -1264,6 +1288,7 @@ class GuidedPopulation(Population):
                 [data],
                 [fitnesses],
                 invalid_flags=[True],
+                mark_seed=self._should_mark_seed_graphs(),
             )
         except Exception as exc:
             warn(f"Failed to record decoder failure ({reason}): {exc}")
@@ -3267,13 +3292,15 @@ class GuidedPopulation(Population):
                         valid_graphs.append(data)
                         valid_fits.append(genome.fitnesses)
                 timing.set_details(f"valid_graphs={len(valid_graphs)} invalid_graphs={len(invalid_graphs)}")
+            mark_seeds = self._should_mark_seed_graphs()
             if valid_graphs:
-                self.trainer.add_data(valid_graphs, valid_fits)
+                self.trainer.add_data(valid_graphs, valid_fits, mark_seed=mark_seeds)
             if invalid_graphs:
                 self.trainer.add_data(
                     invalid_graphs,
                     invalid_fits,
                     invalid_flags=[True] * len(invalid_graphs),
+                    mark_seed=mark_seeds,
                 )
             self._log_memory(f"gen{self.generation:03d}_post_dataset")
 
